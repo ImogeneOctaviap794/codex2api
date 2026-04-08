@@ -1,5 +1,5 @@
 import type { ChangeEvent, DragEvent } from 'react'
-import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, getAdminKey } from '../api'
 import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
@@ -8,9 +8,10 @@ import StateShell from '../components/StateShell'
 import StatusBadge from '../components/StatusBadge'
 import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
+import { usePolling } from '../hooks/usePolling'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest } from '../types'
+import type { AccountRow, AccountsPagedResponse, AccountSummary, AddAccountRequest, AddATAccountRequest } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -83,88 +84,49 @@ export default function Accounts() {
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
 
-  const loadAccounts = useCallback(async () => {
-    const data = await api.getAccounts()
-    return data.accounts ?? []
-  }, [])
+  // 防抖搜索：用户输入后 300ms 才发请求
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (searchTimer.current) clearTimeout(searchTimer.current)
+    searchTimer.current = setTimeout(() => {
+      setDebouncedSearch(searchQuery)
+      setPage(1)
+    }, 300)
+    return () => { if (searchTimer.current) clearTimeout(searchTimer.current) }
+  }, [searchQuery])
 
-  const { data: accounts, loading, error, reload, reloadSilently } = useDataLoader<AccountRow[]>({
-    initialData: [],
+  const loadAccounts = useCallback(async () => {
+    const data = await api.getAccountsPaged({
+      page,
+      page_size: PAGE_SIZE,
+      status: statusFilter,
+      plan: planFilter,
+      search: debouncedSearch,
+      sort: sortKey ?? undefined,
+      order: sortKey ? sortDir : undefined,
+    })
+    return data
+  }, [page, statusFilter, planFilter, debouncedSearch, sortKey, sortDir])
+
+  const { data, loading, error, reload, reloadSilently } = useDataLoader<AccountsPagedResponse>({
+    initialData: { accounts: [], total: 0, page: 1, page_size: PAGE_SIZE, summary: { total: 0, normal: 0, rate_limited: 0, banned: 0, locked: 0, healthy: 0, warm: 0, risky: 0 } },
     load: loadAccounts,
   })
-  const usageBootstrapReloadedRef = useRef(false)
 
-  useEffect(() => {
-    const hasMissingUsage = accounts.some(
-      (account) => account.plan_type?.toLowerCase() === 'free' && (account.usage_percent_7d === null || account.usage_percent_7d === undefined)
-    )
-    if (!hasMissingUsage || usageBootstrapReloadedRef.current) {
-      return
-    }
+  usePolling(() => void reloadSilently(), 30_000)
 
-    usageBootstrapReloadedRef.current = true
-    const timer = window.setTimeout(() => {
-      void reloadSilently()
-    }, 4000)
-
-    return () => window.clearTimeout(timer)
-  }, [accounts, reloadSilently])
-
-  const totalAccounts = accounts.length
-  const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
-  const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
-  const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
-  const lockedAccounts = accounts.filter((account) => account.locked).length
-  const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
-  const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
-  const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
-
-  const filteredAccounts = accounts.filter((account) => {
-    // 状态过滤
-    switch (statusFilter) {
-      case 'normal':
-        if (account.status !== 'active' && account.status !== 'ready') return false
-        break
-      case 'rate_limited':
-        if (account.status !== 'rate_limited' && account.status !== 'usage_exhausted') return false
-        break
-      case 'banned':
-        if (account.status !== 'unauthorized') return false
-        break
-      case 'locked':
-        if (!account.locked) return false
-        break
-    }
-    // 套餐过滤
-    if (planFilter !== 'all') {
-      const plan = (account.plan_type || '').toLowerCase()
-      if (plan !== planFilter) return false
-    }
-    // 搜索过滤
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase()
-      const email = (account.email || '').toLowerCase()
-      const name = (account.name || '').toLowerCase()
-      if (!email.includes(q) && !name.includes(q)) return false
-    }
-    return true
-  })
-
-  const sortedAccounts = [...filteredAccounts].sort((a, b) => {
-    if (!sortKey) return 0
-    let diff = 0
-    if (sortKey === 'requests') {
-      diff = ((a.success_requests ?? 0) + (a.error_requests ?? 0)) - ((b.success_requests ?? 0) + (b.error_requests ?? 0))
-    } else if (sortKey === 'usage') {
-      diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1)
-    } else if (sortKey === 'importTime') {
-      diff = new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
-    }
-    return sortDir === 'asc' ? diff : -diff
-  })
-
-  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / PAGE_SIZE))
-  const pagedAccounts = sortedAccounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const pagedAccounts = data.accounts
+  const summary = data.summary
+  const totalAccounts = summary.total
+  const normalAccounts = summary.normal
+  const rateLimitedAccounts = summary.rate_limited
+  const bannedAccounts = summary.banned
+  const lockedAccounts = summary.locked
+  const healthyAccounts = summary.healthy
+  const warmAccounts = summary.warm
+  const riskyAccounts = summary.risky
+  const totalPages = Math.max(1, Math.ceil(data.total / PAGE_SIZE))
   const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
 
   const toggleSelect = (id: number) => {
@@ -962,7 +924,7 @@ export default function Accounts() {
           <CardContent className="p-6">
             <StateShell
               variant="section"
-              isEmpty={accounts.length === 0}
+              isEmpty={pagedAccounts.length === 0}
               emptyTitle={t('accounts.noData')}
               emptyDescription={t('accounts.noDataDesc')}
               action={<Button onClick={() => setShowAdd(true)}>{t('accounts.addAccount')}</Button>}
@@ -1130,7 +1092,7 @@ export default function Accounts() {
                 page={page}
                 totalPages={totalPages}
                 onPageChange={setPage}
-                totalItems={accounts.length}
+                totalItems={data.total}
                 pageSize={PAGE_SIZE}
               />
             </StateShell>

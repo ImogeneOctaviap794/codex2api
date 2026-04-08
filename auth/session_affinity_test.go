@@ -6,12 +6,22 @@ import (
 	"time"
 )
 
+func buildAccountIndex(accounts []*Account) map[int64]*Account {
+	idx := make(map[int64]*Account, len(accounts))
+	for _, a := range accounts {
+		idx[a.DBID] = a
+	}
+	return idx
+}
+
 func TestNextForSessionPrefersBoundAccountAndProxy(t *testing.T) {
+	accounts := []*Account{
+		{DBID: 1, AccessToken: "tok-1"},
+		{DBID: 2, AccessToken: "tok-2"},
+	}
 	store := &Store{
-		accounts: []*Account{
-			{DBID: 1, AccessToken: "tok-1"},
-			{DBID: 2, AccessToken: "tok-2"},
-		},
+		accounts:       accounts,
+		accountIndex:   buildAccountIndex(accounts),
 		maxConcurrency: 2,
 	}
 	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
@@ -29,11 +39,13 @@ func TestNextForSessionPrefersBoundAccountAndProxy(t *testing.T) {
 }
 
 func TestNextForSessionFallsBackWhenBoundAccountExcluded(t *testing.T) {
+	accounts := []*Account{
+		{DBID: 1, AccessToken: "tok-1"},
+		{DBID: 2, AccessToken: "tok-2"},
+	}
 	store := &Store{
-		accounts: []*Account{
-			{DBID: 1, AccessToken: "tok-1"},
-			{DBID: 2, AccessToken: "tok-2"},
-		},
+		accounts:       accounts,
+		accountIndex:   buildAccountIndex(accounts),
 		maxConcurrency: 2,
 	}
 	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
@@ -51,11 +63,13 @@ func TestNextForSessionFallsBackWhenBoundAccountExcluded(t *testing.T) {
 }
 
 func TestWaitForSessionAvailableReturnsBoundAccount(t *testing.T) {
+	accounts := []*Account{
+		{DBID: 1, AccessToken: "tok-1"},
+		{DBID: 2, AccessToken: "tok-2"},
+	}
 	store := &Store{
-		accounts: []*Account{
-			{DBID: 1, AccessToken: "tok-1"},
-			{DBID: 2, AccessToken: "tok-2"},
-		},
+		accounts:       accounts,
+		accountIndex:   buildAccountIndex(accounts),
 		maxConcurrency: 1,
 	}
 	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
@@ -100,11 +114,13 @@ func TestWaitForSessionAvailableFallsBackWhenBindingExpired(t *testing.T) {
 }
 
 func TestWaitForSessionAvailableRespectsExcludeSet(t *testing.T) {
+	accounts := []*Account{
+		{DBID: 1, AccessToken: "tok-1"},
+		{DBID: 2, AccessToken: "tok-2"},
+	}
 	store := &Store{
-		accounts: []*Account{
-			{DBID: 1, AccessToken: "tok-1"},
-			{DBID: 2, AccessToken: "tok-2"},
-		},
+		accounts:       accounts,
+		accountIndex:   buildAccountIndex(accounts),
 		maxConcurrency: 1,
 	}
 	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")

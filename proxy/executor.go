@@ -233,16 +233,21 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		profile = ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
 		ApplyDeviceProfileHeaders(req, profile)
 		version = codexVersionFromProfile(profile, strings.TrimSpace(deviceCfg.PackageVersion))
+		req.Header.Set("X-Stainless-Lang", "rust")
 	} else {
 		clientProfile := ProfileForAccount(account.ID())
 		req.Header.Set("User-Agent", clientProfile.UserAgent)
 		version = clientProfile.Version
+		req.Header.Set("X-Stainless-Lang", "rust")
+		req.Header.Set("X-Stainless-Package-Version", clientProfile.Version)
+		req.Header.Set("X-Stainless-Runtime-Version", clientProfile.RuntimeVersion)
+		req.Header.Set("X-Stainless-Os", clientProfile.OS)
+		req.Header.Set("X-Stainless-Arch", clientProfile.Arch)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Connection", "Keep-Alive")
 	if version != "" {
 		req.Header.Set("Version", version)
 	}

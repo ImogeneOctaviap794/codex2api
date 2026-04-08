@@ -248,8 +248,8 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		ServerName: host,
 	}
 
-	// 3. 使用 utls 握手（Chrome 指纹）
-	tlsConn := utls.UClient(conn, tlsConfig, utls.HelloChrome_Auto)
+	// 3. 使用 utls 握手（Safari/macOS SecureTransport 指纹，与 codex_cli_rs native-tls 一致）
+	tlsConn := utls.UClient(conn, tlsConfig, utls.HelloSafari_Auto)
 
 	// 设置握手超时
 	handshakeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

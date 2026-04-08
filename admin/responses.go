@@ -22,10 +22,44 @@ type statsResponse struct {
 	Available     int   `json:"available"`
 	Error         int   `json:"error"`
 	TodayRequests int64 `json:"today_requests"`
+	// 用量分布
+	UsageDistribution usageDistribution `json:"usage_distribution"`
+}
+
+// usageDistribution 账号 7d 用量分布
+type usageDistribution struct {
+	TrackedCount int     `json:"tracked_count"` // 有用量数据的账号数
+	AvgPercent   float64 `json:"avg_percent"`   // 平均 7d 用量百分比
+	Low          int     `json:"low"`           // 0-25%
+	Medium       int     `json:"medium"`        // 25-50%
+	High         int     `json:"high"`          // 50-75%
+	Critical     int     `json:"critical"`      // 75-100%
+	Exhausted    int     `json:"exhausted"`     // >=100%
 }
 
 type accountsResponse struct {
 	Accounts []accountResponse `json:"accounts"`
+}
+
+// accountsPagedResponse 分页版账号列表响应
+type accountsPagedResponse struct {
+	Accounts []accountResponse `json:"accounts"`
+	Total    int               `json:"total"`
+	Page     int               `json:"page"`
+	PageSize int               `json:"page_size"`
+	Summary  accountSummary    `json:"summary"`
+}
+
+// accountSummary 账号汇总计数（在筛选前统计）
+type accountSummary struct {
+	Total       int `json:"total"`
+	Normal      int `json:"normal"`
+	RateLimited int `json:"rate_limited"`
+	Banned      int `json:"banned"`
+	Locked      int `json:"locked"`
+	Healthy     int `json:"healthy"`
+	Warm        int `json:"warm"`
+	Risky       int `json:"risky"`
 }
 
 type createAccountResponse struct {

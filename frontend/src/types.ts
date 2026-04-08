@@ -8,11 +8,22 @@ export interface ToastState {
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'paused' | string
 
+export interface UsageDistribution {
+  tracked_count: number
+  avg_percent: number
+  low: number       // 0-25%
+  medium: number    // 25-50%
+  high: number      // 50-75%
+  critical: number  // 75-100%
+  exhausted: number // >=100%
+}
+
 export interface StatsResponse {
   total: number
   available: number
   error: number
   today_requests: number
+  usage_distribution: UsageDistribution
 }
 
 export interface AccountRow {
@@ -56,6 +67,25 @@ export interface AccountRow {
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
+
+export interface AccountSummary {
+  total: number
+  normal: number
+  rate_limited: number
+  banned: number
+  locked: number
+  healthy: number
+  warm: number
+  risky: number
+}
+
+export interface AccountsPagedResponse {
+  accounts: AccountRow[]
+  total: number
+  page: number
+  page_size: number
+  summary: AccountSummary
+}
 
 export interface AddAccountRequest {
   name?: string

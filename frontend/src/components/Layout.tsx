@@ -1,6 +1,6 @@
 import { type PropsWithChildren, type ReactNode, useState } from 'react'
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Workflow, Sun, Moon, Languages, Globe, BookOpen, FileCode2 } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Workflow, Sun, Moon, Languages, Globe, BookOpen, FileCode2, BarChart3 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import logoImg from '../assets/logo.png'
 import { useTheme } from '../hooks/useTheme'
@@ -20,6 +20,7 @@ const navDefs: NavDef[] = [
   { to: '/ops', labelKey: 'nav.ops', icon: <Server className="size-[18px]" />, end: true },
   { to: '/ops/scheduler', labelKey: 'nav.scheduler', icon: <Workflow className="size-[18px]" />, end: true },
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
+  { to: '/analytics', labelKey: 'nav.analytics', icon: <BarChart3 className="size-[18px]" /> },
   { to: '/settings', labelKey: 'nav.settings', icon: <Settings className="size-[18px]" /> },
   { to: '/docs', labelKey: 'nav2.docs', icon: <BookOpen className="size-[18px]" /> },
   { to: '/api-reference', labelKey: 'nav2.apiRef', icon: <FileCode2 className="size-[18px]" /> },

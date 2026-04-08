@@ -272,7 +272,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS admin_secret VARCHAR(255) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_full_usage BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_pool_enabled BOOLEAN DEFAULT FALSE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
@@ -407,7 +407,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		SELECT max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),
-		       COALESCE(fast_scheduler_enabled, false),
+		       COALESCE(fast_scheduler_enabled, true),
 		       COALESCE(max_retries, 2),
 		       COALESCE(allow_remote_migration, false),
 		       COALESCE(auto_clean_error, false),
@@ -907,21 +907,28 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	`
 
 	var todayErrors int64
+	var todayPrompt, todayCompletion, todayCached int64 // 仅用于 scan 对齐，不参与总量计算
 	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
-		&stats.TodayRequests, &stats.TodayTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
+		&stats.TodayRequests, &stats.TodayTokens, &todayPrompt, &todayCompletion, &todayCached,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
 		&todayErrors,
 	)
+	_, _, _ = todayPrompt, todayCompletion, todayCached
 	if err != nil {
 		return nil, err
 	}
 
-	// 统计当前可见请求总数（排除 499，保证与使用统计列表口径一致）
-	var visibleTotal int64
+	// 统计当前可见日志的全量汇总（排除 499，保证与使用统计列表口径一致）
+	var visibleTotal, visibleTokens, visiblePrompt, visibleCompletion, visibleCached int64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499
-	`).Scan(&visibleTotal)
+		SELECT COUNT(*),
+		       COALESCE(SUM(total_tokens), 0),
+		       COALESCE(SUM(prompt_tokens), 0),
+		       COALESCE(SUM(completion_tokens), 0),
+		       COALESCE(SUM(cached_tokens), 0)
+		FROM usage_logs WHERE status_code <> 499
+	`).Scan(&visibleTotal, &visibleTokens, &visiblePrompt, &visibleCompletion, &visibleCached)
 
 	// 加上基线值（清空日志前保存的累计值）
 	var bReq, bTok, bPrompt, bComp, bCached int64
@@ -931,10 +938,10 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
 
 	stats.TotalRequests = visibleTotal + bReq
-	stats.TotalTokens = stats.TodayTokens + bTok
-	stats.TotalPrompt += bPrompt
-	stats.TotalCompletion += bComp
-	stats.TotalCachedTokens += bCached
+	stats.TotalTokens = visibleTokens + bTok
+	stats.TotalPrompt = visiblePrompt + bPrompt
+	stats.TotalCompletion = visibleCompletion + bComp
+	stats.TotalCachedTokens = visibleCached + bCached
 
 	if stats.TodayRequests > 0 {
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100

@@ -6,6 +6,7 @@ import type {
   AdminErrorResponse,
   APIKeysResponse,
   AccountsResponse,
+  AccountsPagedResponse,
   ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
@@ -95,6 +96,17 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
+  getAccountsPaged: (params: { page: number; page_size: number; status?: string; plan?: string; search?: string; sort?: string; order?: string }) => {
+    const qs = new URLSearchParams()
+    qs.set('page', String(params.page))
+    qs.set('page_size', String(params.page_size))
+    if (params.status && params.status !== 'all') qs.set('status', params.status)
+    if (params.plan && params.plan !== 'all') qs.set('plan', params.plan)
+    if (params.search) qs.set('search', params.search)
+    if (params.sort) qs.set('sort', params.sort)
+    if (params.order) qs.set('order', params.order)
+    return request<AccountsPagedResponse>(`/accounts?${qs.toString()}`)
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>

@@ -154,8 +154,13 @@ func parseMeminfoKB(line string) uint64 {
 	return v
 }
 
-// GetOpsOverview 获取系统运维概览
+// GetOpsOverview 获取系统运维概览（5 秒整包缓存）
 func (h *Handler) GetOpsOverview(c *gin.Context) {
+	if entry := h.opsOverviewCache.Load(); entry != nil && time.Now().Before(entry.expiresAt) {
+		c.JSON(200, entry.data)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
@@ -215,7 +220,7 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 		totalRuntimeRequests += acc.GetTotalRequests()
 	}
 
-	c.JSON(200, opsOverviewResponse{
+	resp := &opsOverviewResponse{
 		UpdatedAt:      time.Now().Format(time.RFC3339),
 		UptimeSeconds:  int64(time.Since(h.startedAt).Seconds()),
 		DatabaseDriver: h.databaseDriver,
@@ -270,5 +275,11 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 			TodayTokens:   usageStats.TodayTokens,
 			RPMLimit:      h.rateLimiter.GetRPM(),
 		},
+	}
+
+	h.opsOverviewCache.Store(&opsOverviewCacheEntry{
+		data:      resp,
+		expiresAt: time.Now().Add(5 * time.Second),
 	})
+	c.JSON(200, resp)
 }

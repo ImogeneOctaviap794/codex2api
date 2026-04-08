@@ -70,11 +70,12 @@ func main() {
 			RedisPoolSize:         30,
 			AutoCleanUnauthorized: false,
 			AutoCleanRateLimited:  false,
+			FastSchedulerEnabled:  true,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
 		log.Printf("警告: 读取系统设置失败: %v，将采用安全后备策略", err)
-		settings = &database.SystemSettings{MaxConcurrency: 2, GlobalRPM: 0, TestModel: "gpt-5.4", TestConcurrency: 50, PgMaxConns: 50, RedisPoolSize: 30}
+		settings = &database.SystemSettings{MaxConcurrency: 2, GlobalRPM: 0, TestModel: "gpt-5.4", TestConcurrency: 50, PgMaxConns: 50, RedisPoolSize: 30, FastSchedulerEnabled: true}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)

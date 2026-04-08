@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,11 +53,58 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
+
+	// GetUsageStats 缓存（10秒 TTL）
+	usageStatsCache   atomic.Pointer[usageStatsCacheEntry]
+	// GetOpsOverview 整包缓存（5秒 TTL）
+	opsOverviewCache  atomic.Pointer[opsOverviewCacheEntry]
+	// ListActive 缓存（5秒 TTL，减少分页请求重复 DB 查询）
+	listActiveCache   atomic.Pointer[listActiveCacheEntry]
 }
 
 type chartCacheEntry struct {
 	data      *database.ChartAggregation
 	expiresAt time.Time
+}
+
+type usageStatsCacheEntry struct {
+	data      *database.UsageStats
+	expiresAt time.Time
+}
+
+type listActiveCacheEntry struct {
+	data      []*database.AccountRow
+	expiresAt time.Time
+}
+
+type opsOverviewCacheEntry struct {
+	data      *opsOverviewResponse
+	expiresAt time.Time
+}
+
+// InvalidateStatsCache 使 GetUsageStats / GetOpsOverview / ListActive 缓存立即过期。
+// 在写操作（清日志、增删账号、更新设置等）后调用。
+func (h *Handler) InvalidateStatsCache() {
+	h.usageStatsCache.Store(nil)
+	h.opsOverviewCache.Store(nil)
+	h.listActiveCache.Store(nil)
+}
+
+// getCachedListActive 返回带 5 秒 TTL 缓存的 ListActive 结果，
+// 避免分页/筛选请求每次都走 DB 全量查询。
+func (h *Handler) getCachedListActive(ctx context.Context) ([]*database.AccountRow, error) {
+	if entry := h.listActiveCache.Load(); entry != nil && time.Now().Before(entry.expiresAt) {
+		return entry.data, nil
+	}
+	rows, err := h.db.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.listActiveCache.Store(&listActiveCacheEntry{
+		data:      rows,
+		expiresAt: time.Now().Add(5 * time.Second),
+	})
+	return rows, nil
 }
 
 // NewHandler 创建管理后台处理器
@@ -204,19 +252,39 @@ func (h *Handler) GetStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	accounts, err := h.db.ListActive(ctx)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-
-	total := len(accounts)
+	// total = 池中账号数（active 行），available = 运行时可调度数
+	total := h.store.AccountCount()
 	available := h.store.AvailableCount()
+
+	// error 从运行时状态统计 + 用量分布
 	errCount := 0
+	var dist usageDistribution
+	var usageSum float64
+	accounts := h.store.Accounts()
 	for _, acc := range accounts {
-		if acc.Status == "error" {
+		switch acc.RuntimeStatus() {
+		case "error", "unauthorized":
 			errCount++
 		}
+		if pct, ok := acc.GetUsagePercent7d(); ok {
+			dist.TrackedCount++
+			usageSum += pct
+			switch {
+			case pct >= 100:
+				dist.Exhausted++
+			case pct >= 75:
+				dist.Critical++
+			case pct >= 50:
+				dist.High++
+			case pct >= 25:
+				dist.Medium++
+			default:
+				dist.Low++
+			}
+		}
+	}
+	if dist.TrackedCount > 0 {
+		dist.AvgPercent = usageSum / float64(dist.TrackedCount)
 	}
 
 	usageStats, _ := h.db.GetUsageStats(ctx)
@@ -226,10 +294,11 @@ func (h *Handler) GetStats(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, statsResponse{
-		Total:         total,
-		Available:     available,
-		Error:         errCount,
-		TodayRequests: todayReqs,
+		Total:             total,
+		Available:         available,
+		Error:             errCount,
+		TodayRequests:     todayReqs,
+		UsageDistribution: dist,
 	})
 }
 
@@ -277,15 +346,21 @@ type schedulerBreakdownResponse struct {
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
 
-// ListAccounts 获取账号列表
+// ListAccounts 获取账号列表（支持服务端分页、筛选、排序）
+//
+// Query params:
+//   - page: 页码（1-based，0 或不传则返回全部）
+//   - page_size: 每页条数（默认 20，最大 200）
+//   - status: all | normal | rate_limited | banned | locked
+//   - plan: all | pro | team | free
+//   - search: 按 email/name 搜索
+//   - sort: requests | usage | importTime
+//   - order: asc | desc
 func (h *Handler) ListAccounts(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	h.store.TriggerUsageProbeAsync()
-	h.store.TriggerRecoveryProbeAsync()
-
-	rows, err := h.db.ListActive(ctx)
+	rows, err := h.getCachedListActive(ctx)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -300,7 +375,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
 	reqCounts := h.getCachedRequestCounts()
 
-	accounts := make([]accountResponse, 0, len(rows))
+	all := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
 		resp := accountResponse{
 			ID:        row.ID,
@@ -366,10 +441,139 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.SuccessRequests = rc.SuccessCount
 			resp.ErrorRequests = rc.ErrorCount
 		}
-		accounts = append(accounts, resp)
+		all = append(all, resp)
 	}
 
-	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
+	// ── 汇总计数（在筛选前统计，给前端摘要卡片用） ──
+	summary := accountSummary{}
+	for i := range all {
+		a := &all[i]
+		summary.Total++
+		switch a.Status {
+		case "active", "ready":
+			summary.Normal++
+		case "rate_limited", "usage_exhausted":
+			summary.RateLimited++
+		case "unauthorized":
+			summary.Banned++
+		}
+		if a.Locked {
+			summary.Locked++
+		}
+		switch a.HealthTier {
+		case "healthy":
+			summary.Healthy++
+		case "warm":
+			summary.Warm++
+		case "risky":
+			summary.Risky++
+		}
+	}
+
+	// ── 筛选 ──
+	statusFilter := c.DefaultQuery("status", "all")
+	planFilter := c.DefaultQuery("plan", "all")
+	search := strings.ToLower(strings.TrimSpace(c.Query("search")))
+
+	filtered := make([]accountResponse, 0, len(all))
+	for i := range all {
+		a := &all[i]
+		// 状态筛选
+		switch statusFilter {
+		case "normal":
+			if a.Status != "active" && a.Status != "ready" {
+				continue
+			}
+		case "rate_limited":
+			if a.Status != "rate_limited" && a.Status != "usage_exhausted" {
+				continue
+			}
+		case "banned":
+			if a.Status != "unauthorized" {
+				continue
+			}
+		case "locked":
+			if !a.Locked {
+				continue
+			}
+		}
+		// 套餐筛选
+		if planFilter != "all" {
+			if strings.ToLower(a.PlanType) != planFilter {
+				continue
+			}
+		}
+		// 搜索
+		if search != "" {
+			if !strings.Contains(strings.ToLower(a.Email), search) &&
+				!strings.Contains(strings.ToLower(a.Name), search) {
+				continue
+			}
+		}
+		filtered = append(filtered, *a)
+	}
+
+	// ── 排序（白名单） ──
+	sortKey := c.DefaultQuery("sort", "")
+	sortOrder := c.DefaultQuery("order", "desc")
+	if sortKey != "" {
+		sort.Slice(filtered, func(i, j int) bool {
+			var diff float64
+			switch sortKey {
+			case "requests":
+				diff = float64(filtered[i].SuccessRequests+filtered[i].ErrorRequests) -
+					float64(filtered[j].SuccessRequests+filtered[j].ErrorRequests)
+			case "usage":
+				vi, vj := float64(-1), float64(-1)
+				if filtered[i].UsagePercent7d != nil {
+					vi = *filtered[i].UsagePercent7d
+				}
+				if filtered[j].UsagePercent7d != nil {
+					vj = *filtered[j].UsagePercent7d
+				}
+				diff = vi - vj
+			case "importTime":
+				diff = float64(strings.Compare(filtered[i].CreatedAt, filtered[j].CreatedAt))
+			default:
+				return false
+			}
+			if sortOrder == "asc" {
+				return diff < 0
+			}
+			return diff > 0
+		})
+	}
+
+	// ── 分页 ──
+	pageNum, _ := strconv.Atoi(c.DefaultQuery("page", "0"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+
+	total := len(filtered)
+	if pageNum > 0 {
+		start := (pageNum - 1) * pageSize
+		if start > total {
+			start = total
+		}
+		end := start + pageSize
+		if end > total {
+			end = total
+		}
+		filtered = filtered[start:end]
+	}
+
+	c.JSON(http.StatusOK, accountsPagedResponse{
+		Accounts: filtered,
+		Total:    total,
+		Page:     pageNum,
+		PageSize: pageSize,
+		Summary:  summary,
+	})
 }
 
 // getCachedRequestCounts 返回带 30 秒 TTL 的账号请求统计缓存
@@ -512,6 +716,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
 
+	h.InvalidateStatsCache()
 	c.JSON(http.StatusOK, gin.H{
 		"message": msg,
 		"success": successCount,
@@ -643,6 +848,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
 
+	h.InvalidateStatsCache()
 	c.JSON(http.StatusOK, gin.H{
 		"message": msg,
 		"success": successCount,
@@ -1108,6 +1314,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	})
 
 	log.Printf("导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
+	h.InvalidateStatsCache()
 }
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
@@ -1321,6 +1528,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 	// 从内存池移除
 	h.store.RemoveAccount(id)
 	h.db.InsertAccountEventAsync(id, "deleted", "manual")
+	h.InvalidateStatsCache()
 
 	writeMessage(c, http.StatusOK, "账号已删除")
 }
@@ -1436,6 +1644,7 @@ func (h *Handler) BatchResetStatus(c *gin.Context) {
 		success++
 	}
 
+	h.InvalidateStatsCache()
 	c.JSON(http.StatusOK, gin.H{
 		"message": fmt.Sprintf("已重置 %d 个账号状态", success),
 		"success": success,
@@ -1463,8 +1672,13 @@ func (h *Handler) GetHealth(c *gin.Context) {
 
 // ==================== Usage ====================
 
-// GetUsageStats 获取使用统计
+// GetUsageStats 获取使用统计（10 秒内存缓存）
 func (h *Handler) GetUsageStats(c *gin.Context) {
+	if entry := h.usageStatsCache.Load(); entry != nil && time.Now().Before(entry.expiresAt) {
+		c.JSON(http.StatusOK, entry.data)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
@@ -1473,6 +1687,11 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+
+	h.usageStatsCache.Store(&usageStatsCacheEntry{
+		data:      stats,
+		expiresAt: time.Now().Add(10 * time.Second),
+	})
 	c.JSON(http.StatusOK, stats)
 }
 
@@ -1632,6 +1851,7 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	h.InvalidateStatsCache()
 	c.JSON(http.StatusOK, gin.H{"message": "日志已清空"})
 }
 
@@ -2020,6 +2240,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
 		h.store.TriggerAutoCleanupAsync()
 	}
+	h.InvalidateStatsCache()
 
 	adminSecretForDisplay := currentAdminSecret
 	adminAuthSource := func() string {
@@ -2298,6 +2519,7 @@ func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
 	defer cancel()
 
 	cleaned := h.store.CleanByRuntimeStatus(ctx, targetStatus)
+	h.InvalidateStatsCache()
 
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
 }

@@ -707,6 +707,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 type Store struct {
 	mu                    sync.RWMutex
 	accounts              []*Account
+	accountIndex          map[int64]*Account // DBID → *Account O(1) 索引
 	globalProxy           string
 	maxConcurrency        int64        // 每账号最大并发数
 	testConcurrency       int64        // 批量测试并发数
@@ -732,7 +733,7 @@ type Store struct {
 	proxyPoolEnabled bool     // 代理池是否开启
 	proxyRoundRobin  uint64   // 轮询计数器
 
-	// Fast scheduler POC（默认关闭，通过环境变量启用）
+	// Fast scheduler（默认开启，通过环境变量或设置页关闭）
 	fastScheduler        atomic.Pointer[FastScheduler]
 	fastSchedulerEnabled atomic.Bool
 
@@ -753,13 +754,18 @@ type sessionAffinity struct {
 
 const sessionAffinityTTL = 30 * time.Minute
 
-func fastSchedulerEnabledFromEnv() bool {
+// fastSchedulerFromEnv 返回环境变量对快速调度器的意图：
+// nil = 未设置（使用默认值 true），true/false = 显式启用/禁用。
+func fastSchedulerFromEnv() *bool {
 	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
-		if truthyEnv(os.Getenv(key)) {
-			return true
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			continue
 		}
+		enabled := truthyEnv(v)
+		return &enabled
 	}
-	return false
+	return nil
 }
 
 func truthyEnv(v string) bool {
@@ -775,10 +781,11 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:  2,
-			TestConcurrency: 50,
-			TestModel:       "gpt-5.4",
-			ProxyURL:        "",
+			MaxConcurrency:       2,
+			TestConcurrency:      50,
+			TestModel:            "gpt-5.4",
+			FastSchedulerEnabled: true,
+			ProxyURL:             "",
 		}
 	}
 	s := &Store{
@@ -790,6 +797,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		stopCh:           make(chan struct{}),
 		proxyPoolEnabled: settings.ProxyPoolEnabled,
 		sessionBindings:  make(map[string]sessionAffinity),
+		accountIndex:     make(map[int64]*Account),
 	}
 	s.testModel.Store(settings.TestModel)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
@@ -806,12 +814,19 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
-	// 环境变量优先，否则读数据库设置
-	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
+	// 快速调度器：环境变量优先级最高（显式 true/false）；
+	// 未设置环境变量时默认开启（true），不再依赖数据库值，
+	// 因为历史 schema 默认写入的是 false。
+	fastEnabled := true
+	if envVal := fastSchedulerFromEnv(); envVal != nil {
+		fastEnabled = *envVal
+	}
 	s.fastSchedulerEnabled.Store(fastEnabled)
 	if fastEnabled {
 		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency)))
 		log.Printf("快速调度器已启用（请求热路径将优先走本地内存调度器）")
+	} else {
+		log.Printf("快速调度器已禁用（请求热路径走全量扫描）")
 	}
 
 	// 加载代理池
@@ -1138,6 +1153,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		account.mu.Unlock()
 
 		s.accounts = append(s.accounts, account)
+		s.accountIndex[account.DBID] = account
 	}
 
 	log.Printf("从数据库加载了 %d 个账号", len(s.accounts))
@@ -1382,13 +1398,7 @@ func (s *Store) takeByIDExcluding(id int64, exclude map[int64]bool) *Account {
 	}
 
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc != nil && acc.DBID == id {
-			target = acc
-			break
-		}
-	}
+	target := s.accountIndex[id]
 	s.mu.RUnlock()
 	if target == nil || !target.IsAvailable() {
 		return nil
@@ -1546,6 +1556,7 @@ func (s *Store) AddAccount(acc *Account) {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
+	s.accountIndex[acc.DBID] = acc
 	s.fastSchedulerUpdate(acc)
 }
 
@@ -1557,6 +1568,7 @@ func (s *Store) RemoveAccount(dbID int64) {
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
+			delete(s.accountIndex, dbID)
 			s.fastSchedulerRemove(dbID)
 			// 清理 RefreshScheduler 中可能残留的任务
 			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
@@ -1567,16 +1579,11 @@ func (s *Store) RemoveAccount(dbID int64) {
 	}
 }
 
-// FindByID 通过数据库 ID 查找运行时账号
+// FindByID 通过数据库 ID 查找运行时账号（O(1)）
 func (s *Store) FindByID(dbID int64) *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, acc := range s.accounts {
-		if acc.DBID == dbID {
-			return acc
-		}
-	}
-	return nil
+	return s.accountIndex[dbID]
 }
 
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
@@ -1979,6 +1986,7 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 	kept := s.accounts[:0]
 	for _, acc := range s.accounts {
 		if _, remove := removeSet[acc.DBID]; remove {
+			delete(s.accountIndex, acc.DBID)
 			s.fastSchedulerRemove(acc.DBID)
 			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
 				scheduler.CancelTask(acc.DBID)
@@ -2116,13 +2124,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 // RefreshSingle 刷新单个账号（供 admin handler 调用）
 func (s *Store) RefreshSingle(ctx context.Context, dbID int64) error {
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc.DBID == dbID {
-			target = acc
-			break
-		}
-	}
+	target := s.accountIndex[dbID]
 	s.mu.RUnlock()
 
 	if target == nil {

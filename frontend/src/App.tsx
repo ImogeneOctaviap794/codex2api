@@ -10,6 +10,7 @@ import Settings from './pages/Settings'
 import Guide from './pages/Guide'
 import ApiReference from './pages/ApiReference'
 import Usage from './pages/Usage'
+import Analytics from './pages/Analytics'
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="/ops" element={<Operations />} />
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />
+          <Route path="/analytics" element={<Analytics />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/docs" element={<Guide />} />
           <Route path="/api-reference" element={<ApiReference />} />

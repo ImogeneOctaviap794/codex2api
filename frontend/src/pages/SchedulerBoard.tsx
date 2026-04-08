@@ -7,6 +7,7 @@ import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
+import { usePolling } from '../hooks/usePolling'
 import StatusBadge from '../components/StatusBadge'
 import type { AccountRow, OpsOverviewResponse } from '../types'
 import { Badge } from '@/components/ui/badge'
@@ -44,13 +45,7 @@ export default function SchedulerBoard() {
     load: loadSchedulerData,
   })
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void reloadSilently()
-    }, 15000)
-
-    return () => window.clearInterval(timer)
-  }, [reloadSilently])
+  usePolling(() => void reloadSilently(), 30_000)
 
   const overview = data.overview
   const accounts = data.accounts

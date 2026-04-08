@@ -8,6 +8,7 @@ import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
+import { usePolling } from '../hooks/usePolling'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { APIKeyRow, UsageLog, UsageStats } from '../types'
@@ -185,12 +186,7 @@ export default function Usage() {
     void loadAPIKeys()
   }, [loadAPIKeys])
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void reloadSilently()
-    }, 30000)
-    return () => window.clearInterval(timer)
-  }, [reloadSilently])
+  usePolling(() => void reloadSilently(), 30_000)
 
   const { stats } = data
   const totalPages = Math.max(1, Math.ceil(logsTotal / PAGE_SIZE))

@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -18,6 +18,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import AccountTrendChart from '../components/AccountTrendChart'
 import { useDataLoader } from '../hooks/useDataLoader'
+import { usePolling } from '../hooks/usePolling'
 import type { OpsOverviewResponse } from '../types'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -33,13 +34,7 @@ export default function Operations() {
     load: loadOperationsData,
   })
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void reloadSilently()
-    }, 15000)
-
-    return () => window.clearInterval(timer)
-  }, [reloadSilently])
+  usePolling(() => void reloadSilently(), 30_000)
 
   const updatedLabel = overview?.updated_at ? formatTimeLabel(overview.updated_at) : '--:--:--'
 

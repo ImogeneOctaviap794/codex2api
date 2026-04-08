@@ -217,22 +217,40 @@ func TestStoreFastSchedulerTracksCooldownTransition(t *testing.T) {
 	store.Release(got)
 }
 
-func TestFastSchedulerEnabledFromEnv(t *testing.T) {
+func TestFastSchedulerFromEnv(t *testing.T) {
+	// 两个环境变量都为空 → nil（由调用方决定默认值）
 	t.Setenv("FAST_SCHEDULER_ENABLED", "")
 	t.Setenv("CODEX_FAST_SCHEDULER", "")
-	if fastSchedulerEnabledFromEnv() {
-		t.Fatal("fastSchedulerEnabledFromEnv() should be false when env is empty")
+	if got := fastSchedulerFromEnv(); got != nil {
+		t.Fatalf("fastSchedulerFromEnv() = %v, want nil when env is empty", *got)
 	}
 
+	// FAST_SCHEDULER_ENABLED=true → *true
 	t.Setenv("FAST_SCHEDULER_ENABLED", "true")
-	if !fastSchedulerEnabledFromEnv() {
-		t.Fatal("fastSchedulerEnabledFromEnv() should be true for FAST_SCHEDULER_ENABLED=true")
+	t.Setenv("CODEX_FAST_SCHEDULER", "")
+	if got := fastSchedulerFromEnv(); got == nil || !*got {
+		t.Fatal("fastSchedulerFromEnv() should be *true for FAST_SCHEDULER_ENABLED=true")
 	}
 
+	// FAST_SCHEDULER_ENABLED=false → *false
+	t.Setenv("FAST_SCHEDULER_ENABLED", "false")
+	t.Setenv("CODEX_FAST_SCHEDULER", "")
+	if got := fastSchedulerFromEnv(); got == nil || *got {
+		t.Fatal("fastSchedulerFromEnv() should be *false for FAST_SCHEDULER_ENABLED=false")
+	}
+
+	// CODEX_FAST_SCHEDULER=1 → *true（第一个变量为空时 fallback 到第二个）
 	t.Setenv("FAST_SCHEDULER_ENABLED", "")
 	t.Setenv("CODEX_FAST_SCHEDULER", "1")
-	if !fastSchedulerEnabledFromEnv() {
-		t.Fatal("fastSchedulerEnabledFromEnv() should be true for CODEX_FAST_SCHEDULER=1")
+	if got := fastSchedulerFromEnv(); got == nil || !*got {
+		t.Fatal("fastSchedulerFromEnv() should be *true for CODEX_FAST_SCHEDULER=1")
+	}
+
+	// CODEX_FAST_SCHEDULER=0 → *false
+	t.Setenv("FAST_SCHEDULER_ENABLED", "")
+	t.Setenv("CODEX_FAST_SCHEDULER", "0")
+	if got := fastSchedulerFromEnv(); got == nil || *got {
+		t.Fatal("fastSchedulerFromEnv() should be *false for CODEX_FAST_SCHEDULER=0")
 	}
 }
 
