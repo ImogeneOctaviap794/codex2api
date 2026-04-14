@@ -35,6 +35,11 @@ export interface AccountRow {
   at_only?: boolean
   health_tier?: string
   scheduler_score?: number
+  dispatch_score?: number
+  score_bias_override?: number | null
+  score_bias_effective?: number
+  base_concurrency_override?: number | null
+  base_concurrency_effective?: number
   dynamic_concurrency_limit?: number
   scheduler_breakdown?: {
     unauthorized_penalty: number
@@ -97,6 +102,11 @@ export interface AddATAccountRequest {
   name?: string
   access_token: string
   proxy_url: string
+}
+
+export interface UpdateAccountSchedulerRequest {
+  score_bias_override: number | null
+  base_concurrency_override: number | null
 }
 
 export interface AccountModelStat {
@@ -201,6 +211,9 @@ export interface SystemSettings {
   global_rpm: number
   test_model: string
   test_concurrency: number
+  background_refresh_interval_minutes: number
+  usage_probe_max_age_minutes: number
+  recovery_probe_interval_minutes: number
   proxy_url?: string
   pg_max_conns: number
   redis_pool_size: number
@@ -221,6 +234,8 @@ export interface SystemSettings {
   cache_label: string
   expired_cleaned?: number
   model_mapping: string
+  resin_url: string
+  resin_platform_name: string
 }
 
 export interface CPAExportEntry {

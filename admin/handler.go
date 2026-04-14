@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -142,6 +144,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
+	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
@@ -305,33 +308,38 @@ func (h *Handler) GetStats(c *gin.Context) {
 // ==================== Accounts ====================
 
 type accountResponse struct {
-	ID                 int64                      `json:"id"`
-	Name               string                     `json:"name"`
-	Email              string                     `json:"email"`
-	PlanType           string                     `json:"plan_type"`
-	Status             string                     `json:"status"`
-	ATOnly             bool                       `json:"at_only"`
-	HealthTier         string                     `json:"health_tier"`
-	SchedulerScore     float64                    `json:"scheduler_score"`
-	ConcurrencyCap     int64                      `json:"dynamic_concurrency_limit"`
-	ProxyURL           string                     `json:"proxy_url"`
-	CreatedAt          string                     `json:"created_at"`
-	UpdatedAt          string                     `json:"updated_at"`
-	ActiveRequests     int64                      `json:"active_requests"`
-	TotalRequests      int64                      `json:"total_requests"`
-	LastUsedAt         string                     `json:"last_used_at"`
-	SuccessRequests    int64                      `json:"success_requests"`
-	ErrorRequests      int64                      `json:"error_requests"`
-	UsagePercent7d     *float64                   `json:"usage_percent_7d"`
-	UsagePercent5h     *float64                   `json:"usage_percent_5h"`
-	Reset5hAt          string                     `json:"reset_5h_at,omitempty"`
-	Reset7dAt          string                     `json:"reset_7d_at,omitempty"`
-	ScoreBreakdown     schedulerBreakdownResponse `json:"scheduler_breakdown"`
-	LastUnauthorizedAt string                     `json:"last_unauthorized_at,omitempty"`
-	LastRateLimitedAt  string                     `json:"last_rate_limited_at,omitempty"`
-	LastTimeoutAt      string                     `json:"last_timeout_at,omitempty"`
-	LastServerErrorAt  string                     `json:"last_server_error_at,omitempty"`
-	Locked             bool                       `json:"locked"`
+	ID                       int64                      `json:"id"`
+	Name                     string                     `json:"name"`
+	Email                    string                     `json:"email"`
+	PlanType                 string                     `json:"plan_type"`
+	Status                   string                     `json:"status"`
+	ATOnly                   bool                       `json:"at_only"`
+	HealthTier               string                     `json:"health_tier"`
+	SchedulerScore           float64                    `json:"scheduler_score"`
+	DispatchScore            float64                    `json:"dispatch_score"`
+	ScoreBiasOverride        *int64                     `json:"score_bias_override"`
+	ScoreBiasEffective       int64                      `json:"score_bias_effective"`
+	BaseConcurrencyOverride  *int64                     `json:"base_concurrency_override"`
+	BaseConcurrencyEffective int64                      `json:"base_concurrency_effective"`
+	ConcurrencyCap           int64                      `json:"dynamic_concurrency_limit"`
+	ProxyURL                 string                     `json:"proxy_url"`
+	CreatedAt                string                     `json:"created_at"`
+	UpdatedAt                string                     `json:"updated_at"`
+	ActiveRequests           int64                      `json:"active_requests"`
+	TotalRequests            int64                      `json:"total_requests"`
+	LastUsedAt               string                     `json:"last_used_at"`
+	SuccessRequests          int64                      `json:"success_requests"`
+	ErrorRequests            int64                      `json:"error_requests"`
+	UsagePercent7d           *float64                   `json:"usage_percent_7d"`
+	UsagePercent5h           *float64                   `json:"usage_percent_5h"`
+	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
+	Reset7dAt                string                     `json:"reset_7d_at,omitempty"`
+	ScoreBreakdown           schedulerBreakdownResponse `json:"scheduler_breakdown"`
+	LastUnauthorizedAt       string                     `json:"last_unauthorized_at,omitempty"`
+	LastRateLimitedAt        string                     `json:"last_rate_limited_at,omitempty"`
+	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
+	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
+	Locked                   bool                       `json:"locked"`
 }
 
 type schedulerBreakdownResponse struct {
@@ -378,16 +386,20 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	all := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
 		resp := accountResponse{
-			ID:        row.ID,
-			Name:      row.Name,
-			Email:     row.GetCredential("email"),
-			PlanType:  row.GetCredential("plan_type"),
-			Status:    row.Status,
-			ATOnly:    row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
-			ProxyURL:  row.ProxyURL,
-			Locked:    row.Locked,
-			CreatedAt: row.CreatedAt.Format(time.RFC3339),
-			UpdatedAt: row.UpdatedAt.Format(time.RFC3339),
+			ID:                       row.ID,
+			Name:                     row.Name,
+			Email:                    row.GetCredential("email"),
+			PlanType:                 row.GetCredential("plan_type"),
+			Status:                   row.Status,
+			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ProxyURL:                 row.ProxyURL,
+			Locked:                   row.Locked,
+			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
+			ScoreBiasEffective:       effectiveScoreBias(row.GetCredential("plan_type"), row.ScoreBiasOverride),
+			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
+			BaseConcurrencyEffective: effectiveBaseConcurrency(row.BaseConcurrencyOverride, int64(h.store.GetMaxConcurrency())),
+			CreatedAt:                row.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:                row.UpdatedAt.Format(time.RFC3339),
 		}
 		if acc, ok := accountMap[row.ID]; ok {
 			resp.ActiveRequests = acc.GetActiveRequests()
@@ -396,6 +408,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.HealthTier = debug.HealthTier
 			resp.SchedulerScore = debug.SchedulerScore
 			resp.ConcurrencyCap = debug.DynamicConcurrencyLimit
+			if dispatchScore, ok := reflectFloat64Field(debug, "DispatchScore"); ok {
+				resp.DispatchScore = dispatchScore
+			}
+			if scoreBiasEffective, ok := reflectInt64Field(debug, "ScoreBiasEffective"); ok {
+				resp.ScoreBiasEffective = scoreBiasEffective
+			}
+			if baseConcurrencyEffective, ok := reflectInt64Field(debug, "BaseConcurrencyEffective"); ok {
+				resp.BaseConcurrencyEffective = baseConcurrencyEffective
+			}
 			resp.ScoreBreakdown = schedulerBreakdownResponse{
 				UnauthorizedPenalty: debug.Breakdown.UnauthorizedPenalty,
 				RateLimitPenalty:    debug.Breakdown.RateLimitPenalty,
@@ -436,6 +457,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			// 使用运行时状态（优先于 DB 状态）
 			resp.Status = acc.RuntimeStatus()
+		}
+		if resp.DispatchScore == 0 {
+			resp.DispatchScore = dispatchScoreFallback(resp.SchedulerScore, resp.ScoreBiasEffective, resp.HealthTier, resp.Status)
 		}
 		if rc, ok := reqCounts[row.ID]; ok {
 			resp.SuccessRequests = rc.SuccessCount
@@ -574,6 +598,161 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		PageSize: pageSize,
 		Summary:  summary,
 	})
+}
+
+type updateAccountSchedulerReq struct {
+	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
+	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+}
+
+// UpdateAccountScheduler 更新账号调度配置。
+func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req updateAccountSchedulerReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	scoreBiasOverride, err := parseOptionalIntegerField(req.ScoreBiasOverride, "score_bias_override", -200, 200)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, 50)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新账号调度配置失败: "+err.Error())
+		return
+	}
+	if h.store != nil {
+		h.store.ApplyAccountSchedulerOverrides(id, nullableInt64Pointer(scoreBiasOverride), nullableInt64Pointer(baseConcurrencyOverride))
+	}
+
+	writeMessage(c, http.StatusOK, "账号调度配置已更新")
+}
+
+func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (sql.NullInt64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return sql.NullInt64{}, nil
+	}
+
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return sql.NullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+	}
+	value, err := number.Int64()
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+	}
+	if value < minValue || value > maxValue {
+		return sql.NullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
+	}
+	return sql.NullInt64{Int64: value, Valid: true}, nil
+}
+
+func nullableInt64Pointer(v sql.NullInt64) *int64 {
+	if !v.Valid {
+		return nil
+	}
+	value := v.Int64
+	return &value
+}
+
+func effectiveScoreBias(planType string, override sql.NullInt64) int64 {
+	if override.Valid {
+		return override.Int64
+	}
+	switch strings.ToLower(strings.TrimSpace(planType)) {
+	case "pro", "plus", "team":
+		return 50
+	default:
+		return 0
+	}
+}
+
+func effectiveBaseConcurrency(override sql.NullInt64, defaultValue int64) int64 {
+	if override.Valid {
+		return override.Int64
+	}
+	return defaultValue
+}
+
+func dispatchScoreFallback(schedulerScore float64, scoreBiasEffective int64, healthTier string, status string) float64 {
+	if schedulerScore == 0 {
+		return 0
+	}
+	if !allowScoreBias(healthTier, status) {
+		return schedulerScore
+	}
+	return schedulerScore + float64(scoreBiasEffective)
+}
+
+func allowScoreBias(healthTier string, status string) bool {
+	if status != "" && status != "active" {
+		return false
+	}
+	switch strings.ToLower(healthTier) {
+	case "healthy", "warm":
+		return true
+	default:
+		return false
+	}
+}
+
+// 这里优先读取 auth 层并行实现新增的 runtime/debug 字段，字段名约定为：
+// DispatchScore / ScoreBiasEffective / BaseConcurrencyEffective。
+// 若主分支尚未集成这些字段，则回退到管理层可推导的兼容值，避免阻塞前后端联调。
+func reflectFloat64Field(value interface{}, field string) (float64, bool) {
+	v := reflect.Indirect(reflect.ValueOf(value))
+	if !v.IsValid() || v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	f := v.FieldByName(field)
+	if !f.IsValid() {
+		return 0, false
+	}
+	switch f.Kind() {
+	case reflect.Float32, reflect.Float64:
+		return f.Convert(reflect.TypeOf(float64(0))).Float(), true
+	default:
+		return 0, false
+	}
+}
+
+func reflectInt64Field(value interface{}, field string) (int64, bool) {
+	v := reflect.Indirect(reflect.ValueOf(value))
+	if !v.IsValid() || v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	f := v.FieldByName(field)
+	if !f.IsValid() {
+		return 0, false
+	}
+	switch f.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return f.Int(), true
+	default:
+		return 0, false
+	}
 }
 
 // getCachedRequestCounts 返回带 30 秒 TTL 的账号请求统计缓存
@@ -1966,51 +2145,61 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	MaxConcurrency        int    `json:"max_concurrency"`
-	GlobalRPM             int    `json:"global_rpm"`
-	TestModel             string `json:"test_model"`
-	TestConcurrency       int    `json:"test_concurrency"`
-	ProxyURL              string `json:"proxy_url"`
-	PgMaxConns            int    `json:"pg_max_conns"`
-	RedisPoolSize         int    `json:"redis_pool_size"`
-	AutoCleanUnauthorized bool   `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited  bool   `json:"auto_clean_rate_limited"`
-	AdminSecret           string `json:"admin_secret"`
-	AdminAuthSource       string `json:"admin_auth_source"`
-	AutoCleanFullUsage    bool   `json:"auto_clean_full_usage"`
-	AutoCleanError        bool   `json:"auto_clean_error"`
-	AutoCleanExpired      bool   `json:"auto_clean_expired"`
-	ProxyPoolEnabled      bool   `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled  bool   `json:"fast_scheduler_enabled"`
-	MaxRetries            int    `json:"max_retries"`
-	AllowRemoteMigration  bool   `json:"allow_remote_migration"`
-	DatabaseDriver        string `json:"database_driver"`
-	DatabaseLabel         string `json:"database_label"`
-	CacheDriver           string `json:"cache_driver"`
-	CacheLabel            string `json:"cache_label"`
-	ExpiredCleaned        int    `json:"expired_cleaned,omitempty"`
-	ModelMapping          string `json:"model_mapping"`
+	MaxConcurrency                   int    `json:"max_concurrency"`
+	GlobalRPM                        int    `json:"global_rpm"`
+	TestModel                        string `json:"test_model"`
+	TestConcurrency                  int    `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes int    `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes          int    `json:"usage_probe_max_age_minutes"`
+	RecoveryProbeIntervalMinutes     int    `json:"recovery_probe_interval_minutes"`
+	ProxyURL                         string `json:"proxy_url"`
+	PgMaxConns                       int    `json:"pg_max_conns"`
+	RedisPoolSize                    int    `json:"redis_pool_size"`
+	AutoCleanUnauthorized            bool   `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited             bool   `json:"auto_clean_rate_limited"`
+	AdminSecret                      string `json:"admin_secret"`
+	AdminAuthSource                  string `json:"admin_auth_source"`
+	AutoCleanFullUsage               bool   `json:"auto_clean_full_usage"`
+	AutoCleanError                   bool   `json:"auto_clean_error"`
+	AutoCleanExpired                 bool   `json:"auto_clean_expired"`
+	ProxyPoolEnabled                 bool   `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled             bool   `json:"fast_scheduler_enabled"`
+	MaxRetries                       int    `json:"max_retries"`
+	AllowRemoteMigration             bool   `json:"allow_remote_migration"`
+	DatabaseDriver                   string `json:"database_driver"`
+	DatabaseLabel                    string `json:"database_label"`
+	CacheDriver                      string `json:"cache_driver"`
+	CacheLabel                       string `json:"cache_label"`
+	ExpiredCleaned                   int    `json:"expired_cleaned,omitempty"`
+	ModelMapping                     string `json:"model_mapping"`
+	ResinURL                         string `json:"resin_url"`
+	ResinPlatformName                string `json:"resin_platform_name"`
 }
 
 type updateSettingsReq struct {
-	MaxConcurrency        *int    `json:"max_concurrency"`
-	GlobalRPM             *int    `json:"global_rpm"`
-	TestModel             *string `json:"test_model"`
-	TestConcurrency       *int    `json:"test_concurrency"`
-	ProxyURL              *string `json:"proxy_url"`
-	PgMaxConns            *int    `json:"pg_max_conns"`
-	RedisPoolSize         *int    `json:"redis_pool_size"`
-	AutoCleanUnauthorized *bool   `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited  *bool   `json:"auto_clean_rate_limited"`
-	AdminSecret           *string `json:"admin_secret"`
-	AutoCleanFullUsage    *bool   `json:"auto_clean_full_usage"`
-	AutoCleanError        *bool   `json:"auto_clean_error"`
-	AutoCleanExpired      *bool   `json:"auto_clean_expired"`
-	ProxyPoolEnabled      *bool   `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled  *bool   `json:"fast_scheduler_enabled"`
-	MaxRetries            *int    `json:"max_retries"`
-	AllowRemoteMigration  *bool   `json:"allow_remote_migration"`
-	ModelMapping          *string `json:"model_mapping"`
+	MaxConcurrency                   *int    `json:"max_concurrency"`
+	GlobalRPM                        *int    `json:"global_rpm"`
+	TestModel                        *string `json:"test_model"`
+	TestConcurrency                  *int    `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes *int    `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes          *int    `json:"usage_probe_max_age_minutes"`
+	RecoveryProbeIntervalMinutes     *int    `json:"recovery_probe_interval_minutes"`
+	ProxyURL                         *string `json:"proxy_url"`
+	PgMaxConns                       *int    `json:"pg_max_conns"`
+	RedisPoolSize                    *int    `json:"redis_pool_size"`
+	AutoCleanUnauthorized            *bool   `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited             *bool   `json:"auto_clean_rate_limited"`
+	AdminSecret                      *string `json:"admin_secret"`
+	AutoCleanFullUsage               *bool   `json:"auto_clean_full_usage"`
+	AutoCleanError                   *bool   `json:"auto_clean_error"`
+	AutoCleanExpired                 *bool   `json:"auto_clean_expired"`
+	ProxyPoolEnabled                 *bool   `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled             *bool   `json:"fast_scheduler_enabled"`
+	MaxRetries                       *int    `json:"max_retries"`
+	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
+	ModelMapping                     *string `json:"model_mapping"`
+	ResinURL                         *string `json:"resin_url"`
+	ResinPlatformName                *string `json:"resin_platform_name"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2020,33 +2209,43 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	dbSettings, _ := h.db.GetSystemSettings(ctx)
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
+	var resinURL, resinPlatformName string
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
+	if dbSettings != nil {
+		resinURL = dbSettings.ResinURL
+		resinPlatformName = dbSettings.ResinPlatformName
+	}
 	c.JSON(http.StatusOK, settingsResponse{
-		MaxConcurrency:        h.store.GetMaxConcurrency(),
-		GlobalRPM:             h.rateLimiter.GetRPM(),
-		TestModel:             h.store.GetTestModel(),
-		TestConcurrency:       h.store.GetTestConcurrency(),
-		ProxyURL:              h.store.GetProxyURL(),
-		PgMaxConns:            h.pgMaxConns,
-		RedisPoolSize:         h.redisPoolSize,
-		AutoCleanUnauthorized: h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:  h.store.GetAutoCleanRateLimited(),
-		AdminSecret:           adminSecret,
-		AdminAuthSource:       adminAuthSource,
-		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:        h.store.GetAutoCleanError(),
-		AutoCleanExpired:      h.store.GetAutoCleanExpired(),
-		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
-		MaxRetries:            h.store.GetMaxRetries(),
-		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
-		DatabaseDriver:        h.databaseDriver,
-		DatabaseLabel:         h.databaseLabel,
-		CacheDriver:           h.cacheDriver,
-		CacheLabel:            h.cacheLabel,
-		ModelMapping:          h.store.GetModelMapping(),
+		MaxConcurrency:                   h.store.GetMaxConcurrency(),
+		GlobalRPM:                        h.rateLimiter.GetRPM(),
+		TestModel:                        h.store.GetTestModel(),
+		TestConcurrency:                  h.store.GetTestConcurrency(),
+		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
+		ProxyURL:                         h.store.GetProxyURL(),
+		PgMaxConns:                       h.pgMaxConns,
+		RedisPoolSize:                    h.redisPoolSize,
+		AutoCleanUnauthorized:            h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:             h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                      adminSecret,
+		AdminAuthSource:                  adminAuthSource,
+		AutoCleanFullUsage:               h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                   h.store.GetAutoCleanError(),
+		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
+		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		MaxRetries:                       h.store.GetMaxRetries(),
+		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                   h.databaseDriver,
+		DatabaseLabel:                    h.databaseLabel,
+		CacheDriver:                      h.cacheDriver,
+		CacheLabel:                       h.cacheLabel,
+		ModelMapping:                     h.store.GetModelMapping(),
+		ResinURL:                         resinURL,
+		ResinPlatformName:                resinPlatformName,
 	})
 }
 
@@ -2108,6 +2307,42 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetTestConcurrency(v)
 		log.Printf("设置已更新: test_concurrency = %d", v)
+	}
+
+	if req.BackgroundRefreshIntervalMinutes != nil {
+		v := *req.BackgroundRefreshIntervalMinutes
+		if v < 1 {
+			v = 1
+		}
+		if v > 1440 {
+			v = 1440
+		}
+		h.store.SetBackgroundRefreshInterval(time.Duration(v) * time.Minute)
+		log.Printf("设置已更新: background_refresh_interval_minutes = %d", v)
+	}
+
+	if req.UsageProbeMaxAgeMinutes != nil {
+		v := *req.UsageProbeMaxAgeMinutes
+		if v < 1 {
+			v = 1
+		}
+		if v > 10080 {
+			v = 10080
+		}
+		h.store.SetUsageProbeMaxAge(time.Duration(v) * time.Minute)
+		log.Printf("设置已更新: usage_probe_max_age_minutes = %d", v)
+	}
+
+	if req.RecoveryProbeIntervalMinutes != nil {
+		v := *req.RecoveryProbeIntervalMinutes
+		if v < 1 {
+			v = 1
+		}
+		if v > 10080 {
+			v = 10080
+		}
+		h.store.SetRecoveryProbeInterval(time.Duration(v) * time.Minute)
+		log.Printf("设置已更新: recovery_probe_interval_minutes = %d", v)
 	}
 
 	if req.ProxyURL != nil {
@@ -2212,26 +2447,53 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: model_mapping")
 	}
 
+	// Resin 粘性代理池配置
+	resinURL := ""
+	resinPlatformName := ""
+	if existSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && existSettings != nil {
+		resinURL = existSettings.ResinURL
+		resinPlatformName = existSettings.ResinPlatformName
+	}
+	if req.ResinURL != nil {
+		resinURL = *req.ResinURL
+		log.Printf("设置已更新: resin_url")
+	}
+	if req.ResinPlatformName != nil {
+		resinPlatformName = *req.ResinPlatformName
+		log.Printf("设置已更新: resin_platform_name")
+	}
+	if req.ResinURL != nil || req.ResinPlatformName != nil {
+		proxy.SetResinConfig(&proxy.ResinConfig{
+			BaseURL:      resinURL,
+			PlatformName: resinPlatformName,
+		})
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
-		MaxConcurrency:        h.store.GetMaxConcurrency(),
-		GlobalRPM:             h.rateLimiter.GetRPM(),
-		TestModel:             h.store.GetTestModel(),
-		TestConcurrency:       h.store.GetTestConcurrency(),
-		ProxyURL:              h.store.GetProxyURL(),
-		PgMaxConns:            h.pgMaxConns,
-		RedisPoolSize:         h.redisPoolSize,
-		AutoCleanUnauthorized: h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:  h.store.GetAutoCleanRateLimited(),
-		AdminSecret:           currentAdminSecret,
-		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:        h.store.GetAutoCleanError(),
-		AutoCleanExpired:      h.store.GetAutoCleanExpired(),
-		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
-		MaxRetries:            h.store.GetMaxRetries(),
-		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && hasAdminSecret,
-		ModelMapping:          h.store.GetModelMapping(),
+		MaxConcurrency:                   h.store.GetMaxConcurrency(),
+		GlobalRPM:                        h.rateLimiter.GetRPM(),
+		TestModel:                        h.store.GetTestModel(),
+		TestConcurrency:                  h.store.GetTestConcurrency(),
+		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
+		ProxyURL:                         h.store.GetProxyURL(),
+		PgMaxConns:                       h.pgMaxConns,
+		RedisPoolSize:                    h.redisPoolSize,
+		AutoCleanUnauthorized:            h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:             h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                      currentAdminSecret,
+		AutoCleanFullUsage:               h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                   h.store.GetAutoCleanError(),
+		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
+		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		MaxRetries:                       h.store.GetMaxRetries(),
+		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
+		ModelMapping:                     h.store.GetModelMapping(),
+		ResinURL:                         resinURL,
+		ResinPlatformName:                resinPlatformName,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2252,30 +2514,35 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, settingsResponse{
-		MaxConcurrency:        h.store.GetMaxConcurrency(),
-		GlobalRPM:             h.rateLimiter.GetRPM(),
-		TestModel:             h.store.GetTestModel(),
-		TestConcurrency:       h.store.GetTestConcurrency(),
-		ProxyURL:              h.store.GetProxyURL(),
-		PgMaxConns:            h.pgMaxConns,
-		RedisPoolSize:         h.redisPoolSize,
-		AutoCleanUnauthorized: h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:  h.store.GetAutoCleanRateLimited(),
-		AdminSecret:           adminSecretForDisplay,
-		AdminAuthSource:       adminAuthSource,
-		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:        h.store.GetAutoCleanError(),
-		AutoCleanExpired:      h.store.GetAutoCleanExpired(),
-		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
-		MaxRetries:            h.store.GetMaxRetries(),
-		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
-		DatabaseDriver:        h.databaseDriver,
-		DatabaseLabel:         h.databaseLabel,
-		CacheDriver:           h.cacheDriver,
-		CacheLabel:            h.cacheLabel,
-		ExpiredCleaned:        expiredCleaned,
-		ModelMapping:          h.store.GetModelMapping(),
+		MaxConcurrency:                   h.store.GetMaxConcurrency(),
+		GlobalRPM:                        h.rateLimiter.GetRPM(),
+		TestModel:                        h.store.GetTestModel(),
+		TestConcurrency:                  h.store.GetTestConcurrency(),
+		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
+		ProxyURL:                         h.store.GetProxyURL(),
+		PgMaxConns:                       h.pgMaxConns,
+		RedisPoolSize:                    h.redisPoolSize,
+		AutoCleanUnauthorized:            h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:             h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                      adminSecretForDisplay,
+		AdminAuthSource:                  adminAuthSource,
+		AutoCleanFullUsage:               h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                   h.store.GetAutoCleanError(),
+		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
+		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		MaxRetries:                       h.store.GetMaxRetries(),
+		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                   h.databaseDriver,
+		DatabaseLabel:                    h.databaseLabel,
+		CacheDriver:                      h.cacheDriver,
+		CacheLabel:                       h.cacheLabel,
+		ExpiredCleaned:                   expiredCleaned,
+		ModelMapping:                     h.store.GetModelMapping(),
+		ResinURL:                         resinURL,
+		ResinPlatformName:                resinPlatformName,
 	})
 }
 

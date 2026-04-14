@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,19 +65,22 @@ type Account struct {
 	recoveryProbeInFlight bool
 
 	// 调度健康信号
-	HealthTier              AccountHealthTier
-	SchedulerScore          float64
-	DynamicConcurrencyLimit int64
-	LatencyEWMA             float64
-	SuccessStreak           int
-	FailureStreak           int
-	LastSuccessAt           time.Time
-	LastFailureAt           time.Time
-	LastUnauthorizedAt      time.Time
-	LastRateLimitedAt       time.Time
-	LastTimeoutAt           time.Time
-	LastServerErrorAt       time.Time
-	LastRecoveryProbeAt     time.Time
+	HealthTier               AccountHealthTier
+	SchedulerScore           float64
+	DispatchScore            float64
+	ScoreBiasEffective       int64
+	BaseConcurrencyEffective int64
+	DynamicConcurrencyLimit  int64
+	LatencyEWMA              float64
+	SuccessStreak            int
+	FailureStreak            int
+	LastSuccessAt            time.Time
+	LastFailureAt            time.Time
+	LastUnauthorizedAt       time.Time
+	LastRateLimitedAt        time.Time
+	LastTimeoutAt            time.Time
+	LastServerErrorAt        time.Time
+	LastRecoveryProbeAt      time.Time
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -91,7 +95,16 @@ type Account struct {
 	AddedAt        int64 // 加入号池的时间（UnixNano），用于过期清理
 	Locked         int32 // 原子标志，1 = 锁定，自动清理跳过此账号
 
+	// per-account 调度配置（nil = 跟随默认）
+	ScoreBiasOverride       *int64
+	BaseConcurrencyOverride *int64
 }
+
+const (
+	defaultBackgroundRefreshInterval = 2 * time.Minute
+	defaultUsageProbeMaxAge          = 10 * time.Minute
+	defaultRecoveryProbeInterval     = 30 * time.Minute
+)
 
 // SchedulerBreakdown 调度评分拆解
 type SchedulerBreakdown struct {
@@ -109,14 +122,19 @@ type SchedulerBreakdown struct {
 
 // SchedulerDebugSnapshot 调度调试快照
 type SchedulerDebugSnapshot struct {
-	HealthTier              string
-	SchedulerScore          float64
-	DynamicConcurrencyLimit int64
-	Breakdown               SchedulerBreakdown
-	LastUnauthorizedAt      time.Time
-	LastRateLimitedAt       time.Time
-	LastTimeoutAt           time.Time
-	LastServerErrorAt       time.Time
+	HealthTier               string
+	SchedulerScore           float64
+	DispatchScore            float64
+	ScoreBiasOverride        *int64
+	ScoreBiasEffective       int64
+	BaseConcurrencyOverride  *int64
+	BaseConcurrencyEffective int64
+	DynamicConcurrencyLimit  int64
+	Breakdown                SchedulerBreakdown
+	LastUnauthorizedAt       time.Time
+	LastRateLimitedAt        time.Time
+	LastTimeoutAt            time.Time
+	LastServerErrorAt        time.Time
 }
 
 // ID 返回数据库 ID
@@ -137,6 +155,70 @@ func clampInt(value, minValue, maxValue int) int {
 		return maxValue
 	}
 	return value
+}
+
+func cloneInt64Ptr(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	cloned := *v
+	return &cloned
+}
+
+func reflectOptionalInt64Field(src any, fieldName string) *int64 {
+	if src == nil || fieldName == "" {
+		return nil
+	}
+
+	v := reflect.ValueOf(src)
+	if !v.IsValid() {
+		return nil
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	if !v.IsValid() || v.Kind() != reflect.Struct {
+		return nil
+	}
+
+	field := v.FieldByName(fieldName)
+	if !field.IsValid() {
+		return nil
+	}
+
+	if field.Kind() == reflect.Pointer {
+		if field.IsNil() {
+			return nil
+		}
+		field = field.Elem()
+	}
+
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		value := field.Int()
+		return &value
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		value := int64(field.Uint())
+		return &value
+	case reflect.Float32, reflect.Float64:
+		value := int64(field.Float())
+		return &value
+	case reflect.Struct:
+		validField := field.FieldByName("Valid")
+		if validField.IsValid() && validField.Kind() == reflect.Bool && !validField.Bool() {
+			return nil
+		}
+		int64Field := field.FieldByName("Int64")
+		if int64Field.IsValid() && int64Field.Kind() == reflect.Int64 {
+			value := int64Field.Int()
+			return &value
+		}
+	}
+
+	return nil
 }
 
 // fastRandN 轻量级随机数（用于调度公平性，无需加密安全）
@@ -170,6 +252,15 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 			return 2
 		}
 		return 1
+	}
+}
+
+func defaultScoreBiasForPlan(planType string) int64 {
+	switch strings.ToLower(strings.TrimSpace(planType)) {
+	case "pro", "plus", "team":
+		return 50
+	default:
+		return 0
 	}
 }
 
@@ -311,6 +402,48 @@ func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
 	return breakdown
 }
 
+func (a *Account) effectiveBaseConcurrencyLocked(storeBaseLimit int64) int64 {
+	if a.BaseConcurrencyOverride != nil && *a.BaseConcurrencyOverride > 0 {
+		return *a.BaseConcurrencyOverride
+	}
+	if storeBaseLimit <= 0 {
+		return 1
+	}
+	return storeBaseLimit
+}
+
+func (a *Account) dispatchBonusEligibleLocked(now time.Time, tier AccountHealthTier) bool {
+	if tier != HealthTierHealthy && tier != HealthTierWarm {
+		return false
+	}
+	if a.Status == StatusError {
+		return false
+	}
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+		return false
+	}
+	if a.healthTierLocked() == HealthTierBanned {
+		return false
+	}
+	if a.usageExhaustedLocked() {
+		return false
+	}
+	if a.AccessToken == "" {
+		return false
+	}
+	return true
+}
+
+func (a *Account) effectiveScoreBiasLocked(now time.Time, tier AccountHealthTier) int64 {
+	if !a.dispatchBonusEligibleLocked(now, tier) {
+		return 0
+	}
+	if a.ScoreBiasOverride != nil {
+		return *a.ScoreBiasOverride
+	}
+	return defaultScoreBiasForPlan(a.PlanType)
+}
+
 func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	now := time.Now()
 	breakdown := a.schedulerBreakdownLocked()
@@ -352,16 +485,23 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		tier = HealthTierBanned
 	}
 
+	baseConcurrencyEffective := a.effectiveBaseConcurrencyLocked(baseLimit)
+	scoreBiasEffective := a.effectiveScoreBiasLocked(now, tier)
+	dispatchScore := score + float64(scoreBiasEffective)
+
 	a.HealthTier = tier
 	a.SchedulerScore = score
-	a.DynamicConcurrencyLimit = concurrencyLimitForTier(baseLimit, tier)
+	a.DispatchScore = dispatchScore
+	a.ScoreBiasEffective = scoreBiasEffective
+	a.BaseConcurrencyEffective = baseConcurrencyEffective
+	a.DynamicConcurrencyLimit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
 }
 
-func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64, int64) {
+func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64, float64, int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.recomputeSchedulerLocked(baseLimit)
-	return a.HealthTier, a.SchedulerScore, a.DynamicConcurrencyLimit
+	return a.HealthTier, a.SchedulerScore, a.DispatchScore, a.DynamicConcurrencyLimit
 }
 
 // IsAvailable 检查账号是否可用
@@ -582,6 +722,47 @@ func (a *Account) GetSchedulerScore() float64 {
 	return a.SchedulerScore
 }
 
+// GetDispatchScore 获取当前用于排序的调度分
+func (a *Account) GetDispatchScore() float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.DispatchScore
+}
+
+// GetScoreBiasOverride 获取账号级分数 override
+func (a *Account) GetScoreBiasOverride() (int64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.ScoreBiasOverride == nil {
+		return 0, false
+	}
+	return *a.ScoreBiasOverride, true
+}
+
+// GetScoreBiasEffective 获取当前实际生效的 bonus
+func (a *Account) GetScoreBiasEffective() int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.ScoreBiasEffective
+}
+
+// GetBaseConcurrencyOverride 获取账号级并发 override
+func (a *Account) GetBaseConcurrencyOverride() (int64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.BaseConcurrencyOverride == nil {
+		return 0, false
+	}
+	return *a.BaseConcurrencyOverride, true
+}
+
+// GetBaseConcurrencyEffective 获取当前实际基础并发
+func (a *Account) GetBaseConcurrencyEffective() int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.BaseConcurrencyEffective
+}
+
 // GetDynamicConcurrencyLimit 获取当前动态并发上限
 func (a *Account) GetDynamicConcurrencyLimit() int64 {
 	a.mu.RLock()
@@ -596,14 +777,19 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 
 	a.recomputeSchedulerLocked(baseLimit)
 	return SchedulerDebugSnapshot{
-		HealthTier:              string(a.HealthTier),
-		SchedulerScore:          a.SchedulerScore,
-		DynamicConcurrencyLimit: a.DynamicConcurrencyLimit,
-		Breakdown:               a.schedulerBreakdownLocked(),
-		LastUnauthorizedAt:      a.LastUnauthorizedAt,
-		LastRateLimitedAt:       a.LastRateLimitedAt,
-		LastTimeoutAt:           a.LastTimeoutAt,
-		LastServerErrorAt:       a.LastServerErrorAt,
+		HealthTier:               string(a.HealthTier),
+		SchedulerScore:           a.SchedulerScore,
+		DispatchScore:            a.DispatchScore,
+		ScoreBiasOverride:        cloneInt64Ptr(a.ScoreBiasOverride),
+		ScoreBiasEffective:       a.ScoreBiasEffective,
+		BaseConcurrencyOverride:  cloneInt64Ptr(a.BaseConcurrencyOverride),
+		BaseConcurrencyEffective: a.BaseConcurrencyEffective,
+		DynamicConcurrencyLimit:  a.DynamicConcurrencyLimit,
+		Breakdown:                a.schedulerBreakdownLocked(),
+		LastUnauthorizedAt:       a.LastUnauthorizedAt,
+		LastRateLimitedAt:        a.LastRateLimitedAt,
+		LastTimeoutAt:            a.LastTimeoutAt,
+		LastServerErrorAt:        a.LastServerErrorAt,
 	}
 }
 
@@ -619,7 +805,7 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 		return false
 	}
 	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" {
-		return true
+		return false // 429 冷却期间不探活，避免加重限流
 	}
 	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() {
 		return true
@@ -705,28 +891,32 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
-	mu                    sync.RWMutex
-	accounts              []*Account
-	accountIndex          map[int64]*Account // DBID → *Account O(1) 索引
-	globalProxy           string
-	maxConcurrency        int64        // 每账号最大并发数
-	testConcurrency       int64        // 批量测试并发数
-	testModel             atomic.Value // 测试连接使用的模型（string）
-	db                    *database.DB
-	tokenCache            cache.TokenCache
-	usageProbeMu          sync.RWMutex
-	usageProbe            func(context.Context, *Account) error
-	usageProbeBatch       atomic.Bool
-	recoveryProbeBatch    atomic.Bool
-	autoCleanUnauthorized atomic.Bool
-	autoCleanRateLimited  atomic.Bool
-	autoCleanFullUsage    atomic.Bool
-	autoCleanError        atomic.Bool
-	autoCleanExpired      atomic.Bool
-	autoCleanupBatch      atomic.Bool
-	maxRetries            int64 // 请求失败最大重试次数（换号重试）
-	stopCh                chan struct{}
-	wg                    sync.WaitGroup
+	mu                        sync.RWMutex
+	accounts                  []*Account
+	accountIndex              map[int64]*Account // DBID → *Account O(1) 索引
+	globalProxy               string
+	maxConcurrency            int64        // 每账号最大并发数
+	testConcurrency           int64        // 批量测试并发数
+	testModel                 atomic.Value // 测试连接使用的模型（string）
+	db                        *database.DB
+	tokenCache                cache.TokenCache
+	usageProbeMu              sync.RWMutex
+	usageProbe                func(context.Context, *Account) error
+	usageProbeBatch           atomic.Bool
+	recoveryProbeBatch        atomic.Bool
+	autoCleanUnauthorized     atomic.Bool
+	autoCleanRateLimited      atomic.Bool
+	autoCleanFullUsage        atomic.Bool
+	autoCleanError            atomic.Bool
+	autoCleanExpired          atomic.Bool
+	autoCleanupBatch          atomic.Bool
+	maxRetries                int64 // 请求失败最大重试次数（换号重试）
+	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
+	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
+	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
+	backgroundRefreshWakeCh   chan struct{}
+	stopCh                    chan struct{}
+	wg                        sync.WaitGroup
 
 	// 代理池
 	proxyPool        []string // 已启用的代理 URL 列表
@@ -781,25 +971,32 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:       2,
-			TestConcurrency:      50,
-			TestModel:            "gpt-5.4",
-			FastSchedulerEnabled: true,
-			ProxyURL:             "",
+			MaxConcurrency:                   2,
+			TestConcurrency:                  50,
+			TestModel:                        "gpt-5.4",
+			FastSchedulerEnabled:             true,
+			BackgroundRefreshIntervalMinutes: 2,
+			UsageProbeMaxAgeMinutes:          10,
+			RecoveryProbeIntervalMinutes:     30,
+			ProxyURL:                         "",
 		}
 	}
 	s := &Store{
-		globalProxy:      settings.ProxyURL,
-		maxConcurrency:   int64(settings.MaxConcurrency),
-		testConcurrency:  int64(settings.TestConcurrency),
-		db:               db,
-		tokenCache:       tc,
-		stopCh:           make(chan struct{}),
-		proxyPoolEnabled: settings.ProxyPoolEnabled,
-		sessionBindings:  make(map[string]sessionAffinity),
-		accountIndex:     make(map[int64]*Account),
+		globalProxy:             settings.ProxyURL,
+		maxConcurrency:          int64(settings.MaxConcurrency),
+		testConcurrency:         int64(settings.TestConcurrency),
+		db:                      db,
+		tokenCache:              tc,
+		backgroundRefreshWakeCh: make(chan struct{}, 1),
+		stopCh:                  make(chan struct{}),
+		proxyPoolEnabled:        settings.ProxyPoolEnabled,
+		sessionBindings:         make(map[string]sessionAffinity),
+		accountIndex:            make(map[int64]*Account),
 	}
 	s.testModel.Store(settings.TestModel)
+	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
+	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
+	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -1030,6 +1227,61 @@ func (s *Store) SetAutoCleanExpired(enabled bool) {
 	s.autoCleanExpired.Store(enabled)
 }
 
+// SetBackgroundRefreshInterval 设置后台刷新/探针巡检间隔。
+func (s *Store) SetBackgroundRefreshInterval(d time.Duration) {
+	if d <= 0 {
+		d = defaultBackgroundRefreshInterval
+	}
+	atomic.StoreInt64(&s.backgroundRefreshInterval, int64(d))
+	select {
+	case s.backgroundRefreshWakeCh <- struct{}{}:
+	default:
+	}
+}
+
+// GetBackgroundRefreshInterval 获取后台刷新/探针巡检间隔。
+func (s *Store) GetBackgroundRefreshInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.backgroundRefreshInterval))
+	if d <= 0 {
+		return defaultBackgroundRefreshInterval
+	}
+	return d
+}
+
+// SetUsageProbeMaxAge 设置用量探针最大缓存时长。
+func (s *Store) SetUsageProbeMaxAge(d time.Duration) {
+	if d <= 0 {
+		d = defaultUsageProbeMaxAge
+	}
+	atomic.StoreInt64(&s.usageProbeMaxAge, int64(d))
+}
+
+// GetUsageProbeMaxAge 获取用量探针最大缓存时长。
+func (s *Store) GetUsageProbeMaxAge() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.usageProbeMaxAge))
+	if d <= 0 {
+		return defaultUsageProbeMaxAge
+	}
+	return d
+}
+
+// SetRecoveryProbeInterval 设置恢复探测最小间隔。
+func (s *Store) SetRecoveryProbeInterval(d time.Duration) {
+	if d <= 0 {
+		d = defaultRecoveryProbeInterval
+	}
+	atomic.StoreInt64(&s.recoveryProbeInterval, int64(d))
+}
+
+// GetRecoveryProbeInterval 获取恢复探测最小间隔。
+func (s *Store) GetRecoveryProbeInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.recoveryProbeInterval))
+	if d <= 0 {
+		return defaultRecoveryProbeInterval
+	}
+	return d
+}
+
 // CleanExpiredNow 立即执行一次过期清理，返回清理数量
 func (s *Store) CleanExpiredNow() int {
 	return s.CleanExpiredAccounts(context.Background(), 30*time.Minute)
@@ -1087,6 +1339,8 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			HealthTier:   HealthTierWarm,
 			AddedAt:      row.CreatedAt.UnixNano(),
 		}
+		account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
+		account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
 		if row.Locked {
 			atomic.StoreInt32(&account.Locked, 1)
 		}
@@ -1165,24 +1419,37 @@ func (s *Store) StartBackgroundRefresh() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		refreshTicker := time.NewTicker(2 * time.Minute)
+		refreshTimer := time.NewTimer(s.GetBackgroundRefreshInterval())
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
-		defer refreshTicker.Stop()
+		defer refreshTimer.Stop()
 		defer autoCleanupTicker.Stop()
 		defer fullUsageCleanupTicker.Stop()
 		defer expiredCleanupTicker.Stop()
 		defer rebuildSchedulerTicker.Stop()
 
+		resetRefreshTimer := func() {
+			if !refreshTimer.Stop() {
+				select {
+				case <-refreshTimer.C:
+				default:
+				}
+			}
+			refreshTimer.Reset(s.GetBackgroundRefreshInterval())
+		}
+
 		for {
 			select {
-			case <-refreshTicker.C:
+			case <-refreshTimer.C:
 				s.parallelRefreshAll(context.Background())
 				s.TriggerUsageProbeAsync()
 				s.TriggerRecoveryProbeAsync()
+				refreshTimer.Reset(s.GetBackgroundRefreshInterval())
+			case <-s.backgroundRefreshWakeCh:
+				resetRefreshTimer()
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
 			case <-fullUsageCleanupTicker.C:
@@ -1263,12 +1530,9 @@ func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 
 	var best *Account
 	bestPriority := -1
-	bestScore := -math.MaxFloat64
+	bestDispatchScore := -math.MaxFloat64
 	var bestLoad int64 = math.MaxInt64
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
-
-	// 收集所有可用候选（用于公平调度）
-	var candidates []*Account
 
 	for _, acc := range s.accounts {
 		if exclude != nil && exclude[acc.DBID] {
@@ -1279,32 +1543,20 @@ func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 		}
 
 		load := atomic.LoadInt64(&acc.ActiveRequests)
-		tier, score, limit := acc.schedulerSnapshot(maxConcurrency)
+		tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
 		if limit <= 0 || load >= limit {
 			continue
 		}
 
-		candidates = append(candidates, acc)
-
 		priority := tierPriority(tier)
 		if priority > bestPriority ||
-			(priority == bestPriority && (score > bestScore ||
-				(score == bestScore && load < bestLoad) ||
-				(score == bestScore && load == bestLoad && fastRandN(2) == 0))) {
+			(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+				(dispatchScore == bestDispatchScore && load < bestLoad) ||
+				(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))) {
 			bestPriority = priority
-			bestScore = score
+			bestDispatchScore = dispatchScore
 			bestLoad = load
 			best = acc
-		}
-	}
-
-	// Warm 公平调度：15% 概率随机选一个非 best 候选，避免 warm 饥饿
-	if best != nil && len(candidates) > 1 && bestPriority >= tierPriority(HealthTierHealthy) {
-		if fastRandN(100) < 15 {
-			alt := candidates[fastRandN(len(candidates))]
-			if alt != best {
-				best = alt
-			}
 		}
 	}
 
@@ -1406,7 +1658,7 @@ func (s *Store) takeByIDExcluding(id int64, exclude map[int64]bool) *Account {
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	now := time.Now()
-	_, _, limit, available := target.fastSchedulerSnapshot(maxConcurrency, now)
+	_, _, limit, _, available := target.fastSchedulerSnapshot(maxConcurrency, now)
 	if !available || limit <= 0 {
 		return nil
 	}
@@ -1528,6 +1780,21 @@ func (s *Store) GetTestConcurrency() int {
 	return int(atomic.LoadInt64(&s.testConcurrency))
 }
 
+// GetBackgroundRefreshIntervalMinutes 获取后台巡检间隔（分钟）。
+func (s *Store) GetBackgroundRefreshIntervalMinutes() int {
+	return int(s.GetBackgroundRefreshInterval() / time.Minute)
+}
+
+// GetUsageProbeMaxAgeMinutes 获取用量探针最大缓存时长（分钟）。
+func (s *Store) GetUsageProbeMaxAgeMinutes() int {
+	return int(s.GetUsageProbeMaxAge() / time.Minute)
+}
+
+// GetRecoveryProbeIntervalMinutes 获取恢复探测最小间隔（分钟）。
+func (s *Store) GetRecoveryProbeIntervalMinutes() int {
+	return int(s.GetRecoveryProbeInterval() / time.Minute)
+}
+
 // SetModelMapping 动态更新模型映射 JSON
 func (s *Store) SetModelMapping(mapping string) {
 	s.modelMapping.Store(mapping)
@@ -1584,6 +1851,22 @@ func (s *Store) FindByID(dbID int64) *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.accountIndex[dbID]
+}
+
+// ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
+func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, baseConcurrencyOverride *int64) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	acc.ScoreBiasOverride = cloneInt64Ptr(scoreBiasOverride)
+	acc.BaseConcurrencyOverride = cloneInt64Ptr(baseConcurrencyOverride)
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
 }
 
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
@@ -2016,7 +2299,7 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	for _, acc := range accounts {
-		if !acc.NeedsUsageProbe(10 * time.Minute) {
+		if !acc.NeedsUsageProbe(s.GetUsageProbeMaxAge()) {
 			continue
 		}
 		if !acc.TryBeginUsageProbe() {
@@ -2058,7 +2341,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	for _, acc := range accounts {
-		if !acc.NeedsRecoveryProbe(30 * time.Minute) {
+		if !acc.NeedsRecoveryProbe(s.GetRecoveryProbeInterval()) {
 			continue
 		}
 		if !acc.TryBeginRecoveryProbe() {
@@ -2282,8 +2565,9 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
 	}
 
-	// 3. 执行 RT 刷新
-	td, info, err := RefreshWithRetry(ctx, rt, proxy)
+	// 3. 执行 RT 刷新（Resin 启用时传入 DBID 用于粘性代理）
+	resinID := fmt.Sprintf("%d", dbID)
+	td, info, err := RefreshWithRetry(ctx, rt, proxy, resinID)
 	if err != nil {
 		if isNonRetryable(err) {
 			acc.mu.Lock()
@@ -2304,9 +2588,18 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.ExpiresAt = td.ExpiresAt
 	acc.ErrorMsg = ""
 	if info != nil {
-		acc.AccountID = info.ChatGPTAccountID
-		acc.Email = info.Email
-		acc.PlanType = info.PlanType
+		if info.ChatGPTAccountID != "" {
+			acc.AccountID = info.ChatGPTAccountID
+		}
+		if info.Email != "" {
+			acc.Email = info.Email
+		}
+		// 不用空值覆盖已有的 PlanType，避免 plus 号被误标为 free
+		if info.PlanType != "" {
+			acc.PlanType = info.PlanType
+		} else if acc.PlanType == "" {
+			log.Printf("[账号 %d] 刷新后 plan_type 为空，无法识别套餐类型", dbID)
+		}
 	}
 	if activeCooldown {
 		acc.Status = StatusCooldown
@@ -2335,9 +2628,15 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		"expires_at":    td.ExpiresAt.Format(time.RFC3339),
 	}
 	if info != nil {
-		credentials["account_id"] = info.ChatGPTAccountID
-		credentials["email"] = info.Email
-		credentials["plan_type"] = info.PlanType
+		if info.ChatGPTAccountID != "" {
+			credentials["account_id"] = info.ChatGPTAccountID
+		}
+		if info.Email != "" {
+			credentials["email"] = info.Email
+		}
+		if info.PlanType != "" {
+			credentials["plan_type"] = info.PlanType
+		}
 	}
 	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
 		log.Printf("[账号 %d] 更新数据库失败: %v", dbID, err)

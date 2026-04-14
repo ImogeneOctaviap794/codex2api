@@ -25,10 +25,10 @@ type openAIRequest struct {
 
 // openAIMessage 表示一条 OpenAI 消息
 type openAIMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content"` // string 或 []contentPart
+	Role       string           `json:"role"`
+	Content    json.RawMessage  `json:"content"` // string 或 []contentPart
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 // openAIToolCall 表示 assistant 消息中的工具调用
@@ -240,14 +240,14 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		out["reasoning"] = map[string]any{"effort": effort}
 	}
 
-	// 3. service tier（保留合法值，丢弃不支持的）
+	// 3. service tier（保留合法值，丢弃不支持的；fast 映射为上游接受的 priority）
 	tier := req.ServiceTier
 	if tier == "" {
 		tier = req.ServiceTierAlt
 	}
 	tier = strings.TrimSpace(tier)
 	if isAllowedServiceTier(tier) {
-		out["service_tier"] = tier
+		out["service_tier"] = upstreamServiceTier(tier)
 	}
 
 	// 4. tools 格式转换 + schema 清理
@@ -305,12 +305,14 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		}
 	}
 
-	// 4. service tier 清理
+	// 4. service tier 清理（fast 映射为上游接受的 priority）
 	delete(body, "serviceTier")
 	if tier, ok := body["service_tier"].(string); ok {
 		tier = strings.TrimSpace(tier)
 		if !isAllowedServiceTier(tier) {
 			delete(body, "service_tier")
+		} else {
+			body["service_tier"] = upstreamServiceTier(tier)
 		}
 	}
 
@@ -337,9 +339,9 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 					}
 				}
 			}
-			// 递归清理不支持的 JSON Schema 关键字
+			// 递归清理不支持的 JSON Schema 关键字，并修正上游要求的结构
 			if params, ok := toolMap["parameters"].(map[string]any); ok {
-				stripUnsupportedSchemaKeys(params)
+				sanitizeSchemaForUpstream(params)
 			}
 		}
 	}
@@ -387,6 +389,16 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	return result, expandedInputRaw
 }
 
+// PrepareCompactResponsesBody 将 /responses/compact 请求转换为上游可接受的格式。
+// 它复用通用 Responses 预处理，但会移除 compact 端点不接受的自动注入字段。
+func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
+	body, expandedInputRaw := PrepareResponsesBody(rawBody)
+	body, _ = sjson.DeleteBytes(body, "include")
+	body, _ = sjson.DeleteBytes(body, "store")
+	body, _ = sjson.DeleteBytes(body, "stream")
+	return body, expandedInputRaw
+}
+
 // normalizeReasoningEffort 将 reasoning_effort 钳位到上游支持的值
 func normalizeReasoningEffort(effort string) string {
 	if effort == "" {
@@ -403,11 +415,19 @@ func normalizeReasoningEffort(effort string) string {
 // isAllowedServiceTier 判断 service_tier 是否在上游允许的范围内
 func isAllowedServiceTier(tier string) bool {
 	switch tier {
-	case "auto", "default", "flex", "priority", "scale":
+	case "auto", "default", "flex", "priority", "scale", "fast":
 		return true
 	default:
 		return false
 	}
+}
+
+// upstreamServiceTier 将客户端 service_tier 映射为上游接受的值（fast → priority）
+func upstreamServiceTier(tier string) string {
+	if tier == "fast" {
+		return "priority"
+	}
+	return tier
 }
 
 // convertMessagesToInputSlice 将 OpenAI messages 转换为 Codex input 数组（纯内存操作，零中间序列化）
@@ -567,7 +587,7 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 		if len(parsed.Function.Parameters) > 0 {
 			var params map[string]any
 			if json.Unmarshal(parsed.Function.Parameters, &params) == nil {
-				stripUnsupportedSchemaKeys(params)
+				sanitizeSchemaForUpstream(params)
 				item["parameters"] = params
 			}
 		}
@@ -601,8 +621,12 @@ func sanitizeServiceTierForUpstream(body []byte) []byte {
 		return body
 	}
 	switch tier {
-	case "auto", "default", "flex", "priority", "scale":
+	case "auto", "default", "flex", "priority", "scale", "fast":
 		body, _ = sjson.DeleteBytes(body, "serviceTier")
+		// fast 映射为上游接受的 priority
+		if tier == "fast" {
+			body, _ = sjson.SetBytes(body, "service_tier", "priority")
+		}
 		return body
 	default:
 		body, _ = sjson.DeleteBytes(body, "service_tier")
@@ -676,6 +700,64 @@ func stripUnsupportedSchemaKeys(schema map[string]interface{}) {
 			}
 		}
 	}
+}
+
+func sanitizeSchemaForUpstream(schema map[string]interface{}) {
+	stripUnsupportedSchemaKeys(schema)
+	ensureArrayItems(schema)
+}
+
+// ensureArrayItems 递归为缺失 items 的数组 schema 补上空 schema，
+// 兼容上游对 array 必须声明 items 的校验。
+func ensureArrayItems(schema map[string]interface{}) {
+	if schemaDeclaresArray(schema) {
+		if _, ok := schema["items"]; !ok {
+			schema["items"] = map[string]interface{}{}
+		}
+	}
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureArrayItems(sub)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		ensureArrayItems(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					ensureArrayItems(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		ensureArrayItems(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, v := range defs {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureArrayItems(sub)
+			}
+		}
+	}
+}
+
+func schemaDeclaresArray(schema map[string]interface{}) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == "array"
+	case []interface{}:
+		for _, item := range t {
+			if s, ok := item.(string); ok && s == "array" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ==================== 响应翻译: Codex SSE → OpenAI SSE ====================

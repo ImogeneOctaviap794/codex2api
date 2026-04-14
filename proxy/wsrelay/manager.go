@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
 )
 
@@ -436,10 +437,10 @@ func (m *Manager) createConnection(
 		EnableCompression: m.dialer.EnableCompression,
 	}
 
-	// 配置代理
+	// 配置代理（Resin 反代模式下跳过，URL 已包含 Resin 地址）
 	proxyURL := effectiveProxyURL(account, proxyOverride)
 
-	if proxyURL != "" {
+	if !proxy.IsResinEnabled() && proxyURL != "" {
 		proxyURLParsed, err := url.Parse(proxyURL)
 		if err != nil {
 			return nil, fmt.Errorf("parse proxy URL failed: %w", err)

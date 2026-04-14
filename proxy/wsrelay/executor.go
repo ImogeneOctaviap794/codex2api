@@ -86,8 +86,18 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		return nil, fmt.Errorf("构建 WebSocket URL 失败: %w", err)
 	}
 
+	// Resin 反向代理：改写 WS URL 为 Resin 反代地址
+	if proxy.IsResinEnabled() {
+		wsURL = proxy.BuildWebSocketURL(wsURL)
+	}
+
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, accountIDStr, sessionID, apiKey, deviceCfg, ginHeaders)
+
+	// Resin 反代：注入账号身份头
+	if proxy.IsResinEnabled() {
+		headers.Set("X-Resin-Account", proxy.ResinAccountID(account))
+	}
 
 	// 获取或创建连接
 	wc, pr, err := e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)

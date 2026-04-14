@@ -16,19 +16,21 @@ import (
 
 // AccountRow 数据库中的账号行
 type AccountRow struct {
-	ID             int64
-	Name           string
-	Platform       string
-	Type           string
-	Credentials    map[string]interface{}
-	ProxyURL       string
-	Status         string
-	CooldownReason string
-	CooldownUntil  sql.NullTime
-	ErrorMessage   string
-	Locked         bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                      int64
+	Name                    string
+	Platform                string
+	Type                    string
+	Credentials             map[string]interface{}
+	ProxyURL                string
+	Status                  string
+	CooldownReason          string
+	CooldownUntil           sql.NullTime
+	ErrorMessage            string
+	Locked                  bool
+	ScoreBiasOverride       sql.NullInt64
+	BaseConcurrencyOverride sql.NullInt64
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // GetCredential 从 credentials JSONB 获取字符串字段
@@ -206,6 +208,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS score_bias_override INT NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS base_concurrency_override INT NULL;
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
@@ -253,18 +257,21 @@ func (db *DB) migrate(ctx context.Context) error {
 		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 
-	CREATE TABLE IF NOT EXISTS system_settings (
-		id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-		max_concurrency    INT DEFAULT 2,
-		global_rpm         INT DEFAULT 0,
-		test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
-		test_concurrency   INT DEFAULT 50,
-		proxy_url          VARCHAR(500) DEFAULT '',
-		pg_max_conns       INT DEFAULT 50,
-		redis_pool_size    INT DEFAULT 30,
-		auto_clean_unauthorized BOOLEAN DEFAULT FALSE,
-		auto_clean_rate_limited BOOLEAN DEFAULT FALSE
-	);
+		CREATE TABLE IF NOT EXISTS system_settings (
+			id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+			max_concurrency    INT DEFAULT 2,
+			global_rpm         INT DEFAULT 0,
+			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
+			test_concurrency   INT DEFAULT 50,
+			proxy_url          VARCHAR(500) DEFAULT '',
+			pg_max_conns       INT DEFAULT 50,
+			redis_pool_size    INT DEFAULT 30,
+			auto_clean_unauthorized BOOLEAN DEFAULT FALSE,
+			auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
+			background_refresh_interval_minutes INT DEFAULT 2,
+			usage_probe_max_age_minutes INT DEFAULT 10,
+			recovery_probe_interval_minutes INT DEFAULT 30
+		);
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -275,11 +282,16 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 
-	CREATE TABLE IF NOT EXISTS proxies (
+		CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
 		url        VARCHAR(500) NOT NULL UNIQUE,
 		label      VARCHAR(255) DEFAULT '',
@@ -380,24 +392,29 @@ func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error)
 
 // SystemSettings 运行时设置项
 type SystemSettings struct {
-	MaxConcurrency        int
-	GlobalRPM             int
-	TestModel             string
-	TestConcurrency       int
-	ProxyURL              string
-	PgMaxConns            int
-	RedisPoolSize         int
-	AutoCleanUnauthorized bool
-	AutoCleanRateLimited  bool
-	AdminSecret           string
-	AutoCleanFullUsage    bool
-	AutoCleanError        bool
-	AutoCleanExpired      bool
-	ProxyPoolEnabled      bool
-	FastSchedulerEnabled  bool
-	MaxRetries            int
-	AllowRemoteMigration  bool
-	ModelMapping          string // JSON: {"anthropic_model": "codex_model", ...}
+	MaxConcurrency                   int
+	GlobalRPM                        int
+	TestModel                        string
+	TestConcurrency                  int
+	ProxyURL                         string
+	PgMaxConns                       int
+	RedisPoolSize                    int
+	AutoCleanUnauthorized            bool
+	AutoCleanRateLimited             bool
+	AdminSecret                      string
+	AutoCleanFullUsage               bool
+	AutoCleanError                   bool
+	AutoCleanExpired                 bool
+	ProxyPoolEnabled                 bool
+	FastSchedulerEnabled             bool
+	MaxRetries                       int
+	AllowRemoteMigration             bool
+	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
+	BackgroundRefreshIntervalMinutes int
+	UsageProbeMaxAgeMinutes          int
+	RecoveryProbeIntervalMinutes     int
+	ResinURL                         string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
+	ResinPlatformName                string // Resin 平台标识，例如 codex2api
 }
 
 // GetSystemSettings 加载全局设置
@@ -412,13 +429,20 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(allow_remote_migration, false),
 		       COALESCE(auto_clean_error, false),
 		       COALESCE(auto_clean_expired, false),
-		       COALESCE(model_mapping, '{}')
+		       COALESCE(model_mapping, '{}'),
+		       COALESCE(background_refresh_interval_minutes, 2),
+		       COALESCE(usage_probe_max_age_minutes, 10),
+		       COALESCE(recovery_probe_interval_minutes, 30),
+		       COALESCE(resin_url, ''),
+		       COALESCE(resin_platform_name, '')
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
+		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
+		&s.ResinURL, &s.ResinPlatformName,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -429,34 +453,43 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 // UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
 	_, err := db.conn.ExecContext(ctx, `
-		INSERT INTO system_settings (
-			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
-			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
-			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping
-		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-		ON CONFLICT (id) DO UPDATE SET
-			max_concurrency         = EXCLUDED.max_concurrency,
-			global_rpm              = EXCLUDED.global_rpm,
-			test_model              = EXCLUDED.test_model,
-			test_concurrency        = EXCLUDED.test_concurrency,
-			proxy_url               = EXCLUDED.proxy_url,
+			INSERT INTO system_settings (
+				id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
+				fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
+				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
+				resin_url, resin_platform_name
+			)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+			ON CONFLICT (id) DO UPDATE SET
+				max_concurrency         = EXCLUDED.max_concurrency,
+				global_rpm              = EXCLUDED.global_rpm,
+				test_model              = EXCLUDED.test_model,
+				test_concurrency        = EXCLUDED.test_concurrency,
+				proxy_url               = EXCLUDED.proxy_url,
 			pg_max_conns            = EXCLUDED.pg_max_conns,
 			redis_pool_size         = EXCLUDED.redis_pool_size,
 			auto_clean_unauthorized = EXCLUDED.auto_clean_unauthorized,
 			auto_clean_rate_limited = EXCLUDED.auto_clean_rate_limited,
-			admin_secret            = EXCLUDED.admin_secret,
-			auto_clean_full_usage   = EXCLUDED.auto_clean_full_usage,
-			proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled,
-			fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
-			max_retries             = EXCLUDED.max_retries,
-			allow_remote_migration  = EXCLUDED.allow_remote_migration,
-			auto_clean_error        = EXCLUDED.auto_clean_error,
-			auto_clean_expired      = EXCLUDED.auto_clean_expired,
-			model_mapping           = EXCLUDED.model_mapping
-	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
+				admin_secret            = EXCLUDED.admin_secret,
+				auto_clean_full_usage   = EXCLUDED.auto_clean_full_usage,
+				proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled,
+				fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
+				max_retries             = EXCLUDED.max_retries,
+				allow_remote_migration  = EXCLUDED.allow_remote_migration,
+				auto_clean_error        = EXCLUDED.auto_clean_error,
+				auto_clean_expired      = EXCLUDED.auto_clean_expired,
+				model_mapping           = EXCLUDED.model_mapping,
+				background_refresh_interval_minutes = EXCLUDED.background_refresh_interval_minutes,
+				usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
+				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
+				resin_url               = EXCLUDED.resin_url,
+				resin_platform_name     = EXCLUDED.resin_platform_name
+		`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping)
+		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
+		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
+		s.ResinURL, s.ResinPlatformName)
 	return err
 }
 
@@ -885,6 +918,10 @@ type TrafficSnapshot struct {
 
 // GetUsageStats 获取使用统计（基线 + 当前日志）
 func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
+	if db.isSQLite() {
+		return db.getUsageStatsSQLite(ctx)
+	}
+
 	stats := &UsageStats{}
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
@@ -1449,7 +1486,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 // ListActive 获取所有状态为 active 的账号
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), score_bias_override, base_concurrency_override, created_at, updated_at
 		FROM accounts
 		WHERE status = 'active'
 		ORDER BY id
@@ -1479,6 +1516,8 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&cooldownUntilRaw,
 			&a.ErrorMessage,
 			&a.Locked,
+			&a.ScoreBiasOverride,
+			&a.BaseConcurrencyOverride,
 			&createdAtRaw,
 			&updatedAtRaw,
 		); err != nil {
@@ -1500,6 +1539,35 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// UpdateAccountSchedulerConfig 更新账号调度配置。
+func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreBiasOverride sql.NullInt64, baseConcurrencyOverride sql.NullInt64) error {
+	result, err := db.conn.ExecContext(ctx, `
+		UPDATE accounts
+		SET score_bias_override = $1,
+		    base_concurrency_override = $2,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = $3
+	`, nullableInt64Value(scoreBiasOverride), nullableInt64Value(baseConcurrencyOverride), id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func nullableInt64Value(v sql.NullInt64) interface{} {
+	if !v.Valid {
+		return nil
+	}
+	return v.Int64
 }
 
 // SetAccountLocked 设置账号的锁定状态
