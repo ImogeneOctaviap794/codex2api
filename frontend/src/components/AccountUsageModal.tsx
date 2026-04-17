@@ -8,6 +8,17 @@ import { getErrorMessage } from '../utils/error'
 
 const COLORS = ['#7c3aed', '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#8b5cf6', '#06b6d4', '#84cc16', '#f97316']
 
+// GPT-5 家族（Codex）官方定价 · 单位 USD / 1M tokens
+const PRICE_INPUT_PER_1M = 2.5
+const PRICE_OUTPUT_PER_1M = 15.0
+const PRICE_CACHED_PER_1M = 0.25
+
+function formatUSD(amount: number): string {
+  if (amount >= 0.01) return `$${amount.toFixed(2)}`
+  if (amount > 0) return `$${amount.toFixed(4)}`
+  return '$0.00'
+}
+
 interface Props {
   account: AccountRow
   onClose: () => void
@@ -95,10 +106,54 @@ export default function AccountUsageModal({ account, onClose }: Props) {
             <StatRow label={t('accounts.outputTokens')} value={data.output_tokens.toLocaleString()} />
             <StatRow label={t('accounts.reasoningTokens')} value={data.reasoning_tokens.toLocaleString()} />
             <StatRow label={t('accounts.cachedTokens')} value={data.cached_tokens.toLocaleString()} />
+            <CostEstimate data={data} />
           </div>
         </div>
       )}
     </Modal>
+  )
+}
+
+function CostEstimate({ data }: { data: AccountUsageDetail }) {
+  const { t } = useTranslation()
+  const cached = Math.max(0, data.cached_tokens || 0)
+  const nonCachedInput = Math.max(0, (data.input_tokens || 0) - cached)
+  const output = Math.max(0, data.output_tokens || 0)
+
+  const costInput = (nonCachedInput / 1_000_000) * PRICE_INPUT_PER_1M
+  const costCached = (cached / 1_000_000) * PRICE_CACHED_PER_1M
+  const costOutput = (output / 1_000_000) * PRICE_OUTPUT_PER_1M
+  const total = costInput + costCached + costOutput
+
+  return (
+    <div className="mt-3 rounded-lg border border-border bg-muted/20 px-3.5 py-3">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[13px] font-semibold text-foreground">{t('accounts.estimatedCost')}</span>
+        <span className="text-[11px] text-muted-foreground">{t('accounts.estimatedCostHint')}</span>
+      </div>
+      <div className="space-y-1.5 text-[12px]">
+        <CostLine label={t('accounts.costInputNonCached')} qty={nonCachedInput} rate={PRICE_INPUT_PER_1M} cost={costInput} />
+        <CostLine label={t('accounts.costInputCached')} qty={cached} rate={PRICE_CACHED_PER_1M} cost={costCached} />
+        <CostLine label={t('accounts.costOutput')} qty={output} rate={PRICE_OUTPUT_PER_1M} cost={costOutput} />
+        <div className="h-px bg-border/60 my-1.5" />
+        <div className="flex items-center justify-between">
+          <span className="text-[13px] font-semibold text-foreground">{t('accounts.costTotal')}</span>
+          <span className="text-[15px] font-bold tabular-nums text-emerald-600 dark:text-emerald-400">{formatUSD(total)}</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CostLine({ label, qty, rate, cost }: { label: string; qty: number; rate: number; cost: number }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-muted-foreground shrink-0">{label}</span>
+      <span className="flex-1 text-right text-muted-foreground/80 text-[11px] tabular-nums">
+        {qty.toLocaleString()} × ${rate.toFixed(2)}/M
+      </span>
+      <span className="w-16 text-right font-semibold tabular-nums text-foreground">{formatUSD(cost)}</span>
+    </div>
   )
 }
 

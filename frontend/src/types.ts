@@ -33,6 +33,7 @@ export interface AccountRow {
   plan_type: string
   status: AccountStatus
   at_only?: boolean
+  expires_at?: string
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number

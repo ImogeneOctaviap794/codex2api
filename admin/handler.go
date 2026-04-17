@@ -314,6 +314,7 @@ type accountResponse struct {
 	PlanType                 string                     `json:"plan_type"`
 	Status                   string                     `json:"status"`
 	ATOnly                   bool                       `json:"at_only"`
+	ExpiresAt                string                     `json:"expires_at,omitempty"`
 	HealthTier               string                     `json:"health_tier"`
 	SchedulerScore           float64                    `json:"scheduler_score"`
 	DispatchScore            float64                    `json:"dispatch_score"`
@@ -392,6 +393,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			PlanType:                 row.GetCredential("plan_type"),
 			Status:                   row.Status,
 			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ExpiresAt:                row.GetCredential("expires_at"),
 			ProxyURL:                 row.ProxyURL,
 			Locked:                   row.Locked,
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),

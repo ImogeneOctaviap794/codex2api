@@ -1063,9 +1063,7 @@ export default function Accounts() {
                         <TableCell className="text-[14px] text-muted-foreground">
                           {account.email || '-'}
                           {account.at_only && (
-                            <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                              AT
-                            </span>
+                            <ATExpiryBadge expiresAt={account.expires_at} />
                           )}
                           {account.locked && (
                             <span className="ml-1.5 inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
@@ -2242,6 +2240,49 @@ function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt
       </div>
       {resetText && <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">⏱ {resetText}</div>}
     </div>
+  )
+}
+
+// AT 到期徽章：从 JWT exp 解析出的 expires_at 展示剩余时长
+// 颜色等级：<3d 红 / <7d 橙 / <30d 黄 / >=30d 常规琥珀
+function ATExpiryBadge({ expiresAt }: { expiresAt?: string }) {
+  let suffix = ''
+  let tone: 'neutral' | 'warn' | 'danger' = 'neutral'
+  let title = 'Access Token-only account'
+
+  if (expiresAt) {
+    const exp = new Date(expiresAt).getTime()
+    const diffMs = exp - Date.now()
+    const absHours = Math.abs(diffMs) / 3600000
+    title = `AT exp: ${new Date(expiresAt).toLocaleString()}`
+    if (diffMs <= 0) {
+      suffix = ' · expired'
+      tone = 'danger'
+    } else if (absHours < 24) {
+      suffix = ` · ${Math.floor(absHours)}h`
+      tone = 'danger'
+    } else {
+      const days = Math.floor(absHours / 24)
+      suffix = ` · ${days}d`
+      if (days < 7) tone = 'danger'
+      else if (days < 30) tone = 'warn'
+    }
+  }
+
+  const toneClass =
+    tone === 'danger'
+      ? 'bg-red-50 text-red-700 ring-red-600/20 dark:bg-red-950 dark:text-red-400 dark:ring-red-400/20'
+      : tone === 'warn'
+        ? 'bg-orange-50 text-orange-700 ring-orange-600/20 dark:bg-orange-950 dark:text-orange-400 dark:ring-orange-400/20'
+        : 'bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20'
+
+  return (
+    <span
+      className={`ml-1.5 inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset ${toneClass}`}
+      title={title}
+    >
+      AT{suffix}
+    </span>
   )
 }
 
