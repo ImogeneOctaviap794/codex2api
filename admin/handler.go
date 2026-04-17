@@ -341,6 +341,32 @@ type accountResponse struct {
 	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
 	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
 	Locked                   bool                       `json:"locked"`
+	// 近 7 天成本估算（USD，按 gpt-5 价目表：输入 $2.5、缓存读取 $0.25、输出 $15 / 1M tokens）
+	EstimatedCost7d float64 `json:"estimated_cost_7d"`
+}
+
+// GPT-5 家族价目表（USD per 1M tokens）
+const (
+	priceInputPer1M  = 2.5
+	priceCachedPer1M = 0.25
+	priceOutputPer1M = 15.0
+)
+
+// estimateCostUSD 按输入/输出/缓存 token 数量估算费用（单位 USD）
+func estimateCostUSD(inputTokens, outputTokens, cachedTokens int64) float64 {
+	nonCachedInput := inputTokens - cachedTokens
+	if nonCachedInput < 0 {
+		nonCachedInput = 0
+	}
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	if outputTokens < 0 {
+		outputTokens = 0
+	}
+	return float64(nonCachedInput)/1_000_000*priceInputPer1M +
+		float64(cachedTokens)/1_000_000*priceCachedPer1M +
+		float64(outputTokens)/1_000_000*priceOutputPer1M
 }
 
 type schedulerBreakdownResponse struct {
@@ -466,6 +492,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if rc, ok := reqCounts[row.ID]; ok {
 			resp.SuccessRequests = rc.SuccessCount
 			resp.ErrorRequests = rc.ErrorCount
+			resp.EstimatedCost7d = estimateCostUSD(rc.InputTokens, rc.OutputTokens, rc.CachedTokens)
 		}
 		all = append(all, resp)
 	}

@@ -218,6 +218,7 @@
     "costInputCached": "Cached read",
     "costOutput": "Output",
     "costTotal": "Total",
+    "costHint": "Estimated 7-day cost (gpt-5 pricing)",
     "noUsageData": "No usage data yet",
     "searchPlaceholder": "Search email or name…",
     "usage5h": "5h",

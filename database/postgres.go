@@ -1451,15 +1451,22 @@ type AccountRequestCount struct {
 	AccountID    int64
 	SuccessCount int64
 	ErrorCount   int64
+	// Token 聚合（近 7 天，仅 status_code<400 的成功请求）
+	InputTokens  int64
+	OutputTokens int64
+	CachedTokens int64
 }
 
-// GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数
+// GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数及 token 总量
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
 	since := time.Now().AddDate(0, 0, -7)
 	query := `
 	SELECT account_id,
 		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
-		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
+		COALESCE(SUM(CASE WHEN status_code < 400 THEN input_tokens ELSE 0 END), 0)  AS input_tokens,
+		COALESCE(SUM(CASE WHEN status_code < 400 THEN output_tokens ELSE 0 END), 0) AS output_tokens,
+		COALESCE(SUM(CASE WHEN status_code < 400 THEN cached_tokens ELSE 0 END), 0) AS cached_tokens
 	FROM usage_logs
 	WHERE created_at >= $1
 	GROUP BY account_id
@@ -1473,7 +1480,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 	result := make(map[int64]*AccountRequestCount)
 	for rows.Next() {
 		rc := &AccountRequestCount{}
-		if err := rows.Scan(&rc.AccountID, &rc.SuccessCount, &rc.ErrorCount); err != nil {
+		if err := rows.Scan(&rc.AccountID, &rc.SuccessCount, &rc.ErrorCount, &rc.InputTokens, &rc.OutputTokens, &rc.CachedTokens); err != nil {
 			return nil, err
 		}
 		result[rc.AccountID] = rc

@@ -218,6 +218,7 @@
     "costInputCached": "缓存读取",
     "costOutput": "输出",
     "costTotal": "合计",
+    "costHint": "按 gpt-5 价目表估算的近 7 天费用",
     "noUsageData": "暂无使用记录",
     "searchPlaceholder": "搜索邮箱或名称…",
     "usage5h": "5h",

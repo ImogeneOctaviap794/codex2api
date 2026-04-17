@@ -64,6 +64,7 @@ export interface AccountRow {
   last_used_at?: ISODateString
   success_requests?: number
   error_requests?: number
+  estimated_cost_7d?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   reset_5h_at?: ISODateString

@@ -1097,6 +1097,14 @@ export default function Accounts() {
                             <span className="text-muted-foreground">/</span>
                             <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
                           </div>
+                          {typeof account.estimated_cost_7d === 'number' && account.estimated_cost_7d > 0 && (
+                            <div
+                              className="mt-0.5 text-[11px] font-medium tabular-nums text-emerald-600/80 dark:text-emerald-400/80"
+                              title={t('accounts.costHint')}
+                            >
+                              {formatCostUSD(account.estimated_cost_7d)}
+                            </div>
+                          )}
                         </TableCell>
                         <TableCell>
                           <UsageCell account={account} />
@@ -2241,6 +2249,13 @@ function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt
       {resetText && <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">⏱ {resetText}</div>}
     </div>
   )
+}
+
+// 按照量级格式化美元金额：≥$0.01 保留两位小数，否则保留四位避免显示成 $0.00
+function formatCostUSD(amount: number): string {
+  if (amount >= 0.01) return `$${amount.toFixed(2)}`
+  if (amount > 0) return `$${amount.toFixed(4)}`
+  return '$0.00'
 }
 
 // AT 到期徽章：从 JWT exp 解析出的 expires_at 展示剩余时长
