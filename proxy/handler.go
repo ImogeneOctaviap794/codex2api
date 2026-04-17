@@ -1749,6 +1749,11 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 
 	result.Used5hHeaders = responseHasCodex5hHeaders(resp)
 	result.UsagePct7d, result.HasUsage7d = parseCodexUsageHeaders(resp, account)
+	// 5h 响应头仅会出现在 Plus/Pro/Team 账号上。若 plan_type 为空（如 AT 来自非 Codex CLI 客户端，
+	// JWT 中不携带 chatgpt_plan_type），回退推断为 plus，避免 UI 显示 "-" 且调度器无法识别 premium。
+	if store != nil && result.Used5hHeaders {
+		store.InferPremiumPlanFromHeaders(account)
+	}
 	if store != nil {
 		if result.HasUsage7d {
 			store.PersistUsageSnapshot(account, result.UsagePct7d)

@@ -98,6 +98,37 @@ func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
 	}
 }
 
+// InferPremiumPlanFromHeaders 在检测到 5h 响应头但 plan_type 为空时回退推断为 "plus"。
+// 仅 Plus/Pro/Team 套餐会返回 5h 窗口头，但头内不区分具体等级，故以 plus 作为最小权限的安全默认。
+// 返回 true 表示确实发生了回退赋值并已持久化。
+func (s *Store) InferPremiumPlanFromHeaders(acc *Account) bool {
+	if acc == nil || s == nil {
+		return false
+	}
+	acc.mu.Lock()
+	if acc.PlanType != "" {
+		acc.mu.Unlock()
+		return false
+	}
+	acc.PlanType = "plus"
+	dbID := acc.DBID
+	acc.mu.Unlock()
+
+	log.Printf("[账号 %d] 依据 5h 响应头回退推断 plan_type=plus", dbID)
+
+	if s.db == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, dbID, map[string]interface{}{
+		"plan_type": "plus",
+	}); err != nil {
+		log.Printf("[账号 %d] 持久化推断 plan_type 失败: %v", dbID, err)
+	}
+	return true
+}
+
 // MarkPremium5hRateLimited 将账号标记为 premium 5h 限流态，并按 resetAt 驱动恢复。
 func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	if acc == nil || s == nil {

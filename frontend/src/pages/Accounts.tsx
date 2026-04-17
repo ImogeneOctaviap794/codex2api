@@ -1,5 +1,5 @@
 import type { ChangeEvent, DragEvent } from 'react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, getAdminKey } from '../api'
 import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
@@ -28,6 +28,8 @@ import {
 import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
+
+const PAGE_SIZE = 20
 
 export default function Accounts() {
   const { t } = useTranslation()
@@ -1177,7 +1179,7 @@ export default function Accounts() {
                 </Table>
               </div>
               <Pagination
-                page={currentPage}
+                page={page}
                 totalPages={totalPages}
                 onPageChange={setPage}
                 totalItems={data.total}

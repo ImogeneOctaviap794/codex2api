@@ -1411,6 +1411,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			}
 		}
 		// 恢复 5h 用量快照
+		has5hSnapshot := false
 		if usagePct5h := row.GetCredential("codex_5h_used_percent"); usagePct5h != "" {
 			if parsed, err := strconv.ParseFloat(usagePct5h, 64); err == nil {
 				resetAt := time.Time{}
@@ -1420,6 +1421,21 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 					}
 				}
 				account.SetUsageSnapshot5h(parsed, resetAt)
+				has5hSnapshot = true
+			}
+		}
+		// 历史数据回退修复：plan_type 为空但已有 5h 用量快照的账号一定是 Plus/Pro/Team，
+		// 自动推断为 plus（最保守默认）以便调度器正确识别 premium 5h 限流语义。
+		// 常见于从非 Codex CLI 客户端（JWT 缺失 chatgpt_plan_type claim）导入的 AT。
+		if has5hSnapshot && account.PlanType == "" {
+			account.PlanType = "plus"
+			log.Printf("[账号 %d] 历史数据修复: 检测到 5h 用量但 plan_type 为空，回退推断为 plus", row.ID)
+			if s.db != nil {
+				if err := s.db.UpdateCredentials(ctx, row.ID, map[string]interface{}{
+					"plan_type": "plus",
+				}); err != nil {
+					log.Printf("[账号 %d] 持久化推断 plan_type 失败: %v", row.ID, err)
+				}
 			}
 		}
 		account.mu.Lock()
