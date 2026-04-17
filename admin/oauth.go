@@ -132,20 +132,6 @@ func oauthCodeChallenge(verifier string) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString(h[:]), "=")
 }
 
-// isLocalhostHost 判断 Host 头是否指向 localhost（含 127.0.0.1、[::1]）
-func isLocalhostHost(host string) bool {
-	// 去除端口号
-	h := host
-	if idx := strings.LastIndex(h, ":"); idx != -1 {
-		// 排除 IPv6 方括号中的冒号
-		if !strings.Contains(h[idx:], "]") {
-			h = h[:idx]
-		}
-	}
-	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
-	return h == "localhost" || h == "127.0.0.1" || h == "::1"
-}
-
 // ==================== Handlers ====================
 
 // GenerateOAuthURL 生成 Codex CLI PKCE OAuth 授权 URL
@@ -159,19 +145,9 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 
 	redirectURI := strings.TrimSpace(req.RedirectURI)
 	if redirectURI == "" {
-		// 自动推导回调地址：
-		// 1. 本地访问时使用请求 Host（浏览器可直接回调）
-		// 2. 远程访问时回退到 localhost 默认值，因为 OpenAI 仅注册了 localhost 回调
-		host := c.Request.Host
-		if host != "" && isLocalhostHost(host) {
-			scheme := "http"
-			if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-				scheme = "https"
-			}
-			redirectURI = fmt.Sprintf("%s://%s/auth/callback", scheme, host)
-		} else {
-			redirectURI = oauthDefaultRedirectURI
-		}
+		// OpenAI OAuth 仅注册了 localhost:1455 回调，始终使用固定默认值
+		// 避免因请求 Host 端口不同（如 localhost:3000）导致回调校验失败（#80）
+		redirectURI = oauthDefaultRedirectURI
 	}
 
 	state, err := oauthRandomHex(32)
