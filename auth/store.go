@@ -386,6 +386,8 @@ func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
 			breakdown.UsagePenalty7d = 40
 		case a.UsagePercent7d >= 95:
 			breakdown.UsagePenalty7d = 30
+		case a.UsagePercent7d >= freeUsageRateLimitThresholdPct: // 90% 起进入软限速
+			breakdown.UsagePenalty7d = 25
 		case a.UsagePercent7d >= 85:
 			breakdown.UsagePenalty7d = 18
 		case a.UsagePercent7d >= 70:
@@ -478,7 +480,7 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	}
 	if a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
 		switch {
-		case a.UsagePercent7d >= 95:
+		case a.UsagePercent7d >= freeUsageRateLimitThresholdPct: // 90% 起降到 Risky（限速）
 			tier = HealthTierRisky
 		case a.UsagePercent7d >= 85 && tier == HealthTierHealthy:
 			tier = HealthTierWarm
@@ -549,6 +551,25 @@ func (a *Account) IsAvailable() bool {
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
 func (a *Account) usageExhaustedLocked() bool {
 	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
+}
+
+// freeUsageRateLimitThresholdPct 定义 Free 账号进入软限速的 7d 用量阈值。
+// 达到该值（默认 90%）时：
+//   - RuntimeStatus 返回 "rate_limited"
+//   - HealthTier 降到 Risky，scheduler 显著降权
+//   - 仍然可被调度（保留 < 10% 剩余额度），直到 100% 触发 usageExhausted 硬阻断
+const freeUsageRateLimitThresholdPct = 90.0
+
+// freeUsageRateLimitedLocked 判断 Free 账号 7d 用量是否处于软限速区间 [90%, 100%)
+// （需持有 mu 读锁）
+func (a *Account) freeUsageRateLimitedLocked() bool {
+	if !a.UsagePercent7dValid {
+		return false
+	}
+	if !strings.EqualFold(a.PlanType, "free") {
+		return false
+	}
+	return a.UsagePercent7d >= freeUsageRateLimitThresholdPct && a.UsagePercent7d < 100
 }
 
 // NeedsRefresh 检查 AT 是否需要刷新（过期前 5 分钟刷新）
@@ -625,6 +646,10 @@ func (a *Account) RuntimeStatus() string {
 		return "usage_exhausted"
 	}
 	if a.premium5hRateLimitedLocked(now) {
+		return "rate_limited"
+	}
+	// Free 账号 7d 用量 >= 90% 进入软限速，状态标记为 rate_limited 但仍可用
+	if a.freeUsageRateLimitedLocked() {
 		return "rate_limited"
 	}
 	switch a.Status {
