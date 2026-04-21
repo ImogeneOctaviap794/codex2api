@@ -10,6 +10,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { usePolling } from '../hooks/usePolling'
 import StatusBadge from '../components/StatusBadge'
 import type { AccountRow, OpsOverviewResponse } from '../types'
+import { formatCompactEmail } from '../lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -252,7 +253,7 @@ export default function SchedulerBoard() {
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="truncate text-[14px] font-semibold text-foreground">
-                              {account.email || `ID ${account.id}`}
+                              {account.email ? formatCompactEmail(account.email) : `ID ${account.id}`}
                             </div>
                             <div className="mt-1 text-[12px] text-muted-foreground">
                               {t('scheduler.score')} {Math.round(getDispatchScore(account))} · {t('scheduler.concurrency')} {account.dynamic_concurrency_limit ?? '-'} · {t('scheduler.plan')} {account.plan_type || '-'}

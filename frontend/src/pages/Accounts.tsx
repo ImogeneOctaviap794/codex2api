@@ -13,6 +13,7 @@ import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { AccountRow, AccountsPagedResponse, AccountSummary, AddAccountRequest, AddATAccountRequest } from '../types'
 import { getErrorMessage } from '../utils/error'
+import { formatCompactEmail } from '../lib/utils'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -1080,7 +1081,7 @@ export default function Accounts() {
                         </TableCell>
                         <TableCell className="text-[14px] font-mono text-muted-foreground">{account.id}</TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
-                          {account.email || '-'}
+                          {formatCompactEmail(account.email)}
                           {account.at_only && (
                             <ATExpiryBadge expiresAt={account.expires_at} />
                           )}
