@@ -29,11 +29,9 @@ import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, 
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
-const PAGE_SIZE = 20
-
 export default function Accounts() {
   const { t } = useTranslation()
-  const pageSizeOptions = [10, 20, 50, 100]
+  const pageSizeOptions = [10, 20, 50, 100, 200]
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
@@ -107,7 +105,7 @@ export default function Accounts() {
   const loadAccounts = useCallback(async () => {
     const data = await api.getAccountsPaged({
       page,
-      page_size: PAGE_SIZE,
+      page_size: pageSize,
       status: statusFilter,
       plan: planFilter,
       search: debouncedSearch,
@@ -115,10 +113,10 @@ export default function Accounts() {
       order: sortKey ? sortDir : undefined,
     })
     return data
-  }, [page, statusFilter, planFilter, debouncedSearch, sortKey, sortDir])
+  }, [page, pageSize, statusFilter, planFilter, debouncedSearch, sortKey, sortDir])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<AccountsPagedResponse>({
-    initialData: { accounts: [], total: 0, page: 1, page_size: PAGE_SIZE, summary: { total: 0, normal: 0, rate_limited: 0, banned: 0, locked: 0, healthy: 0, warm: 0, risky: 0 } },
+    initialData: { accounts: [], total: 0, page: 1, page_size: pageSize, summary: { total: 0, normal: 0, rate_limited: 0, banned: 0, locked: 0, healthy: 0, warm: 0, risky: 0 } },
     load: loadAccounts,
   })
 
@@ -134,7 +132,7 @@ export default function Accounts() {
   const healthyAccounts = summary.healthy
   const warmAccounts = summary.warm
   const riskyAccounts = summary.risky
-  const totalPages = Math.max(1, Math.ceil(data.total / PAGE_SIZE))
+  const totalPages = Math.max(1, Math.ceil(data.total / pageSize))
   const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
 
   useEffect(() => {
@@ -494,8 +492,29 @@ export default function Accounts() {
       }
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
       if (format === 'json') {
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-        downloadBlob(blob, `cpa-${ts}-${data.length}.json`)
+        // 多个账号导出：打包为 zip，每个账号一个 .json 文件
+        if (data.length > 1) {
+          const JSZip = (await import('jszip')).default
+          const zip = new JSZip()
+          const used = new Set<string>()
+          const sanitize = (s: string) => (s || '').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80)
+          data.forEach((entry, idx) => {
+            const base = sanitize(entry.email) || `account_${idx + 1}`
+            let name = `${base}.json`
+            let seq = 2
+            while (used.has(name)) {
+              name = `${base}_${seq++}.json`
+            }
+            used.add(name)
+            zip.file(name, JSON.stringify(entry, null, 2))
+          })
+          const blob = await zip.generateAsync({ type: 'blob' })
+          downloadBlob(blob, `cpa-${ts}-${data.length}.zip`)
+        } else {
+          // 单个账号：保持单 JSON（数组形式）
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+          downloadBlob(blob, `cpa-${ts}-${data.length}.json`)
+        }
       } else {
         const text = data.map(e => e.refresh_token).join('\n')
         const blob = new Blob([text], { type: 'text/plain' })
@@ -1189,7 +1208,12 @@ export default function Accounts() {
                 totalPages={totalPages}
                 onPageChange={setPage}
                 totalItems={data.total}
-                pageSize={PAGE_SIZE}
+                pageSize={pageSize}
+                onPageSizeChange={(next) => {
+                  setPageSize(next)
+                  setPage(1)
+                }}
+                pageSizeOptions={pageSizeOptions}
               />
             </StateShell>
           </CardContent>
