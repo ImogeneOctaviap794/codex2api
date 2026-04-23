@@ -25,7 +25,7 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 	}
 
 	payload := buildTestPayload(h.store.GetTestModel())
-	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", "", "", nil, nil)
+	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	if err != nil {
 		return err
 	}

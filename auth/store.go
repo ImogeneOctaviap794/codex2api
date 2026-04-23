@@ -1193,6 +1193,53 @@ func (s *Store) NextProxy() string {
 	return pool[idx%uint64(len(pool))]
 }
 
+// ResolveProxyForAccount returns the effective proxy for account-bound internal calls.
+// Priority: account proxy > sticky proxy pool > global proxy > direct.
+func (s *Store) ResolveProxyForAccount(acc *Account) string {
+	if s == nil {
+		return ""
+	}
+
+	var accountID int64
+	if acc != nil {
+		acc.mu.RLock()
+		accountID = acc.DBID
+		if proxy := strings.TrimSpace(acc.ProxyURL); proxy != "" {
+			acc.mu.RUnlock()
+			return proxy
+		}
+		acc.mu.RUnlock()
+	}
+
+	return s.resolveFallbackProxyForAccount(accountID)
+}
+
+func (s *Store) resolveFallbackProxyForAccount(accountID int64) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.proxyPoolEnabled && len(s.proxyPool) > 0 {
+		start := stickyProxyIndex(accountID, len(s.proxyPool))
+		for i := 0; i < len(s.proxyPool); i++ {
+			if proxy := strings.TrimSpace(s.proxyPool[(start+i)%len(s.proxyPool)]); proxy != "" {
+				return proxy
+			}
+		}
+	}
+
+	return strings.TrimSpace(s.globalProxy)
+}
+
+func stickyProxyIndex(accountID int64, poolSize int) int {
+	if poolSize <= 1 {
+		return 0
+	}
+	if accountID <= 0 {
+		return 0
+	}
+	return int((accountID - 1) % int64(poolSize))
+}
+
 // GetProxyPoolEnabled 获取代理池开关状态
 func (s *Store) GetProxyPoolEnabled() bool {
 	s.mu.RLock()
@@ -1376,15 +1423,10 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			continue
 		}
 
-		proxy := row.ProxyURL
-		if proxy == "" {
-			proxy = s.globalProxy
-		}
-
 		account := &Account{
 			DBID:         row.ID,
 			RefreshToken: rt,
-			ProxyURL:     proxy,
+			ProxyURL:     strings.TrimSpace(row.ProxyURL),
 			HealthTier:   HealthTierWarm,
 			AddedAt:      row.CreatedAt.UnixNano(),
 		}
@@ -2667,7 +2709,6 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.mu.RLock()
 	rt := acc.RefreshToken
-	proxy := acc.ProxyURL
 	dbID := acc.DBID
 	cooldownUntil := acc.CooldownUtil
 	cooldownReason := acc.CooldownReason
@@ -2738,6 +2779,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 
 	// 3. 执行 RT 刷新（Resin 启用时传入 DBID 用于粘性代理）
 	resinID := fmt.Sprintf("%d", dbID)
+	proxy := s.ResolveProxyForAccount(acc)
 	td, info, err := RefreshWithRetry(ctx, rt, proxy, resinID)
 	if err != nil {
 		if isNonRetryable(err) {
