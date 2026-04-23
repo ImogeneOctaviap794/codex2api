@@ -1575,7 +1575,7 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 		}
 
 		if s.db != nil {
-			if err := s.db.SetError(ctx, acc.DBID, "deleted"); err != nil {
+			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
 				log.Printf("[账号 %d] 清理 %s 状态失败: %v", acc.DBID, targetStatus, err)
 				continue
 			}
@@ -2250,7 +2250,7 @@ func (s *Store) CleanFullUsageAccounts(ctx context.Context) int {
 		}
 
 		if s.db != nil {
-			if err := s.db.SetError(ctx, acc.DBID, "deleted"); err != nil {
+			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
 				log.Printf("[账号 %d] 清理用量满账号失败: %v", acc.DBID, err)
 				continue
 			}
@@ -2320,7 +2320,7 @@ func (s *Store) CleanExpiredAccounts(ctx context.Context, maxAge time.Duration) 
 
 	// 2. 批量更新数据库状态
 	if s.db != nil {
-		if err := s.db.BatchSetError(ctx, expiredIDs, "deleted"); err != nil {
+		if err := s.db.BatchSoftDeleteAccounts(ctx, expiredIDs); err != nil {
 			log.Printf("过期清理: 批量更新数据库失败: %v，回退逐条处理", err)
 			return s.cleanExpiredFallback(ctx, expiredIDs)
 		}
@@ -2342,7 +2342,7 @@ func (s *Store) CleanExpiredAccounts(ctx context.Context, maxAge time.Duration) 
 func (s *Store) cleanExpiredFallback(ctx context.Context, ids []int64) int {
 	cleaned := 0
 	for _, id := range ids {
-		if err := s.db.SetError(ctx, id, "deleted"); err != nil {
+		if err := s.db.SoftDeleteAccount(ctx, id); err != nil {
 			log.Printf("[账号 %d] 过期清理失败: %v", id, err)
 			continue
 		}

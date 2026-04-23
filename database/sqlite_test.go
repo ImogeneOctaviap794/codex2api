@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -39,6 +40,94 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
+	}
+}
+
+func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "delete-me", "rt-delete-me", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+	if err := db.SoftDeleteAccount(ctx, id); err != nil {
+		t.Fatalf("SoftDeleteAccount 返回错误: %v", err)
+	}
+
+	active, err := db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive 返回错误: %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("ListActive 返回 %d 条，want 0", len(active))
+	}
+	if _, err := db.GetAccountByID(ctx, id); err == nil {
+		t.Fatal("GetAccountByID 应该排除已删除账号")
+	}
+
+	var status string
+	var errorMessage string
+	var deletedAt sql.NullString
+	if err := db.conn.QueryRowContext(ctx, `SELECT status, error_message, deleted_at FROM accounts WHERE id = $1`, id).Scan(&status, &errorMessage, &deletedAt); err != nil {
+		t.Fatalf("查询账号状态返回错误: %v", err)
+	}
+	if status != "deleted" {
+		t.Fatalf("status = %q, want deleted", status)
+	}
+	if errorMessage != "" {
+		t.Fatalf("error_message = %q, want empty", errorMessage)
+	}
+	if !deletedAt.Valid || deletedAt.String == "" {
+		t.Fatal("deleted_at 未写入")
+	}
+}
+
+func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	ctx := context.Background()
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	id, err := db.InsertAccount(ctx, "legacy-delete", "rt-legacy-delete", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+	if err := db.SetError(ctx, id, "deleted"); err != nil {
+		t.Fatalf("SetError 返回错误: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close 返回错误: %v", err)
+	}
+
+	db, err = New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	var status string
+	var errorMessage string
+	var deletedAt sql.NullString
+	if err := db.conn.QueryRowContext(ctx, `SELECT status, error_message, deleted_at FROM accounts WHERE id = $1`, id).Scan(&status, &errorMessage, &deletedAt); err != nil {
+		t.Fatalf("查询迁移后账号返回错误: %v", err)
+	}
+	if status != "deleted" {
+		t.Fatalf("status = %q, want deleted", status)
+	}
+	if errorMessage != "" {
+		t.Fatalf("error_message = %q, want empty", errorMessage)
+	}
+	if !deletedAt.Valid || deletedAt.String == "" {
+		t.Fatal("deleted_at 未迁移")
 	}
 }
 

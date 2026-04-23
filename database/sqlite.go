@@ -37,6 +37,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			score_bias_override INTEGER NULL,
 			base_concurrency_override INTEGER NULL,
 			error_message TEXT DEFAULT '',
+			deleted_at TIMESTAMP NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
@@ -127,6 +128,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "cooldown_until", "TIMESTAMP NULL"},
 		{"accounts", "score_bias_override", "INTEGER NULL"},
 		{"accounts", "base_concurrency_override", "INTEGER NULL"},
+		{"accounts", "deleted_at", "TIMESTAMP NULL"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "reasoning_tokens", "INTEGER DEFAULT 0"},
@@ -186,6 +188,19 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
+	}
+
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE accounts
+		SET status = 'deleted',
+			error_message = '',
+			cooldown_reason = '',
+			cooldown_until = NULL,
+			deleted_at = COALESCE(deleted_at, updated_at, CURRENT_TIMESTAMP),
+			updated_at = CURRENT_TIMESTAMP
+		WHERE status <> 'deleted' AND COALESCE(error_message, '') = 'deleted'
+	`); err != nil {
+		return err
 	}
 
 	return nil
