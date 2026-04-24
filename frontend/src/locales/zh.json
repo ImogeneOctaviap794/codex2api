@@ -618,6 +618,14 @@
     "openaiCompat": "OpenAI 兼容",
     "responsesApi": "Responses API",
     "modelList": "模型列表",
+    "dispatchPolicyTitle": "模型派发策略",
+    "dispatchPolicyDesc": "调度器按该策略在账号池中为每个模型挑选账号。premium_only 模型（如 gpt-5.5）只能派发给付费账号（Plus/Pro/Team），上游对 Free 账号直接拒绝；其他模型优先消耗 Free 账号，保留付费配额。",
+    "dispatchPolicyModel": "模型",
+    "dispatchPolicyPolicy": "策略",
+    "dispatchPolicyPreferPlan": "优先 plan",
+    "dispatchPolicyAllowedPlans": "允许的 plan",
+    "dispatchPolicyPremiumOnly": "仅付费",
+    "dispatchPolicyPreferFree": "优先 Free",
     "createFailed": "创建失败",
     "deleteFailed": "删除失败"
   },
@@ -742,7 +750,10 @@
     "anthropicModel": "Anthropic 模型",
     "codexModel": "Codex 模型",
     "addMapping": "添加映射",
-    "messagesEndpoint": "Anthropic Messages API 兼容端点（Claude Code）"
+    "messagesEndpoint": "Anthropic Messages API 兼容端点（Claude Code）",
+    "virtualModelsTitle": "虚拟模型别名（Payload 注入）",
+    "virtualModelsDesc": "将任意模型别名映射到 base_model + inject（tools / tool_choice / reasoning 等）。例如把 image_generation 工具固化为 gpt-draw-1024x1024，客户端只需选模型名即可画图。空值或 {} 表示关闭。命中时请求体的 model 会被换成 base_model，inject 字段会覆盖合并到请求中。注意：画图场景目前仅流式可取图，客户端需带 stream:true。",
+    "virtualModelsExample": "填入画图示例"
   },
   "apiRef": {
     "title": "API 文档",

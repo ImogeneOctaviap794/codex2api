@@ -1,0 +1,77 @@
+package proxy
+
+import "testing"
+
+func TestIsCapacityError(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"empty", "", false},
+		{"unrelated", "Internal server error", false},
+		{"exact OpenAI Codex CLI message",
+			"Selected model is at capacity. Please try a different mode", true},
+		{"lowercase at capacity", "model is at capacity right now", true},
+		{"uppercase AT CAPACITY", "AT CAPACITY, RETRY LATER", true},
+		{"try a different model", "Please try a different model.", true},
+		{"rate limit is NOT capacity", "Rate limit exceeded", false},
+		{"quota is NOT capacity", "You exceeded your current quota", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isCapacityError(c.msg); got != c.want {
+				t.Errorf("isCapacityError(%q) = %v, want %v", c.msg, got, c.want)
+			}
+		})
+	}
+}
+
+func TestTruncateForLog(t *testing.T) {
+	cases := []struct {
+		in     string
+		maxLen int
+		want   string
+	}{
+		{"short", 100, "short"},
+		{"exact", 5, "exact"},
+		{"hello world", 5, "hello…(total=11)"},
+		{"", 10, ""},
+	}
+	for _, c := range cases {
+		if got := truncateForLog(c.in, c.maxLen); got != c.want {
+			t.Errorf("truncateForLog(%q,%d) = %q, want %q", c.in, c.maxLen, got, c.want)
+		}
+	}
+}
+
+func TestExtractResponseFailedErrMsg(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "standard failed event",
+			payload: `{"type":"response.failed","response":{"error":{"message":"Selected model is at capacity. Please try a different mode"}}}`,
+			want:    "Selected model is at capacity. Please try a different mode",
+		},
+		{
+			name:    "missing error field",
+			payload: `{"type":"response.failed","response":{}}`,
+			want:    "",
+		},
+		{
+			name:    "non-failed event",
+			payload: `{"type":"response.completed","response":{"output":[]}}`,
+			want:    "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := extractResponseFailedErrMsg([]byte(c.payload)); got != c.want {
+				t.Errorf("extractResponseFailedErrMsg = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

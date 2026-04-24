@@ -18,6 +18,7 @@ import type {
   StatsResponse,
   CPAExportEntry,
   SystemSettings,
+  ModelPlanPolicy,
   UpdateAccountSchedulerRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
@@ -180,7 +181,7 @@ export const api = {
   getSettings: () => request<SystemSettings>('/settings'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
-  getModels: () => request<{ models: string[] }>('/models'),
+  getModels: () => request<{ models: string[]; model_policies?: Record<string, ModelPlanPolicy> }>('/models'),
   batchTestAccounts: () =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', { method: 'POST' }),
   cleanBanned: () =>

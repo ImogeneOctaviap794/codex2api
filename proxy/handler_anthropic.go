@@ -206,7 +206,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			})
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if (isRetryableStatus(resp.StatusCode) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -238,6 +238,8 @@ func (h *Handler) Messages(c *gin.Context) {
 		var readErr error
 		var writeErr error
 		wroteAnyBody := false
+		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
+		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
@@ -259,6 +261,16 @@ func (h *Handler) Messages(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+
+				// 容量错误透明重试：首包前上游报 "at capacity"，吞掉该事件不翻译不写
+				if eventType == "response.failed" {
+					lastFailedErrMsg = extractResponseFailedErrMsg(data)
+					if !wroteAnyBody && isCapacityError(lastFailedErrMsg) {
+						capacityErrMsg = lastFailedErrMsg
+						gotTerminal = true
+						return false
+					}
+				}
 
 				// TTFT 跟踪
 				if !ttftRecorded && (eventType == "response.output_text.delta" ||
@@ -333,18 +345,41 @@ func (h *Handler) Messages(c *gin.Context) {
 					return false
 				}
 				if eventType == "response.failed" {
+					lastFailedErrMsg = extractResponseFailedErrMsg(data)
+					if isCapacityError(lastFailedErrMsg) {
+						capacityErrMsg = lastFailedErrMsg
+					}
 					gotTerminal = true
 					return false
 				}
 				return true
 			})
 
-			if lastCompletedData != nil {
+			if capacityErrMsg == "" && lastCompletedData != nil {
 				anthropicResp := buildAnthropicResponseFromCompleted(lastCompletedData, originalModel)
 				c.JSON(http.StatusOK, anthropicResp)
-			} else {
+			} else if capacityErrMsg == "" {
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "No complete response received from upstream")
 			}
+			// capacity 错误时暂不响应，由下方透明重试分支处理
+		}
+
+		// 容量错误透明重试：首包前上游报 "at capacity" → 换账号重试，不冷却原账号。
+		// continue 后若 attempt 耗尽，会自然跳出 loop 走 "所有重试都失败" 分支返错误。
+		if capacityErrMsg != "" && !wroteAnyBody {
+			log.Printf("上游返回容量错误，透明重试到其他账号 (attempt %d/%d, account %d, /v1/messages): %s",
+				attempt+1, maxRetries+1, account.ID(), capacityErrMsg)
+			resp.Body.Close()
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			lastErr = errors.New(capacityErrMsg)
+			continue
+		}
+
+		// 0-token debug 日志：gotTerminal 但完全没 delta 的异常响应（用于定位上游隐蔽错误）
+		if gotTerminal && deltaCharCount == 0 && capacityErrMsg == "" {
+			log.Printf("[0-token] account=%d model=%s stream=%t duration=%dms failed_errmsg=%q /v1/messages",
+				account.ID(), model, isStream, int(time.Since(start).Milliseconds()), truncateForLog(lastFailedErrMsg, 200))
 		}
 
 		// 断流检测 + token 估算

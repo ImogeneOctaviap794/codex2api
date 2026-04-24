@@ -18,9 +18,11 @@ type openAIRequest struct {
 	Model           string            `json:"model"`
 	Messages        []openAIMessage   `json:"messages"`
 	Tools           []json.RawMessage `json:"tools"`
+	ToolChoice      json.RawMessage   `json:"tool_choice,omitempty"`
 	ReasoningEffort string            `json:"reasoning_effort"`
 	ServiceTier     string            `json:"service_tier"`
 	ServiceTierAlt  string            `json:"serviceTier"` // 兼容驼峰命名
+	Metadata        map[string]any    `json:"metadata,omitempty"`
 }
 
 // openAIMessage 表示一条 OpenAI 消息
@@ -257,7 +259,138 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		}
 	}
 
+	// 5. tool_choice 原样透传（支持 string "auto"/"none"/"required" 或对象形式
+	// 例如 {"type":"image_generation"} / {"type":"function","name":"..."}）
+	if len(req.ToolChoice) > 0 && string(req.ToolChoice) != "null" {
+		var tc any
+		if err := json.Unmarshal(req.ToolChoice, &tc); err == nil {
+			out["tool_choice"] = tc
+		}
+	}
+
+	// 6. metadata.image_* 运行时覆盖：将客户端通过 metadata 传入的
+	// image_size / quality / background / … 合并到 tools[] 中的
+	// image_generation 条目，允许虚拟模型 inject 的默认被单次覆写。
+	if len(req.Metadata) > 0 {
+		out["metadata"] = cloneMetadata(req.Metadata)
+		mergeImageMetadataIntoTools(out)
+	}
+
 	return json.Marshal(out)
+}
+
+// imageMetadataToolFields 描述 metadata 上的 image_* 键 ⇒ image_generation tool 字段。
+// 仅非空值（字符串不能为""）会被合并进 tool。
+var imageMetadataToolFields = map[string]string{
+	"image_size":               "size",
+	"image_quality":            "quality",
+	"image_background":         "background",
+	"image_output_format":      "output_format",
+	"image_output_compression": "output_compression",
+	"image_moderation":         "moderation",
+	"image_input_fidelity":     "input_fidelity",
+	"image_partial_images":     "partial_images",
+	"image_model":              "model",
+}
+
+// cloneMetadata 浅拷贝一份 metadata，避免修改影响调用者。
+func cloneMetadata(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// mergeImageMetadataIntoTools 将 body["metadata"] 中的 image_* 字段
+// 合并到 body["tools"] 第一个 type=="image_generation" 的条目上。
+//
+// 规则：
+//  1. 仅合并白名单内的键（imageMetadataToolFields）；
+//  2. 空字符串忽略（便于客户端用 env 传空値时走 MODEL_OVERRIDES 默认）；
+//  3. 若 tools 中暂无 image_generation 条目，则新增一条；
+//  4. 已消费的键会从 body["metadata"] 中删除，空 metadata 连同字段一并删除。
+func mergeImageMetadataIntoTools(body map[string]any) {
+	md, ok := body["metadata"].(map[string]any)
+	if !ok || len(md) == 0 {
+		return
+	}
+
+	overrides := make(map[string]any, len(imageMetadataToolFields))
+	for mdKey, toolKey := range imageMetadataToolFields {
+		v, exists := md[mdKey]
+		if !exists {
+			continue
+		}
+		if s, isStr := v.(string); isStr && s == "" {
+			delete(md, mdKey)
+			continue
+		}
+		overrides[toolKey] = v
+		delete(md, mdKey)
+	}
+
+	if len(md) == 0 {
+		delete(body, "metadata")
+	} else {
+		body["metadata"] = md
+	}
+
+	if len(overrides) == 0 {
+		return
+	}
+
+	tools, _ := body["tools"].([]any)
+	for _, t := range tools {
+		tm, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		if ty, _ := tm["type"].(string); ty == "image_generation" {
+			for k, v := range overrides {
+				tm[k] = v
+			}
+			sanitizeImageTool(tm)
+			return
+		}
+	}
+
+	// 没找到现有 image_generation tool→ 新增一个。
+	newTool := map[string]any{"type": "image_generation"}
+	for k, v := range overrides {
+		newTool[k] = v
+	}
+	sanitizeImageTool(newTool)
+	body["tools"] = append(tools, newTool)
+}
+
+// imageModelsSupportingInputFidelity 记录上游支持 input_fidelity 参数的画图模型。
+// gpt-image-2（及空值默认，对应上游默认模型 gpt-image-2）不支持该参数，
+// 强行传会收到 400 "The model 'gpt-image-2' does not support the 'input_fidelity' parameter"。
+// 只有 gpt-image-1 / gpt-image-1.5 / gpt-image-1-mini 保留 input_fidelity。
+var imageModelsSupportingInputFidelity = map[string]bool{
+	"gpt-image-1":      true,
+	"gpt-image-1.5":    true,
+	"gpt-image-1-mini": true,
+}
+
+// sanitizeImageTool 根据 image_generation tool 当前的 model 值，
+// 丢弃上游不兼容的参数，避免上游 400 invalid_input_fidelity_model 等错误。
+//
+// 目前唯一的过滤规则：
+//   - input_fidelity 仅在 model ∈ {gpt-image-1, gpt-image-1.5, gpt-image-1-mini} 时保留。
+//     其它值（空、gpt-image-2、未知新模型）会被删除。
+func sanitizeImageTool(tool map[string]any) {
+	if _, has := tool["input_fidelity"]; !has {
+		return
+	}
+	model, _ := tool["model"].(string)
+	if !imageModelsSupportingInputFidelity[model] {
+		delete(tool, "input_fidelity")
+	}
 }
 
 // PrepareResponsesBody 将 Responses API 原始请求转换为上游可接受的格式
@@ -345,6 +478,10 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 			}
 		}
 	}
+
+	// 6a. metadata.image_* 运行时覆盖（v1.7.10+）：将 body["metadata"] 中的
+	// image_size / quality / … 合并到 tools[].image_generation 上。
+	mergeImageMetadataIntoTools(body)
 
 	// 6. 展开 previous_response_id
 	prevID, _ := body["previous_response_id"].(string)
@@ -877,6 +1014,16 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		delta := gjson.GetBytes(eventData, "delta").String()
 		return newReasoningChunk(chunkID, model, created, delta), false
 
+	case "response.output_item.done":
+		// image_generation_call 终稿：优先写入本地 /images 静态目录并返回 URL；
+		// 本地存储未启用（IMAGE_BASE_URL 未配置）时退回 data URL。
+		if gjson.GetBytes(eventData, "item.type").String() == "image_generation_call" {
+			if b64 := gjson.GetBytes(eventData, "item.result").String(); b64 != "" {
+				return newContentChunk(chunkID, model, created, imageMarkdownFromBase64(b64)), false
+			}
+		}
+		return nil, false
+
 	case "response.completed":
 		usage := extractUsage(eventData)
 		return newFinalChunk(chunkID, model, created, "stop", usage), true
@@ -888,12 +1035,14 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		}
 		return newErrorResponse(errMsg), true
 
-	case "response.content_part.done", "response.output_item.done",
+	case "response.content_part.done",
 		"response.created", "response.in_progress",
 		"response.output_item.added", "response.content_part.added",
 		"response.reasoning_summary_text.done",
 		"response.reasoning.encrypted_content.delta", "response.reasoning.encrypted_content.done",
-		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.image_generation_call.in_progress", "response.image_generation_call.generating",
+		"response.image_generation_call.partial_image", "response.image_generation_call.completed":
 		return nil, false
 
 	default:
@@ -974,6 +1123,15 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 	case "response.function_call_arguments.done":
 		return nil, false
 
+	case "response.output_item.done":
+		// image_generation_call 终稿：优先写本地 /images → URL，未配置则退回 data URL。
+		if gjson.GetBytes(eventData, "item.type").String() == "image_generation_call" {
+			if b64 := gjson.GetBytes(eventData, "item.result").String(); b64 != "" {
+				return newContentChunk(st.ChunkID, st.Model, st.Created, imageMarkdownFromBase64(b64)), false
+			}
+		}
+		return nil, false
+
 	case "response.completed":
 		usage := extractUsage(eventData)
 		finishReason := "stop"
@@ -989,12 +1147,14 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		}
 		return newErrorResponse(errMsg), true
 
-	case "response.content_part.done", "response.output_item.done",
+	case "response.content_part.done",
 		"response.created", "response.in_progress",
 		"response.content_part.added",
 		"response.reasoning_summary_text.done",
 		"response.reasoning.encrypted_content.delta", "response.reasoning.encrypted_content.done",
-		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.image_generation_call.in_progress", "response.image_generation_call.generating",
+		"response.image_generation_call.partial_image", "response.image_generation_call.completed":
 		return nil, false
 
 	default:

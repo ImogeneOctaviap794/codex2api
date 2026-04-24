@@ -975,8 +975,9 @@ type Store struct {
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
-	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
-	modelMapping         atomic.Value // 模型映射 JSON 字符串
+	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
+	modelMapping          atomic.Value // 模型映射 JSON 字符串
+	modelPayloadOverrides atomic.Value // 虚拟模型 payload 覆盖 JSON 字符串
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
 }
@@ -1055,6 +1056,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
+	}
+	if settings.ModelPayloadOverrides != "" {
+		s.modelPayloadOverrides.Store(settings.ModelPayloadOverrides)
 	}
 	// 快速调度器：环境变量优先级最高（显式 true/false）；
 	// 未设置环境变量时默认开启（true），不再依赖数据库值，
@@ -1884,6 +1888,19 @@ func (s *Store) GetModelMapping() string {
 	return "{}"
 }
 
+// SetModelPayloadOverrides 动态更新虚拟模型 payload 覆盖配置 JSON
+func (s *Store) SetModelPayloadOverrides(overrides string) {
+	s.modelPayloadOverrides.Store(overrides)
+}
+
+// GetModelPayloadOverrides 获取当前虚拟模型 payload 覆盖配置 JSON
+func (s *Store) GetModelPayloadOverrides() string {
+	if v, ok := s.modelPayloadOverrides.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
 func (s *Store) AddAccount(acc *Account) {
 	if acc == nil {
@@ -1975,6 +1992,14 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 		} else {
 			acc.HealthTier = HealthTierRisky
 		}
+	case "deactivated_workspace":
+		// 上游 402 {"detail":{"code":"deactivated_workspace"}} = workspace 已被 OpenAI 停用。
+		// 对本账号永久不可用，直接 banned 并锁定失败流水，避免调度再选到它。
+		acc.LastUnauthorizedAt = now
+		acc.LastFailureAt = now
+		acc.FailureStreak++
+		acc.SuccessStreak = 0
+		acc.HealthTier = HealthTierBanned
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
@@ -2520,6 +2545,73 @@ func (s *Store) Accounts() []*Account {
 	result := make([]*Account, len(s.accounts))
 	copy(result, s.accounts)
 	return result
+}
+
+// AccountIDsExcludingPlans 返回 plan_type 不在 keepPlans 中的账号 ID 集合。
+// 用法：当希望仅从指定 plan 中调度时，把其余 plan 全部塞入 exclude。
+func (s *Store) AccountIDsExcludingPlans(keepPlans ...string) map[int64]bool {
+	keepSet := make(map[string]struct{}, len(keepPlans))
+	for _, p := range keepPlans {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		keepSet[p] = struct{}{}
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[int64]bool)
+	for _, acc := range s.accounts {
+		if acc == nil {
+			continue
+		}
+		acc.Mu().RLock()
+		plan := strings.ToLower(strings.TrimSpace(acc.PlanType))
+		id := acc.DBID
+		acc.Mu().RUnlock()
+		if _, keep := keepSet[plan]; keep {
+			continue
+		}
+		out[id] = true
+	}
+	return out
+}
+
+// AccountIDsByPlan 返回指定 plan_type 的账号 ID 集合（小写匹配，不区分大小写）。
+// 用法：调度前构造 exclude 集，避免把只支持付费账号的模型派发给 Free 号。
+func (s *Store) AccountIDsByPlan(planTypes ...string) map[int64]bool {
+	if len(planTypes) == 0 {
+		return nil
+	}
+	planSet := make(map[string]struct{}, len(planTypes))
+	for _, p := range planTypes {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		planSet[p] = struct{}{}
+	}
+	if len(planSet) == 0 {
+		return nil
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[int64]bool)
+	for _, acc := range s.accounts {
+		if acc == nil {
+			continue
+		}
+		acc.Mu().RLock()
+		plan := strings.ToLower(strings.TrimSpace(acc.PlanType))
+		id := acc.DBID
+		acc.Mu().RUnlock()
+		if _, ok := planSet[plan]; ok {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 // ==================== 并行刷新 ====================

@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	defaultDeviceProfileUserAgent      = "codex_cli_rs/0.117.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464"
-	defaultDeviceProfilePackageVersion = "0.117.0"
+	defaultDeviceProfileUserAgent      = "codex_cli_rs/0.124.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464"
+	defaultDeviceProfilePackageVersion = "0.124.0"
 	defaultDeviceProfileRuntimeVersion = "rustc/1.85.0"
 	defaultDeviceProfileOS             = "MacOS"
 	defaultDeviceProfileArch           = "arm64"

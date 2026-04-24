@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +42,33 @@ type Handler struct {
 func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
+	}
+	return h.store.NextForSession(sessionID, exclude)
+}
+
+// nextAccountForSessionWithPreference 按 plan 偏好的两阶段选号：
+//  1. 先把 preferPlan 以外的账号全部视作 exclude，只在偏好池中选；
+//  2. 偏好池空/全忙时，回退到普通 exclude 选号。
+// preferPlan 为空则退化为普通选号。
+func (h *Handler) nextAccountForSessionWithPreference(sessionID string, exclude map[int64]bool, preferPlan string) (*auth.Account, string) {
+	if h == nil || h.store == nil {
+		return nil, ""
+	}
+	preferPlan = strings.ToLower(strings.TrimSpace(preferPlan))
+	if preferPlan != "" {
+		nonPref := h.store.AccountIDsExcludingPlans(preferPlan)
+		if len(nonPref) > 0 {
+			merged := make(map[int64]bool, len(exclude)+len(nonPref))
+			for id := range exclude {
+				merged[id] = true
+			}
+			for id := range nonPref {
+				merged[id] = true
+			}
+			if acc, sticky := h.store.NextForSession(sessionID, merged); acc != nil {
+				return acc, sticky
+			}
+		}
 	}
 	return h.store.NextForSession(sessionID, exclude)
 }
@@ -324,6 +353,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.POST("/responses", h.Responses)
 	v1.POST("/responses/compact", h.ResponsesCompact)
 	v1.POST("/messages", h.Messages)
+	v1.POST("/images/generations", h.ImagesGenerations)
 	v1.GET("/models", h.ListModels)
 
 	// 无前缀路由（兼容 base_url 已包含 /v1 的客户端）
@@ -331,6 +361,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/responses", auth, h.Responses)
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
 	r.POST("/messages", auth, h.Messages)
+	r.POST("/images/generations", auth, h.ImagesGenerations)
 	r.GET("/models", auth, h.ListModels)
 }
 
@@ -388,6 +419,83 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 
 // ==================== /v1/responses ====================
 
+// drawingResponseModelAlias 虚拟模型命中（画图请求）时响应体中对外展示的统一模型名。
+// 不管客户端选的是哪个 gpt-draw-* 虚拟模型，也不管 base_model 是 gpt-5.4-mini
+// 还是别的，对外统一显示为 gpt-5.4，避免泄露内部实现。
+const drawingResponseModelAlias = "gpt-5.4"
+
+// applyVirtualModel 在请求体进入校验/翻译流程之前，识别并改写虚拟模型请求。
+// 如果 body 里的 model 命中虚拟模型配置，则替换为 base_model 并合并 inject 字段。
+// 未命中或未配置时返回原 body。
+// 第二个返回值是 hit 的虚拟模型配置（nil 表示未命中），供调用者判断是否是画图请求。
+func (h *Handler) applyVirtualModel(rawBody []byte) ([]byte, *ModelOverride) {
+	overrides := ParseModelOverrides(h.store.GetModelPayloadOverrides())
+	if len(overrides) == 0 {
+		return rawBody, nil
+	}
+	return ApplyModelOverride(rawBody, overrides)
+}
+
+// responseModelFor 选响应体中对外展示的 model 名。
+// 命中虚拟模型（画图）→返回 drawingResponseModelAlias；否则返回原始 model。
+func responseModelFor(model string, hit *ModelOverride) string {
+	if hit != nil {
+		return drawingResponseModelAlias
+	}
+	return model
+}
+
+// rewriteResponseModelIfDrawing 在画图场景下（hit != nil）把 JSON 数据中指定 path
+// 的 model 字段原地改写为 drawingResponseModelAlias。其他情况原样返回。
+// path 支持 sjson 语法，如 "model" 或 "response.model"。
+func rewriteResponseModelIfDrawing(data []byte, hit *ModelOverride, path string) []byte {
+	if hit == nil || len(data) == 0 {
+		return data
+	}
+	if !gjson.GetBytes(data, path).Exists() {
+		return data
+	}
+	if rewritten, err := sjson.SetBytes(data, path, drawingResponseModelAlias); err == nil {
+		return rewritten
+	}
+	return data
+}
+
+// applyUpstreamModelOverride 隐藏参数：如果 body 中 metadata.upstream_model 非空，
+// 就把 body.model 直接覆盖为该值，并从 metadata 里删除此字段。用于客户端单次临时
+// 切换上游模型名，绕过虚拟模型的 base_model 绑定（高级用户功能）。
+//
+// 与虚拟模型 inject 的关系：
+//   - 先执行 applyVirtualModel（若命中则把 model 换成 base_model、合并 inject）
+//   - 再执行本函数（若 metadata.upstream_model 存在则覆盖 model）
+//
+// 覆盖后的 model 仍会走 validator（ModelValidator(SupportedModels)），
+// 防止注入非法模型名。
+func applyUpstreamModelOverride(rawBody []byte) []byte {
+	if len(rawBody) == 0 {
+		return rawBody
+	}
+	overrideModel := gjson.GetBytes(rawBody, "metadata.upstream_model").String()
+	if overrideModel == "" {
+		return rawBody
+	}
+
+	out, err := sjson.SetBytes(rawBody, "model", overrideModel)
+	if err != nil {
+		return rawBody
+	}
+	if cleaned, err := sjson.DeleteBytes(out, "metadata.upstream_model"); err == nil {
+		out = cleaned
+	}
+	// 若 metadata 变成空对象 → 连同字段一并删除，避免污染上游
+	if md := gjson.GetBytes(out, "metadata"); md.IsObject() && len(md.Map()) == 0 {
+		if cleaned, err := sjson.DeleteBytes(out, "metadata"); err == nil {
+			out = cleaned
+		}
+	}
+	return out
+}
+
 // getMaxRetries 从 store 读取可配置的最大重试次数
 func (h *Handler) getMaxRetries() int {
 	return h.store.GetMaxRetries()
@@ -401,6 +509,18 @@ const (
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
+}
+
+// isUpstreamToolNotSupported 判断上游 400 是否因"当前账号不支持请求里的工具"导致
+// 典型场景：image_generation 工具只在 ChatGPT Plus / Team 订阅的 Codex 通道可用，
+// free 账号会返回 "Tool choice 'image_generation' not found in 'tools' parameter."
+// 这类错误不是请求问题，应该换下一个账号重试。
+func isUpstreamToolNotSupported(statusCode int, errBody []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	return bytes.Contains(errBody, []byte("Tool choice")) &&
+		bytes.Contains(errBody, []byte("not found in 'tools' parameter"))
 }
 
 func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
@@ -426,6 +546,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+
+	// 识别并改写虚拟模型（命中时替换 model 为 base_model 并合并 inject 字段）
+	rawBody, virtualHit := h.applyVirtualModel(rawBody)
+	// 隐藏参数：metadata.upstream_model 直接覆盖上游 model 名
+	rawBody = applyUpstreamModelOverride(rawBody)
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
@@ -478,9 +603,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
+	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
@@ -567,7 +693,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			})
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -594,6 +720,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var responseJSON []byte
+		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
+		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -615,6 +743,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+
+				// 容量错误透明重试：首包前上游报 "at capacity"，吞掉该事件不转发
+				if eventType == "response.failed" {
+					lastFailedErrMsg = extractResponseFailedErrMsg(data)
+					if !wroteAnyBody && isCapacityError(lastFailedErrMsg) {
+						capacityErrMsg = lastFailedErrMsg
+						gotTerminal = true
+						return false
+					}
+				}
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
 				if !ttftRecorded && eventType == "response.output_text.delta" {
@@ -641,7 +779,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
+				// 画图场景下将 SSE 事件里的 response.model 改为 gpt-5.4
+				dataToWrite := rewriteResponseModelIfDrawing(data, virtualHit, "response.model")
+				if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", dataToWrite); err != nil {
 					writeErr = err
 					return false
 				}
@@ -652,6 +792,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
+			// Bug 2 修复：image_generation_call 的 result 在 Codex 流式响应里
+			// 仅通过 response.output_item.done 事件下发；非流式客户端需要
+			// 把这些 item 合并回 response.completed.response.output[]。
+			imageItemsByID := make(map[string]json.RawMessage)
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
@@ -662,6 +806,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
+				}
+				if eventType == "response.output_item.done" {
+					if parsed.Get("item.type").String() == "image_generation_call" {
+						if id := parsed.Get("item.id").String(); id != "" {
+							imageItemsByID[id] = json.RawMessage(parsed.Get("item").Raw)
+						}
+					}
 				}
 				if eventType == "response.completed" {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
@@ -675,6 +826,10 @@ func (h *Handler) Responses(c *gin.Context) {
 					return false
 				}
 				if eventType == "response.failed" {
+					lastFailedErrMsg = extractResponseFailedErrMsg(data)
+					if isCapacityError(lastFailedErrMsg) {
+						capacityErrMsg = lastFailedErrMsg
+					}
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -686,8 +841,29 @@ func (h *Handler) Responses(c *gin.Context) {
 				responseObj := gjson.GetBytes(lastResponseData, "response")
 				if responseObj.Exists() {
 					responseJSON = []byte(responseObj.Raw)
+					responseJSON = MergeImageItemsIntoResponse(responseJSON, imageItemsByID)
+					// 画图场景对外统一显示 gpt-5.4
+					responseJSON = rewriteResponseModelIfDrawing(responseJSON, virtualHit, "model")
 				}
 			}
+		}
+
+		// 容量错误透明重试：首包前上游报 "at capacity" → 换账号重试，不冷却原账号。
+		// continue 后若 attempt 耗尽，会自然跳出 loop 走 "所有重试都失败" 分支返 502。
+		if capacityErrMsg != "" && !wroteAnyBody {
+			log.Printf("上游返回容量错误，透明重试到其他账号 (attempt %d/%d, account %d, /v1/responses): %s",
+				attempt+1, maxRetries+1, account.ID(), capacityErrMsg)
+			resp.Body.Close()
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			lastErr = errors.New(capacityErrMsg)
+			continue
+		}
+
+		// 0-token debug 日志：gotTerminal 但完全没 delta 的异常响应（用于定位上游隐蔽错误）
+		if gotTerminal && deltaCharCount == 0 && capacityErrMsg == "" {
+			log.Printf("[0-token] account=%d model=%s stream=%t duration=%dms failed_errmsg=%q /v1/responses",
+				account.ID(), model, isStream, int(time.Since(start).Milliseconds()), truncateForLog(lastFailedErrMsg, 200))
 		}
 
 		// 断流检测 + token 估算
@@ -791,6 +967,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 
+	// 识别并改写虚拟模型（命中时替换 model 为 base_model 并合并 inject 字段）
+	rawBody, virtualHit := h.applyVirtualModel(rawBody)
+	// 隐藏参数：metadata.upstream_model 直接覆盖上游 model 名
+	rawBody = applyUpstreamModelOverride(rawBody)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
@@ -840,9 +1021,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
+	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
 			if account == nil {
@@ -917,7 +1099,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			})
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -964,6 +1146,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		})
 
 		h.store.Release(account)
+		// 画图场景对外统一显示 gpt-5.4
+		respBody = rewriteResponseModelIfDrawing(respBody, virtualHit, "model")
 		c.Data(http.StatusOK, "application/json", respBody)
 		return
 	}
@@ -985,6 +1169,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+
+	// 识别并改写虚拟模型（命中时替换 model 为 base_model 并合并 inject 字段）
+	rawBody, virtualHit := h.applyVirtualModel(rawBody)
+	// 隐藏参数：metadata.upstream_model 直接覆盖上游 model 名
+	rawBody = applyUpstreamModelOverride(rawBody)
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
@@ -1039,9 +1228,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
+	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
@@ -1128,7 +1318,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			})
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -1155,12 +1345,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var compactResult []byte
+		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
+		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
 		created := time.Now().Unix()
 
+		// 画图请求响应体中的 model 统一显示为 gpt-5.4（不泄露 base_model）
+		responseModel := responseModelFor(model, virtualHit)
+
 		if isStream {
-			streamTranslator := NewStreamTranslator(chunkID, model, created)
+			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -1177,10 +1372,23 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				chunk, done := streamTranslator.Translate(data)
-
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+
+				// 容量错误透明重试：若流尚未向下游写入任何字节，且上游报 response.failed
+				// 携带 "at capacity"/"try a different mode" 类错误，则吞掉该事件不翻译、
+				// 不写客户端，让流结束后触发 continue 换账号重试（不冷却原账号）。
+				if eventType == "response.failed" {
+					lastFailedErrMsg = extractResponseFailedErrMsg(data)
+					if !wroteAnyBody && isCapacityError(lastFailedErrMsg) {
+						capacityErrMsg = lastFailedErrMsg
+						gotTerminal = true
+						return false
+					}
+				}
+
+				chunk, done := streamTranslator.Translate(data)
+
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -1237,6 +1445,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					fullContent.WriteString(delta)
 				case "response.function_call_arguments.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
+				case "response.output_item.done":
+					// Bug 2 修复：image_generation_call 终稿出现在 output_item.done 里，
+					// 非流式模式下把 base64 转成 markdown image URL 拼进 content。
+					if parsed.Get("item.type").String() == "image_generation_call" {
+						if b64 := parsed.Get("item.result").String(); b64 != "" {
+							fullContent.WriteString(imageMarkdownFromBase64(b64))
+						}
+					}
 				case "response.completed":
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -1247,13 +1463,35 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 					return false
 				case "response.failed":
+					lastFailedErrMsg = extractResponseFailedErrMsg(data)
+					if isCapacityError(lastFailedErrMsg) {
+						capacityErrMsg = lastFailedErrMsg
+					}
 					gotTerminal = true
 					return false
 				}
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, model, created, fullContent.String(), toolCalls, usage)
+			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), toolCalls, usage)
+		}
+
+		// 容量错误透明重试：首包前上游报 "at capacity" → 换账号重试，不冷却原账号。
+		// continue 后若 attempt 耗尽，会自然跳出 loop 走 "所有重试都失败" 分支返 502。
+		if capacityErrMsg != "" && !wroteAnyBody {
+			log.Printf("上游返回容量错误，透明重试到其他账号 (attempt %d/%d, account %d, /v1/chat/completions): %s",
+				attempt+1, maxRetries+1, account.ID(), capacityErrMsg)
+			resp.Body.Close()
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			lastErr = errors.New(capacityErrMsg)
+			continue
+		}
+
+		// 0-token debug 日志：gotTerminal 但完全没 delta 的异常响应（用于定位上游隐蔽错误）
+		if gotTerminal && deltaCharCount == 0 && capacityErrMsg == "" {
+			log.Printf("[0-token] account=%d model=%s stream=%t duration=%dms failed_errmsg=%q /v1/chat/completions",
+				account.ID(), model, isStream, int(time.Since(start).Milliseconds()), truncateForLog(lastFailedErrMsg, 200))
 		}
 
 		// 断流检测 + token 估算
@@ -1433,6 +1671,30 @@ func parseRetryAfter(body []byte) time.Duration {
 
 	// 默认 2 分钟
 	return 2 * time.Minute
+}
+
+// IsDeactivatedWorkspace 判断上游 402 响应体是否来自 workspace 被停用。
+// 导出版本，供 admin 测试路径复用。
+// Codex 对已停用的 team/enterprise workspace 返回:
+//   - {"detail":{"code":"deactivated_workspace"}}
+//   - {"error":{"code":"deactivated_workspace"}}
+// 该账号对任何 API 请求都不可恢复，应永久禁用并换号重试。
+func IsDeactivatedWorkspace(body []byte) bool {
+	return isDeactivatedWorkspace(body)
+}
+
+// isDeactivatedWorkspace 内部实现。
+func isDeactivatedWorkspace(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "detail.code").String()), "deactivated_workspace") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()), "deactivated_workspace") {
+		return true
+	}
+	return false
 }
 
 func isMissingScopeUnauthorized(body []byte) bool {
@@ -1653,6 +1915,27 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 			h.store.RemoveAccount(account.ID())
 		} else {
 			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
+		}
+	case http.StatusPaymentRequired:
+		// 402 目前只处理已知的 deactivated_workspace 语义：
+		// workspace 被 OpenAI 停用后所有请求都会命中，账号永久不可恢复。
+		// 其它未知 402 暂不改变账号状态，仅靠本次请求的 excludeAccounts 换号。
+		if !isDeactivatedWorkspace(body) {
+			return
+		}
+		atomic.StoreInt32(&account.Disabled, 1)
+		if h.store.GetAutoCleanUnauthorized() {
+			log.Printf("账号 %d 收到 402 deactivated_workspace，立即清理", account.ID())
+			if h.db != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = h.db.SetError(ctx, account.ID(), "deleted")
+				cancel()
+				h.db.InsertAccountEventAsync(account.ID(), "deleted", "auto_clean_deactivated_workspace")
+			}
+			h.store.RemoveAccount(account.ID())
+		} else {
+			log.Printf("账号 %d 收到 402 deactivated_workspace，标记为 banned", account.ID())
+			h.store.MarkCooldown(account, 7*24*time.Hour, "deactivated_workspace")
 		}
 	}
 }
@@ -1900,14 +2183,99 @@ func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, sta
 
 // SupportedModels 支持的模型列表（全局共享）
 var SupportedModels = []string{
-	"gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
+	"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
 	"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
 	"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
 }
 
-// ListModels 列出可用模型
+// premiumOnlyModels 仅对 Plus/Pro/Team 账号开放的模型。
+// 上游 Codex 后端对 Free 账号直接 HTTP 400 "model is not supported"。
+// 为避免浪费重试与健康分惩罚，调度时从候选池中排除 free 账号。
+var premiumOnlyModels = map[string]struct{}{
+	"gpt-5.5": {},
+}
+
+// IsPremiumOnlyModel 判断模型是否仅对付费账号开放。
+func IsPremiumOnlyModel(model string) bool {
+	_, ok := premiumOnlyModels[strings.ToLower(strings.TrimSpace(model))]
+	return ok
+}
+
+// bodyRequiresPaidAccount 判断请求体是否必须由付费账号承接。
+// 当前仅 image_generation 工具需要：ChatGPT Free 订阅下调用会返回
+// "Tool choice 'image_generation' not found in 'tools' parameter." 400。
+func bodyRequiresPaidAccount(rawBody []byte) bool {
+	if len(rawBody) == 0 {
+		return false
+	}
+	if gjson.GetBytes(rawBody, "tool_choice.type").String() == "image_generation" {
+		return true
+	}
+	tools := gjson.GetBytes(rawBody, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	found := false
+	tools.ForEach(func(_, t gjson.Result) bool {
+		if t.Get("type").String() == "image_generation" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// planDispatch 计算一次请求的调度策略，就地写入 exclude 集并返回 preferPlan。
+// 规则：
+//   - 命中 premium-only 模型，或请求体（含虚拟模型 inject 之后）带 image_generation 工具
+//     → 把所有 Free 账号加入 exclude，preferPlan = ""（只调度付费）
+//   - 其他请求（含只 inject reasoning effort 的虚拟模型如 gpt-5.4-high）
+//     → preferPlan = "free"（优先 Free，池空回退付费）
+//
+// 注意：这里**不**再用 `virtualHit != nil` 作为 premium 判据——虚拟模型也可能只
+// inject reasoning/service_tier，Free 完全能承接。统一以 rawBody 是否含
+// image_generation 作为唯一付费判据更准确。
+func (h *Handler) planDispatch(model string, rawBody []byte, _ *ModelOverride, exclude map[int64]bool) string {
+	needPaid := IsPremiumOnlyModel(model) || bodyRequiresPaidAccount(rawBody)
+	if needPaid {
+		if exclude != nil && h != nil && h.store != nil {
+			for id := range h.store.AccountIDsByPlan("free") {
+				exclude[id] = true
+			}
+		}
+		return ""
+	}
+	return "free"
+}
+
+// ModelPlanPolicy 描述某个模型的派发策略（供前端展示）。
+type ModelPlanPolicy struct {
+	Plan         string   `json:"plan_policy"`   // "premium_only" / "prefer_free"
+	AllowedPlans []string `json:"allowed_plans"` // 可承接该模型的 plan 列表
+	PreferPlan   string   `json:"prefer_plan"`   // 优先派发的 plan；premium_only 时为空
+}
+
+// PolicyForModel 返回模型的派发策略。
+func PolicyForModel(model string) ModelPlanPolicy {
+	if IsPremiumOnlyModel(model) {
+		return ModelPlanPolicy{
+			Plan:         "premium_only",
+			AllowedPlans: []string{"plus", "pro", "team"},
+			PreferPlan:   "",
+		}
+	}
+	return ModelPlanPolicy{
+		Plan:         "prefer_free",
+		AllowedPlans: []string{"free", "plus", "pro", "team"},
+		PreferPlan:   "free",
+	}
+}
+
+// ListModels 列出可用模型（含虚拟模型别名）
 func (h *Handler) ListModels(c *gin.Context) {
-	models := make([]api.Model, 0, len(SupportedModels))
+	virtualNames := ParseModelOverrides(h.store.GetModelPayloadOverrides()).VirtualModelNames()
+	models := make([]api.Model, 0, len(SupportedModels)+len(virtualNames))
 	now := time.Now().Unix()
 	for _, id := range SupportedModels {
 		models = append(models, api.Model{
@@ -1915,6 +2283,14 @@ func (h *Handler) ListModels(c *gin.Context) {
 			Object:  "model",
 			Created: now,
 			OwnedBy: "openai",
+		})
+	}
+	for _, id := range virtualNames {
+		models = append(models, api.Model{
+			ID:      id,
+			Object:  "model",
+			Created: now,
+			OwnedBy: "codex2api-virtual",
 		})
 	}
 	api.SendList(c, "list", models)

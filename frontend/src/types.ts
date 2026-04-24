@@ -208,6 +208,12 @@ export interface OpsOverviewResponse {
   }
 }
 
+export interface ModelPlanPolicy {
+  plan_policy: 'premium_only' | 'prefer_free' | string
+  allowed_plans: string[]
+  prefer_plan: string
+}
+
 export interface SystemSettings {
   max_concurrency: number
   global_rpm: number
@@ -236,6 +242,7 @@ export interface SystemSettings {
   cache_label: string
   expired_cleaned?: number
   model_mapping: string
+  model_payload_overrides: string
   resin_url: string
   resin_platform_name: string
 }

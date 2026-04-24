@@ -9,7 +9,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { APIKeyRow, HealthResponse, SystemSettings } from '../types'
+import type { APIKeyRow, HealthResponse, ModelPlanPolicy, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -37,6 +37,48 @@ const DEFAULT_MODEL_MAPPING: Record<string, string> = {
   'claude-sonnet-4-6': 'gpt-5.3-codex',
   'claude-sonnet-4-5-20250929': 'gpt-5.2-codex',
   'claude-opus-4-5-20251101': 'gpt-5.3-codex',
+}
+
+// 虚拟模型别名 - 画图示例
+const DEFAULT_DRAW_OVERRIDES = {
+  'gpt-draw-1024x1024': {
+    base_model: 'gpt-5.4-mini',
+    inject: {
+      tools: [
+        { type: 'image_generation', size: '1024x1024', quality: 'high', background: 'auto' },
+      ],
+      tool_choice: { type: 'image_generation' },
+    },
+    description: '画图 1:1',
+  },
+  'gpt-draw-1024x1536': {
+    base_model: 'gpt-5.4-mini',
+    inject: {
+      tools: [
+        { type: 'image_generation', size: '1024x1536', quality: 'high', background: 'auto' },
+      ],
+      tool_choice: { type: 'image_generation' },
+    },
+    description: '画图 2:3 竖图',
+  },
+  'gpt-draw-1536x1024': {
+    base_model: 'gpt-5.4-mini',
+    inject: {
+      tools: [
+        { type: 'image_generation', size: '1536x1024', quality: 'high', background: 'auto' },
+      ],
+      tool_choice: { type: 'image_generation' },
+    },
+    description: '画图 3:2 横图',
+  },
+  'gpt-image-2': {
+    base_model: 'gpt-5.4-mini',
+    inject: {
+      tools: [{ type: 'image_generation' }],
+      tool_choice: { type: 'image_generation' },
+    },
+    description: '统一画图模型（所有参数交给 metadata.image_* 控制）',
+  },
 }
 
 // 模型映射编辑器组件
@@ -153,12 +195,14 @@ export default function Settings() {
     cache_driver: 'redis',
     cache_label: 'Redis',
     model_mapping: '{}',
+    model_payload_overrides: '{}',
     resin_url: '',
     resin_platform_name: '',
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
+  const [modelPolicies, setModelPolicies] = useState<Record<string, ModelPlanPolicy>>({})
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set())
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
@@ -168,6 +212,7 @@ export default function Settings() {
     setSettingsForm(settings)
     setLoadedAdminSecret(settings.admin_secret ?? '')
     setModelList(modelsResp.models ?? [])
+    setModelPolicies(modelsResp.model_policies ?? {})
     return {
       health,
       keys: keysResponse.keys ?? [],
@@ -710,6 +755,90 @@ export default function Settings() {
               value={settingsForm.model_mapping}
               onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
             />
+          </CardContent>
+        </Card>
+
+        {/* Model Dispatch Policy */}
+        <Card className="mb-4">
+          <CardContent className="p-6">
+            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings.dispatchPolicyTitle')}</h3>
+            <p className="text-xs text-muted-foreground mb-4">{t('settings.dispatchPolicyDesc')}</p>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-[220px]">{t('settings.dispatchPolicyModel')}</TableHead>
+                  <TableHead className="w-[160px]">{t('settings.dispatchPolicyPolicy')}</TableHead>
+                  <TableHead className="w-[180px]">{t('settings.dispatchPolicyPreferPlan')}</TableHead>
+                  <TableHead>{t('settings.dispatchPolicyAllowedPlans')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {modelList.map((model) => {
+                  const policy = modelPolicies[model]
+                  if (!policy) {
+                    return (
+                      <TableRow key={model}>
+                        <TableCell className="font-mono text-[13px]">{model}</TableCell>
+                        <TableCell colSpan={3} className="text-xs text-muted-foreground">—</TableCell>
+                      </TableRow>
+                    )
+                  }
+                  const isPremiumOnly = policy.plan_policy === 'premium_only'
+                  return (
+                    <TableRow key={model}>
+                      <TableCell className="font-mono text-[13px]">{model}</TableCell>
+                      <TableCell>
+                        <Badge variant={isPremiumOnly ? 'destructive' : 'secondary'} className="text-[12px]">
+                          {isPremiumOnly ? t('settings.dispatchPolicyPremiumOnly') : t('settings.dispatchPolicyPreferFree')}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-[13px]">
+                        {policy.prefer_plan
+                          ? <span className="font-mono">{policy.prefer_plan}</span>
+                          : <span className="text-muted-foreground">—</span>}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap gap-1">
+                          {policy.allowed_plans.map((p) => (
+                            <Badge key={p} variant="outline" className="text-[11px] font-mono">{p}</Badge>
+                          ))}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+
+        {/* Virtual Models (Payload Overrides) */}
+        <Card className="mb-4">
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+              <h3 className="text-base font-semibold text-foreground">{t('settings2.virtualModelsTitle')}</h3>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setSettingsForm(f => ({
+                  ...f,
+                  model_payload_overrides: JSON.stringify(DEFAULT_DRAW_OVERRIDES, null, 2),
+                }))}
+              >
+                {t('settings2.virtualModelsExample')}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground mb-4">{t('settings2.virtualModelsDesc')}</p>
+            <textarea
+              className="w-full min-h-[220px] font-mono text-xs rounded-md border border-input bg-background px-3 py-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              spellCheck={false}
+              placeholder={'{\n  "gpt-draw-1024x1024": {\n    "base_model": "gpt-5.4-mini",\n    "inject": { "tools": [{"type":"image_generation","size":"1024x1024"}], "tool_choice": {"type":"image_generation"} }\n  }\n}'}
+              value={settingsForm.model_payload_overrides}
+              onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setSettingsForm(f => ({ ...f, model_payload_overrides: e.target.value }))}
+            />
+            <Button className="mt-4" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+              {savingSettings ? t('common.saving') : t('settings.saveSettings')}
+            </Button>
           </CardContent>
         </Card>
 

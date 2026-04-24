@@ -85,6 +85,20 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
 			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+		case http.StatusPaymentRequired:
+			// 402 deactivated_workspace：workspace 已被 OpenAI 停用，账号不可恢复，
+			// 永久禁用并立即从池中清理（或 MarkCooldown 7 天），与 /v1/responses 路径一致。
+			if proxy.IsDeactivatedWorkspace(errBody) {
+				if h.store.GetAutoCleanUnauthorized() && h.db != nil {
+					ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_ = h.db.SetError(ctx2, account.ID(), "deleted")
+					cancel()
+					h.db.InsertAccountEventAsync(account.ID(), "deleted", "auto_clean_deactivated_workspace")
+					h.store.RemoveAccount(account.ID())
+				} else {
+					h.store.MarkCooldown(account, 7*24*time.Hour, "deactivated_workspace")
+				}
+			}
 		case http.StatusTooManyRequests:
 			proxy.Apply429Cooldown(h.store, account, errBody, resp)
 		}
@@ -239,6 +253,22 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				proxy.SyncCodexUsageState(h.store, acc, resp)
 				h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
 				atomic.AddInt64(&bannedCount, 1)
+			case http.StatusPaymentRequired:
+				proxy.SyncCodexUsageState(h.store, acc, resp)
+				if proxy.IsDeactivatedWorkspace(body) {
+					if h.store.GetAutoCleanUnauthorized() && h.db != nil {
+						ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+						_ = h.db.SetError(ctx2, acc.ID(), "deleted")
+						cancel()
+						h.db.InsertAccountEventAsync(acc.ID(), "deleted", "auto_clean_deactivated_workspace")
+						h.store.RemoveAccount(acc.ID())
+					} else {
+						h.store.MarkCooldown(acc, 7*24*time.Hour, "deactivated_workspace")
+					}
+					atomic.AddInt64(&bannedCount, 1)
+				} else {
+					atomic.AddInt64(&failedCount, 1)
+				}
 			case http.StatusTooManyRequests:
 				proxy.SyncCodexUsageState(h.store, acc, resp)
 				proxy.Apply429Cooldown(h.store, acc, body, resp)

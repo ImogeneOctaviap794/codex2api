@@ -290,6 +290,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_payload_overrides TEXT DEFAULT '{}';
 
 		CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -410,6 +411,7 @@ type SystemSettings struct {
 	MaxRetries                       int
 	AllowRemoteMigration             bool
 	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
+	ModelPayloadOverrides            string // JSON: virtual model name -> {base_model, inject}
 	BackgroundRefreshIntervalMinutes int
 	UsageProbeMaxAgeMinutes          int
 	RecoveryProbeIntervalMinutes     int
@@ -430,6 +432,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(auto_clean_error, false),
 		       COALESCE(auto_clean_expired, false),
 		       COALESCE(model_mapping, '{}'),
+		       COALESCE(model_payload_overrides, '{}'),
 		       COALESCE(background_refresh_interval_minutes, 2),
 		       COALESCE(usage_probe_max_age_minutes, 10),
 		       COALESCE(recovery_probe_interval_minutes, 30),
@@ -440,7 +443,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
-		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
+		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping, &s.ModelPayloadOverrides,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
 		&s.ResinURL, &s.ResinPlatformName,
 	)
@@ -457,10 +460,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
+				model_payload_overrides,
 				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
 				resin_url, resin_platform_name
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 			ON CONFLICT (id) DO UPDATE SET
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
@@ -480,6 +484,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				auto_clean_error        = EXCLUDED.auto_clean_error,
 				auto_clean_expired      = EXCLUDED.auto_clean_expired,
 				model_mapping           = EXCLUDED.model_mapping,
+				model_payload_overrides = EXCLUDED.model_payload_overrides,
 				background_refresh_interval_minutes = EXCLUDED.background_refresh_interval_minutes,
 				usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
 				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
@@ -488,6 +493,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
+		s.ModelPayloadOverrides,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
 		s.ResinURL, s.ResinPlatformName)
 	return err

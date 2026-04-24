@@ -416,7 +416,9 @@ func ResponsesAPIValidationRules() map[string][]ValidationRule {
 		"store":             {TypeBoolean()},
 		"truncation":        {TypeString(), Enum("auto", "disabled")},
 		"tools":             {TypeArray()},
-		"tool_choice":       {TypeString(), MaxLength(64)},
+		// tool_choice 允许 string ("auto"/"none"/"required") 或对象
+		// （{"type":"image_generation"}、{"type":"function","name":"..."} 等），
+		// 这里不做严格校验，与 Chat Completions 规则保持一致。
 	}
 }
 

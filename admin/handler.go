@@ -2201,6 +2201,7 @@ type settingsResponse struct {
 	CacheLabel                       string `json:"cache_label"`
 	ExpiredCleaned                   int    `json:"expired_cleaned,omitempty"`
 	ModelMapping                     string `json:"model_mapping"`
+	ModelPayloadOverrides            string `json:"model_payload_overrides"`
 	ResinURL                         string `json:"resin_url"`
 	ResinPlatformName                string `json:"resin_platform_name"`
 }
@@ -2227,6 +2228,7 @@ type updateSettingsReq struct {
 	MaxRetries                       *int    `json:"max_retries"`
 	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
 	ModelMapping                     *string `json:"model_mapping"`
+	ModelPayloadOverrides            *string `json:"model_payload_overrides"`
 	ResinURL                         *string `json:"resin_url"`
 	ResinPlatformName                *string `json:"resin_platform_name"`
 }
@@ -2273,6 +2275,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CacheDriver:                      h.cacheDriver,
 		CacheLabel:                       h.cacheLabel,
 		ModelMapping:                     h.store.GetModelMapping(),
+		ModelPayloadOverrides:            h.store.GetModelPayloadOverrides(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
 	})
@@ -2476,6 +2479,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: model_mapping")
 	}
 
+	if req.ModelPayloadOverrides != nil {
+		val := strings.TrimSpace(*req.ModelPayloadOverrides)
+		if val == "" {
+			val = "{}"
+		}
+		if !json.Valid([]byte(val)) {
+			writeError(c, http.StatusBadRequest, "model_payload_overrides 必须是合法 JSON")
+			return
+		}
+		h.store.SetModelPayloadOverrides(val)
+		log.Printf("设置已更新: model_payload_overrides")
+	}
+
 	// Resin 粘性代理池配置
 	resinURL := ""
 	resinPlatformName := ""
@@ -2521,6 +2537,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxRetries:                       h.store.GetMaxRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                     h.store.GetModelMapping(),
+		ModelPayloadOverrides:            h.store.GetModelPayloadOverrides(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
 	})
@@ -2570,6 +2587,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CacheLabel:                       h.cacheLabel,
 		ExpiredCleaned:                   expiredCleaned,
 		ModelMapping:                     h.store.GetModelMapping(),
+		ModelPayloadOverrides:            h.store.GetModelPayloadOverrides(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
 	})
@@ -2746,9 +2764,47 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 
 // ==================== Models ====================
 
-// ListModels 返回支持的模型列表（供前端设置页使用）
+// ListModels 返回支持的模型列表与派发策略（供前端设置页使用）
+// 响应 shape（向后兼容：models 仍是字符串数组）:
+//
+//	{
+//	  "models": ["gpt-5.5","gpt-5.4",...],
+//	  "model_policies": {
+//	    "gpt-5.5": {"plan_policy":"premium_only","allowed_plans":["plus","pro","team"],"prefer_plan":""},
+//	    "gpt-5.4": {"plan_policy":"prefer_free","allowed_plans":["free","plus","pro","team"],"prefer_plan":"free"},
+//	    ...
+//	  }
+//	}
 func (h *Handler) ListModels(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"models": proxy.SupportedModels})
+	// 真实模型（gpt-5.*）
+	models := make([]string, 0, len(proxy.SupportedModels)+4)
+	models = append(models, proxy.SupportedModels...)
+	policies := make(map[string]proxy.ModelPlanPolicy, len(proxy.SupportedModels)+4)
+	for _, m := range proxy.SupportedModels {
+		policies[m] = proxy.PolicyForModel(m)
+	}
+
+	// 虚拟模型：只有 inject image_generation 的（画图系）才是 premium_only，
+	// 其他（如 gpt-5.4-high 仅 inject reasoning effort）继承 base_model 策略（prefer_free）。
+	overrides := proxy.ParseModelOverrides(h.store.GetModelPayloadOverrides())
+	for _, v := range overrides.VirtualModelNames() {
+		models = append(models, v)
+		ov := overrides[v]
+		if ov.InjectsImageGeneration() {
+			policies[v] = proxy.ModelPlanPolicy{
+				Plan:         "premium_only",
+				AllowedPlans: []string{"plus", "pro", "team"},
+				PreferPlan:   "",
+			}
+		} else {
+			policies[v] = proxy.PolicyForModel(ov.BaseModel)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"models":         models,
+		"model_policies": policies,
+	})
 }
 
 // ==================== 账号趋势 ====================

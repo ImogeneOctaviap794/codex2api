@@ -618,6 +618,14 @@
     "openaiCompat": "OpenAI Compatible",
     "responsesApi": "Responses API",
     "modelList": "Model List",
+    "dispatchPolicyTitle": "Model Dispatch Policy",
+    "dispatchPolicyDesc": "Scheduler routes each model using the policy below. Premium-only models (e.g. gpt-5.5) are only dispatched to paid plans (Plus/Pro/Team); upstream rejects Free. Other models prefer Free to preserve paid quota.",
+    "dispatchPolicyModel": "Model",
+    "dispatchPolicyPolicy": "Policy",
+    "dispatchPolicyPreferPlan": "Preferred plan",
+    "dispatchPolicyAllowedPlans": "Allowed plans",
+    "dispatchPolicyPremiumOnly": "Premium only",
+    "dispatchPolicyPreferFree": "Prefer Free",
     "createFailed": "Create failed",
     "deleteFailed": "Delete failed"
   },
@@ -742,7 +750,10 @@
     "anthropicModel": "Anthropic Model",
     "codexModel": "Codex Model",
     "addMapping": "Add Mapping",
-    "messagesEndpoint": "Anthropic Messages API endpoint (Claude Code)"
+    "messagesEndpoint": "Anthropic Messages API endpoint (Claude Code)",
+    "virtualModelsTitle": "Virtual Model Aliases (Payload Injection)",
+    "virtualModelsDesc": "Map any model alias to a base_model + inject (tools / tool_choice / reasoning, etc). For example freeze the image_generation tool as gpt-draw-1024x1024 so clients that only pick model names can generate images. Empty value or {} disables. On hit, the request 'model' is replaced with base_model and inject fields are merged (overwriting) into the body. Note: image generation currently requires streaming to retrieve image data, so the client must send stream:true.",
+    "virtualModelsExample": "Insert image example"
   },
   "apiRef": {
     "title": "API Reference",

@@ -117,6 +117,7 @@ export default function Usage() {
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
+  const [modelOptions, setModelOptions] = useState<string[]>([])
   const showFastFilter = false
   const pageSizeOptions = [10, 20, 50, 100]
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
@@ -155,6 +156,15 @@ export default function Usage() {
     }
   }, [])
 
+  const loadModelOptions = useCallback(async () => {
+    try {
+      const resp = await api.getModels()
+      setModelOptions(resp.models ?? [])
+    } catch {
+      // 失败时保持空列表，下拉只显示「全部」
+    }
+  }, [])
+
   // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
@@ -186,6 +196,10 @@ export default function Usage() {
   useEffect(() => {
     void loadAPIKeys()
   }, [loadAPIKeys])
+
+  useEffect(() => {
+    void loadModelOptions()
+  }, [loadModelOptions])
 
   usePolling(() => void reloadSilently(), 30_000)
 
@@ -399,7 +413,7 @@ export default function Usage() {
                 placeholder={t('usage.allModels')}
                 options={[
                   { label: t('usage.allModels'), value: '' },
-                  ...['gpt-5.4', 'gpt-5.4-mini', 'gpt-5', 'gpt-5-codex', 'gpt-5-codex-mini', 'gpt-5.1', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1-codex-max', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5.3-codex'].map((m) => ({ label: m, value: m })),
+                  ...modelOptions.map((m) => ({ label: m, value: m })),
                 ]}
               />
 
