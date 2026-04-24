@@ -559,6 +559,8 @@
     "timezoneAuto": "Auto (Browser Timezone)",
     "fastSchedulerEnabled": "Fast Scheduler",
     "fastSchedulerEnabledDesc": "Uses an in-memory fast scheduling algorithm, significantly reducing dispatch latency under high concurrency. Recommended for large account pools (100+).",
+    "fastAliasEnabled": "service_tier=fast Priority Lane",
+    "fastAliasEnabledDesc": "When enabled, client-sent service_tier=fast is mapped to upstream priority tier (queue-jumping, ~2x pricing). When disabled, fast is silently stripped and upstream falls back to default. Usage logs will show the Fast badge on affected requests in both cases for auditing.",
     "allowRemoteMigration": "Allow Remote Migration",
     "allowRemoteMigrationDesc": "When enabled, other codex2api instances can pull healthy accounts from this instance.",
     "allowRemoteMigrationRequiresSecret": "Set an admin secret first. Remote migration cannot be enabled without admin authentication.",

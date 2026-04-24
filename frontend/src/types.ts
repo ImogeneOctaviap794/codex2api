@@ -234,6 +234,7 @@ export interface SystemSettings {
   auto_clean_expired: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
+  fast_alias_enabled: boolean
   max_retries: number
   allow_remote_migration: boolean
   database_driver: string

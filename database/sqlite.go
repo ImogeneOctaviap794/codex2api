@@ -92,6 +92,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			auto_clean_expired INTEGER DEFAULT 0,
 			proxy_pool_enabled INTEGER DEFAULT 0,
 			fast_scheduler_enabled INTEGER DEFAULT 1,
+			fast_alias_enabled INTEGER DEFAULT 1,
 			max_retries INTEGER DEFAULT 2,
 			allow_remote_migration INTEGER DEFAULT 0
 		);`,
@@ -155,6 +156,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "auto_clean_expired", "INTEGER DEFAULT 0"},
 		{"system_settings", "proxy_pool_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "fast_alias_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},

@@ -955,6 +955,7 @@ type Store struct {
 	autoCleanError            atomic.Bool
 	autoCleanExpired          atomic.Bool
 	autoCleanupBatch          atomic.Bool
+	fastAliasEnabled          atomic.Bool // 是否把客户端的 service_tier=fast 映射为上游 priority
 	maxRetries                int64 // 请求失败最大重试次数（换号重试）
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
@@ -1048,6 +1049,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
 	s.autoCleanError.Store(settings.AutoCleanError)
 	s.autoCleanExpired.Store(settings.AutoCleanExpired)
+	s.fastAliasEnabled.Store(settings.FastAliasEnabled)
 	retries := int64(settings.MaxRetries)
 	if retries <= 0 {
 		retries = 2 // 默认重试 2 次
@@ -1311,6 +1313,17 @@ func (s *Store) GetAutoCleanError() bool {
 // SetAutoCleanError 设置是否自动清理 error 账号
 func (s *Store) SetAutoCleanError(enabled bool) {
 	s.autoCleanError.Store(enabled)
+}
+
+// GetFastAliasEnabled 是否启用 service_tier=fast 的快速别名（映射为 priority）。
+// 关闭时，客户端传 fast 将被静默剥离，上游收到 default 队列。
+func (s *Store) GetFastAliasEnabled() bool {
+	return s.fastAliasEnabled.Load()
+}
+
+// SetFastAliasEnabled 设置是否启用 fast→priority 别名。
+func (s *Store) SetFastAliasEnabled(enabled bool) {
+	s.fastAliasEnabled.Store(enabled)
 }
 
 // GetAutoCleanExpired 获取是否自动清理过期账号

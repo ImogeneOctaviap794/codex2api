@@ -2193,6 +2193,7 @@ type settingsResponse struct {
 	AutoCleanExpired                 bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             bool   `json:"fast_scheduler_enabled"`
+	FastAliasEnabled                 bool   `json:"fast_alias_enabled"`
 	MaxRetries                       int    `json:"max_retries"`
 	AllowRemoteMigration             bool   `json:"allow_remote_migration"`
 	DatabaseDriver                   string `json:"database_driver"`
@@ -2225,6 +2226,7 @@ type updateSettingsReq struct {
 	AutoCleanExpired                 *bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 *bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             *bool   `json:"fast_scheduler_enabled"`
+	FastAliasEnabled                 *bool   `json:"fast_alias_enabled"`
 	MaxRetries                       *int    `json:"max_retries"`
 	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
 	ModelMapping                     *string `json:"model_mapping"`
@@ -2268,6 +2270,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		FastAliasEnabled:                 h.store.GetFastAliasEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                   h.databaseDriver,
@@ -2451,6 +2454,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
 	}
 
+	if req.FastAliasEnabled != nil {
+		h.store.SetFastAliasEnabled(*req.FastAliasEnabled)
+		log.Printf("设置已更新: fast_alias_enabled = %t", *req.FastAliasEnabled)
+	}
+
 	if req.MaxRetries != nil {
 		v := *req.MaxRetries
 		if v < 0 {
@@ -2534,6 +2542,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		FastAliasEnabled:                 h.store.GetFastAliasEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                     h.store.GetModelMapping(),
@@ -2579,6 +2588,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		FastAliasEnabled:                 h.store.GetFastAliasEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                   h.databaseDriver,

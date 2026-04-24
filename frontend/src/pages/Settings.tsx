@@ -188,6 +188,7 @@ export default function Settings() {
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
+    fast_alias_enabled: true,
     max_retries: 2,
     allow_remote_migration: false,
     database_driver: 'postgres',
@@ -662,6 +663,15 @@ export default function Settings() {
                   options={booleanOptions}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.fastSchedulerEnabledDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.fastAliasEnabled')}</label>
+                <Select
+                  value={settingsForm.fast_alias_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, fast_alias_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.fastAliasEnabledDesc')}</p>
               </div>
             </div>
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.display')}</h3>

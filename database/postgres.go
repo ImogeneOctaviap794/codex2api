@@ -302,6 +302,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_payload_overrides TEXT DEFAULT '{}';
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_alias_enabled BOOLEAN DEFAULT TRUE;
 
 		CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -419,6 +420,7 @@ type SystemSettings struct {
 	AutoCleanExpired                 bool
 	ProxyPoolEnabled                 bool
 	FastSchedulerEnabled             bool
+	FastAliasEnabled                 bool // service_tier=fast → priority 映射开关
 	MaxRetries                       int
 	AllowRemoteMigration             bool
 	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
@@ -448,7 +450,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(usage_probe_max_age_minutes, 10),
 		       COALESCE(recovery_probe_interval_minutes, 30),
 		       COALESCE(resin_url, ''),
-		       COALESCE(resin_platform_name, '')
+		       COALESCE(resin_platform_name, ''),
+		       COALESCE(fast_alias_enabled, true)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
@@ -456,7 +459,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping, &s.ModelPayloadOverrides,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
-		&s.ResinURL, &s.ResinPlatformName,
+		&s.ResinURL, &s.ResinPlatformName, &s.FastAliasEnabled,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -473,9 +476,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
 				model_payload_overrides,
 				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
-				resin_url, resin_platform_name
+				resin_url, resin_platform_name, fast_alias_enabled
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 			ON CONFLICT (id) DO UPDATE SET
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
@@ -500,13 +503,14 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
 				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
 				resin_url               = EXCLUDED.resin_url,
-				resin_platform_name     = EXCLUDED.resin_platform_name
+				resin_platform_name     = EXCLUDED.resin_platform_name,
+				fast_alias_enabled      = EXCLUDED.fast_alias_enabled
 		`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
 		s.ModelPayloadOverrides,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
-		s.ResinURL, s.ResinPlatformName)
+		s.ResinURL, s.ResinPlatformName, s.FastAliasEnabled)
 	return err
 }
 

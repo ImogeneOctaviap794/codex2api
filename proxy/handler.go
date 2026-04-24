@@ -253,6 +253,26 @@ func extractServiceTier(body []byte) string {
 	return gjson.GetBytes(body, "serviceTier").String()
 }
 
+// stripDisabledFastAlias 当 service_tier=fast 的别名被关闭时，从请求体里移除
+// service_tier，避免下游 upstreamServiceTier()/sanitizeServiceTierForUpstream()
+// 仍把 fast 映射成 priority 发给上游。
+//
+// 调用顺序必须在 extractServiceTier 之后，这样原始 "fast" 仍会被记录到 usage_logs
+// 便于审计；上游则会走 default 队列。
+func stripDisabledFastAlias(rawBody []byte, aliasEnabled bool) []byte {
+	if aliasEnabled || len(rawBody) == 0 {
+		return rawBody
+	}
+	tier := strings.TrimSpace(gjson.GetBytes(rawBody, "service_tier").String())
+	if !strings.EqualFold(tier, "fast") {
+		return rawBody
+	}
+	if stripped, err := sjson.DeleteBytes(rawBody, "service_tier"); err == nil {
+		return stripped
+	}
+	return rawBody
+}
+
 func classifyTransportFailure(err error) string {
 	if err == nil {
 		return ""
@@ -589,10 +609,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	reasoningEffort := extractReasoningEffort(rawBody)
-	serviceTier := extractServiceTier(rawBody)
+	serviceTier := extractServiceTier(rawBody) // 先捕获原始值用于日志审计
 	if serviceTier != "" {
 		c.Set("x-service-tier", serviceTier)
 	}
+	rawBody = stripDisabledFastAlias(rawBody, h.store.GetFastAliasEnabled())
 
 	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
 	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
@@ -1008,6 +1029,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	if serviceTier != "" {
 		c.Set("x-service-tier", serviceTier)
 	}
+	rawBody = stripDisabledFastAlias(rawBody, h.store.GetFastAliasEnabled())
 
 	// compact 强制非流式
 	rawBody, _ = sjson.SetBytes(rawBody, "stream", false)
@@ -1212,6 +1234,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if serviceTier != "" {
 		c.Set("x-service-tier", serviceTier)
 	}
+	rawBody = stripDisabledFastAlias(rawBody, h.store.GetFastAliasEnabled())
 
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
 	codexBody, err := TranslateRequest(rawBody)
