@@ -28,6 +28,20 @@ Thumbs.db
 .env.local
 USAGE_WINDOW_LOGIC.md
 .claude/settings.local.json
+
+# Local experiments / probe scripts (一次性研究，不入库)
+probe_chat_sites.*
+probe_codex_sites.*
+redeem_cdk.py
+cdk_token.json
+*资产数据*.csv
+
+# Local progress notes (Cascade 工作记录，仅本地)
+progress_notes/
+
+# Image studio docs (研究草稿)
+docs/gpt-image-*.md
+docs/gpt-5-text-models.md
 scripts
 
 # Logs

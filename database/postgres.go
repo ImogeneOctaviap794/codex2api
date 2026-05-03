@@ -303,6 +303,9 @@ func (db *DB) migrate(ctx context.Context) error {
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_payload_overrides TEXT DEFAULT '{}';
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_alias_enabled BOOLEAN DEFAULT TRUE;
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS rt_manager_url TEXT DEFAULT '';
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS rt_manager_password TEXT DEFAULT '';
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS rt_manager_enabled BOOLEAN DEFAULT FALSE;
 
 		CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -430,6 +433,9 @@ type SystemSettings struct {
 	RecoveryProbeIntervalMinutes     int
 	ResinURL                         string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
 	ResinPlatformName                string // Resin 平台标识，例如 codex2api
+	RTManagerURL                     string // 外部 rt-manager 服务地址，用于 AT-only 账号的刷新中转
+	RTManagerPassword                string // rt-manager 登录密码（codex2api 内部换 Bearer token）
+	RTManagerEnabled                 bool   // 是否启用 rt-manager 联动刷新 AT-only 账号
 }
 
 // GetSystemSettings 加载全局设置
@@ -451,7 +457,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(recovery_probe_interval_minutes, 30),
 		       COALESCE(resin_url, ''),
 		       COALESCE(resin_platform_name, ''),
-		       COALESCE(fast_alias_enabled, true)
+		       COALESCE(fast_alias_enabled, true),
+		       COALESCE(rt_manager_url, ''),
+		       COALESCE(rt_manager_password, ''),
+		       COALESCE(rt_manager_enabled, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
@@ -460,6 +469,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping, &s.ModelPayloadOverrides,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
 		&s.ResinURL, &s.ResinPlatformName, &s.FastAliasEnabled,
+		&s.RTManagerURL, &s.RTManagerPassword, &s.RTManagerEnabled,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -476,9 +486,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
 				model_payload_overrides,
 				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
-				resin_url, resin_platform_name, fast_alias_enabled
+				resin_url, resin_platform_name, fast_alias_enabled,
+				rt_manager_url, rt_manager_password, rt_manager_enabled
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 			ON CONFLICT (id) DO UPDATE SET
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
@@ -504,13 +515,17 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
 				resin_url               = EXCLUDED.resin_url,
 				resin_platform_name     = EXCLUDED.resin_platform_name,
-				fast_alias_enabled      = EXCLUDED.fast_alias_enabled
+				fast_alias_enabled      = EXCLUDED.fast_alias_enabled,
+				rt_manager_url          = EXCLUDED.rt_manager_url,
+				rt_manager_password     = EXCLUDED.rt_manager_password,
+				rt_manager_enabled      = EXCLUDED.rt_manager_enabled
 		`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
 		s.ModelPayloadOverrides,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
-		s.ResinURL, s.ResinPlatformName, s.FastAliasEnabled)
+		s.ResinURL, s.ResinPlatformName, s.FastAliasEnabled,
+		s.RTManagerURL, s.RTManagerPassword, s.RTManagerEnabled)
 	return err
 }
 
@@ -1548,6 +1563,53 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.BaseConcurrencyOverride,
 			&createdAtRaw,
 			&updatedAtRaw,
+		); err != nil {
+			return nil, fmt.Errorf("扫描账号行失败: %w", err)
+		}
+		a.Credentials = decodeCredentials(credRaw)
+		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+		}
+		a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 created_at 失败: %w", err)
+		}
+		a.UpdatedAt, err = parseDBTimeValue(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 updated_at 失败: %w", err)
+		}
+		accounts = append(accounts, a)
+	}
+	return accounts, rows.Err()
+}
+
+// ListNonDeleted 获取所有非 deleted 状态的账号（供去重分析使用）。
+// 相比 ListActive 还包含 rate_limited / banned / error 等状态，用于全量重复检测。
+func (db *DB) ListNonDeleted(ctx context.Context) ([]*AccountRow, error) {
+	query := `
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), score_bias_override, base_concurrency_override, created_at, updated_at
+		FROM accounts
+		WHERE status <> 'deleted'
+		ORDER BY id
+	`
+	rows, err := db.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("查询账号失败: %w", err)
+	}
+	defer rows.Close()
+
+	var accounts []*AccountRow
+	for rows.Next() {
+		a := &AccountRow{}
+		var credRaw interface{}
+		var cooldownUntilRaw interface{}
+		var createdAtRaw interface{}
+		var updatedAtRaw interface{}
+		if err := rows.Scan(
+			&a.ID, &a.Name, &a.Platform, &a.Type, &credRaw, &a.ProxyURL, &a.Status,
+			&a.CooldownReason, &cooldownUntilRaw, &a.ErrorMessage, &a.Locked,
+			&a.ScoreBiasOverride, &a.BaseConcurrencyOverride, &createdAtRaw, &updatedAtRaw,
 		); err != nil {
 			return nil, fmt.Errorf("扫描账号行失败: %w", err)
 		}

@@ -69,12 +69,13 @@ func (c *CacheConfig) Label() string {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port               int
-	AdminSecret        string
-	MaxRequestBodySize int
-	Database           DatabaseConfig
-	Cache              CacheConfig
-	UseWebsocket       bool // 是否启用 WebSocket 传输
+	Port                   int
+	AdminSecret            string
+	MaxRequestBodySize     int
+	Database               DatabaseConfig
+	Cache                  CacheConfig
+	UseWebsocket           bool   // 是否启用 WebSocket 传输
+	CodexUpstreamTransport string // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -103,8 +104,16 @@ func Load(envPath string) (*Config, error) {
 		}
 	}
 
-	// WebSocket 配置
-	if parseBoolEnv(os.Getenv("USE_WEBSOCKET")) {
+	// Codex 上游传输配置。CODEX_UPSTREAM_TRANSPORT 优先；USE_WEBSOCKET 保留为旧开关。
+	cfg.CodexUpstreamTransport = normalizeCodexUpstreamTransport(os.Getenv("CODEX_UPSTREAM_TRANSPORT"))
+	if cfg.CodexUpstreamTransport == "" && parseBoolEnv(os.Getenv("USE_WEBSOCKET")) {
+		cfg.CodexUpstreamTransport = "ws"
+		cfg.UseWebsocket = true
+	}
+	if cfg.CodexUpstreamTransport == "" {
+		cfg.CodexUpstreamTransport = "http"
+	}
+	if cfg.CodexUpstreamTransport == "ws" {
 		cfg.UseWebsocket = true
 	}
 
@@ -183,5 +192,18 @@ func parseBoolEnv(value string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func normalizeCodexUpstreamTransport(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "http", "https", "sse":
+		return "http"
+	case "auto":
+		return "auto"
+	case "ws", "websocket", "wss":
+		return "ws"
+	default:
+		return ""
 	}
 }

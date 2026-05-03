@@ -20,21 +20,16 @@ func newPremium5hTestAccount(plan string, resetAt time.Time) *Account {
 	}
 }
 
-func TestPremium5hRateLimitedAccountRemainsSchedulable(t *testing.T) {
+// Premium 5h 限流（5h 用量 100% 且 Reset5hAt 未到）期间完全不可调度，
+// RuntimeStatus 归为 usage_exhausted（与 free 110%+ 同语义：上游真停服）。
+func TestPremium5hRateLimitedAccountIsUnavailable(t *testing.T) {
 	acc := newPremium5hTestAccount("plus", time.Now().Add(45*time.Minute))
 
-	snapshot := acc.GetSchedulerDebugSnapshot(4)
-	if got := acc.RuntimeStatus(); got != "rate_limited" {
-		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	if got := acc.RuntimeStatus(); got != "usage_exhausted" {
+		t.Fatalf("RuntimeStatus() = %q, want usage_exhausted", got)
 	}
-	if !acc.IsAvailable() {
-		t.Fatal("IsAvailable() = false, want true for premium 5h rate limited account")
-	}
-	if snapshot.HealthTier != string(HealthTierRisky) {
-		t.Fatalf("HealthTier = %q, want %q", snapshot.HealthTier, HealthTierRisky)
-	}
-	if snapshot.DynamicConcurrencyLimit != 1 {
-		t.Fatalf("DynamicConcurrencyLimit = %d, want 1", snapshot.DynamicConcurrencyLimit)
+	if acc.IsAvailable() {
+		t.Fatal("IsAvailable() = true, want false during premium 5h rate limit window")
 	}
 }
 

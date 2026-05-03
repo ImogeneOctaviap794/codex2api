@@ -13,7 +13,6 @@ import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { AccountRow, AccountsPagedResponse, AccountSummary, AddAccountRequest, AddATAccountRequest } from '../types'
 import { getErrorMessage } from '../utils/error'
-import { formatCompactEmail } from '../lib/utils'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -26,9 +25,10 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Users } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
+import DedupeModal from '../components/DedupeModal'
 
 export default function Accounts() {
   const { t } = useTranslation()
@@ -36,7 +36,7 @@ export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'locked'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'usage_exhausted' | 'banned' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'plus' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
@@ -53,6 +53,7 @@ export default function Accounts() {
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
   const [cleaningError, setCleaningError] = useState(false)
+  const [dedupeOpen, setDedupeOpen] = useState(false)
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null)
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null)
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null)
@@ -117,7 +118,7 @@ export default function Accounts() {
   }, [page, pageSize, statusFilter, planFilter, debouncedSearch, sortKey, sortDir])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<AccountsPagedResponse>({
-    initialData: { accounts: [], total: 0, page: 1, page_size: pageSize, summary: { total: 0, normal: 0, rate_limited: 0, banned: 0, locked: 0, healthy: 0, warm: 0, risky: 0 } },
+    initialData: { accounts: [], total: 0, page: 1, page_size: pageSize, summary: { total: 0, normal: 0, rate_limited: 0, usage_exhausted: 0, banned: 0, locked: 0, healthy: 0, warm: 0, risky: 0 } },
     load: loadAccounts,
   })
 
@@ -128,6 +129,7 @@ export default function Accounts() {
   const totalAccounts = summary.total
   const normalAccounts = summary.normal
   const rateLimitedAccounts = summary.rate_limited
+  const usageExhaustedAccounts = summary.usage_exhausted
   const bannedAccounts = summary.banned
   const lockedAccounts = summary.locked
   const healthyAccounts = summary.healthy
@@ -879,13 +881,13 @@ export default function Accounts() {
                 <Ban className="size-3" />
                 {cleaningBanned ? t('accounts.cleaning') : t('accounts.cleanBanned')}
               </Button>
-              <Button variant="outline" size="sm" disabled={cleaningRateLimited} onClick={() => void handleCleanRateLimited()}>
-                <Timer className="size-3" />
-                {cleaningRateLimited ? t('accounts.cleaning') : t('accounts.cleanRateLimited')}
-              </Button>
               <Button variant="outline" size="sm" disabled={cleaningError} onClick={() => void handleCleanError()}>
                 <AlertTriangle className="size-3" />
                 {cleaningError ? t('accounts.cleaning') : t('accounts.cleanError')}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setDedupeOpen(true)}>
+                <Users className="size-3" />
+                {t('accounts.dedupeButton')}
               </Button>
               <Button onClick={() => setShowAdd(true)}>
                 <Plus className="size-3.5" />
@@ -936,16 +938,17 @@ export default function Accounts() {
           )}
         />
 
-        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
           <CompactStat label={t('accounts.totalAccounts')} chipLabel={t('accounts.filterAll')} value={totalAccounts} tone="neutral" />
           <CompactStat label={t('accounts.normalAccounts')} chipLabel={t('accounts.filterNormal')} value={normalAccounts} tone="success" />
           <CompactStat label={t('accounts.rateLimited')} chipLabel={t('accounts.filterRateLimited')} value={rateLimitedAccounts} tone="warning" />
+          <CompactStat label={t('accounts.usageExhausted')} chipLabel={t('accounts.filterUsageExhausted')} value={usageExhaustedAccounts} tone="warning" />
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['usage_exhausted', t('accounts.filterUsageExhausted')], ['banned', t('accounts.filterBanned')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
@@ -955,7 +958,7 @@ export default function Accounts() {
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : lockedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'usage_exhausted' ? usageExhaustedAccounts : key === 'banned' ? bannedAccounts : lockedAccounts}
             </button>
           ))}
         </div>
@@ -1081,7 +1084,7 @@ export default function Accounts() {
                         </TableCell>
                         <TableCell className="text-[14px] font-mono text-muted-foreground">{account.id}</TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
-                          {formatCompactEmail(account.email)}
+                          <span className="break-all">{account.email || '-'}</span>
                           {account.at_only && (
                             <ATExpiryBadge expiresAt={account.expires_at} />
                           )}
@@ -1164,9 +1167,9 @@ export default function Accounts() {
                               variant="outline"
                               size="icon"
                               className="h-7 w-8 px-0"
-                              disabled={refreshingIds.has(account.id) || account.at_only}
+                              disabled={refreshingIds.has(account.id)}
                               onClick={() => void handleRefresh(account)}
-                              title={account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
+                              title={t('accounts.refreshAccessToken')}
                             >
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
                             </Button>
@@ -1606,6 +1609,13 @@ export default function Accounts() {
         {usageAccount && (
           <AccountUsageModal account={usageAccount} onClose={() => setUsageAccount(null)} />
         )}
+
+        <DedupeModal
+          show={dedupeOpen}
+          onClose={() => setDedupeOpen(false)}
+          onDone={() => void reload()}
+          showToast={showToast}
+        />
 
         <Modal
           show={Boolean(editingAccount)}

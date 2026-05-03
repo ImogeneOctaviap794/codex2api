@@ -47,6 +47,10 @@ type Handler struct {
 	cacheLabel     string
 	adminSecretEnv string
 
+	// API Key 缓存失效回调（main.go 在创建完 proxy.Handler 后注入）
+	// 增删 key 后调用，让鉴权中间件的 dbKeys 缓存立即过期。
+	apiKeyCacheInvalidator func()
+
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
@@ -135,6 +139,19 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 	h.redisPoolSize = redisPoolSize
 }
 
+// SetAPIKeyCacheInvalidator 注入 API Key 缓存失效回调。
+// 由 main.go 在创建完 proxy.Handler 后注入 handler.InvalidateAPIKeyCache。
+func (h *Handler) SetAPIKeyCacheInvalidator(fn func()) {
+	h.apiKeyCacheInvalidator = fn
+}
+
+// invalidateAPIKeyCache 安全地调用注入的失效回调（如未注入也不会 panic）。
+func (h *Handler) invalidateAPIKeyCache() {
+	if h.apiKeyCacheInvalidator != nil {
+		h.apiKeyCacheInvalidator()
+	}
+}
+
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api := r.Group("/api/admin")
@@ -156,6 +173,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
 	api.POST("/accounts/clean-error", h.CleanError)
+	api.GET("/accounts/duplicates", h.ListDuplicateAccounts)
+	api.POST("/accounts/dedupe", h.DedupeAccounts)
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
@@ -505,8 +524,10 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		switch a.Status {
 		case "active", "ready":
 			summary.Normal++
-		case "rate_limited", "usage_exhausted":
+		case "rate_limited":
 			summary.RateLimited++
+		case "usage_exhausted":
+			summary.UsageExhausted++
 		case "unauthorized":
 			summary.Banned++
 		}
@@ -538,7 +559,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				continue
 			}
 		case "rate_limited":
-			if a.Status != "rate_limited" && a.Status != "usage_exhausted" {
+			if a.Status != "rate_limited" {
+				continue
+			}
+		case "usage_exhausted":
+			if a.Status != "usage_exhausted" {
 				continue
 			}
 		case "banned":
@@ -866,69 +891,86 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		return
 	}
 
-	// 限制批量添加数量
-	if len(tokens) > 100 {
-		writeError(c, http.StatusBadRequest, "单次最多添加100个账号")
+	// 限制批量添加数量：上限 3000，内部并发 20 分批处理
+	if len(tokens) > 3000 {
+		writeError(c, http.StatusBadRequest, "单次最多添加 3000 个账号")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	// 用独立 ctx（不绑定客户端请求），避免客户端断开导致部分插入失败
+	// 3000 条 × 并发 20 ≈ 15s，设 5min 足够
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	successCount := 0
-	failCount := 0
+	var successCount int64
+	var failCount int64
+
+	const insertConcurrency = 20
+	sem := make(chan struct{}, insertConcurrency)
+	var wg sync.WaitGroup
 
 	for i, rt := range tokens {
-		name := req.Name
-		if name == "" {
-			name = fmt.Sprintf("account-%d", i+1)
-		} else if len(tokens) > 1 {
-			name = fmt.Sprintf("%s-%d", req.Name, i+1)
-		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(idx int, rt string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		id, err := h.db.InsertAccount(ctx, name, rt, req.ProxyURL)
-		if err != nil {
-			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
-			failCount++
-			continue
-		}
-
-		successCount++
-		h.db.InsertAccountEventAsync(id, "added", "manual")
-
-		// 热加载：直接加入内存池
-		newAcc := &auth.Account{
-			DBID:         id,
-			RefreshToken: rt,
-			ProxyURL:     req.ProxyURL,
-		}
-		h.store.AddAccount(newAcc)
-
-		// 异步刷新 AT
-		go func(accountID int64) {
-			refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-				log.Printf("新账号 %d 刷新失败: %v", accountID, err)
-			} else {
-				log.Printf("新账号 %d 刷新成功，已加入号池", accountID)
+			name := req.Name
+			if name == "" {
+				name = fmt.Sprintf("account-%d", idx+1)
+			} else if len(tokens) > 1 {
+				name = fmt.Sprintf("%s-%d", req.Name, idx+1)
 			}
-		}(id)
+
+			id, err := h.db.InsertAccount(ctx, name, rt, req.ProxyURL)
+			if err != nil {
+				log.Printf("批量添加账号 %d 失败: %v", idx+1, err)
+				atomic.AddInt64(&failCount, 1)
+				return
+			}
+
+			atomic.AddInt64(&successCount, 1)
+			h.db.InsertAccountEventAsync(id, "added", "manual")
+
+			// 热加载：直接加入内存池
+			newAcc := &auth.Account{
+				DBID:         id,
+				RefreshToken: rt,
+				ProxyURL:     req.ProxyURL,
+			}
+			h.store.AddAccount(newAcc)
+
+			// 异步刷新 AT
+			go func(accountID int64) {
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
+					log.Printf("新账号 %d 刷新失败: %v", accountID, err)
+				} else {
+					log.Printf("新账号 %d 刷新成功，已加入号池", accountID)
+				}
+			}(id)
+		}(i, rt)
 	}
+	wg.Wait()
+
+	successTotal := atomic.LoadInt64(&successCount)
+	failTotal := atomic.LoadInt64(&failCount)
 
 	// 记录安全审计日志
-	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successTotal, failTotal, c.ClientIP()))
 
-	msg := fmt.Sprintf("成功添加 %d 个账号", successCount)
-	if failCount > 0 {
-		msg += fmt.Sprintf("，%d 个失败", failCount)
+	msg := fmt.Sprintf("成功添加 %d 个账号", successTotal)
+	if failTotal > 0 {
+		msg += fmt.Sprintf("，%d 个失败", failTotal)
 	}
 
 	h.InvalidateStatsCache()
 	c.JSON(http.StatusOK, gin.H{
 		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"success": successTotal,
+		"failed":  failTotal,
 	})
 }
 
@@ -985,82 +1027,98 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		return
 	}
 
-	if len(tokens) > 100 {
-		writeError(c, http.StatusBadRequest, "单次最多添加100个账号")
+	if len(tokens) > 3000 {
+		writeError(c, http.StatusBadRequest, "单次最多添加 3000 个账号")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	// 独立 ctx，5min 超时
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	successCount := 0
-	failCount := 0
+	var successCount int64
+	var failCount int64
+
+	const insertConcurrency = 20
+	sem := make(chan struct{}, insertConcurrency)
+	var wg sync.WaitGroup
 
 	for i, at := range tokens {
-		name := req.Name
-		if name == "" {
-			name = fmt.Sprintf("at-account-%d", i+1)
-		} else if len(tokens) > 1 {
-			name = fmt.Sprintf("%s-%d", req.Name, i+1)
-		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(idx int, at string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
-		if err != nil {
-			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
-			failCount++
-			continue
-		}
-
-		successCount++
-		h.db.InsertAccountEventAsync(id, "added", "manual_at")
-
-		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
-		atInfo := auth.ParseAccessToken(at)
-
-		// 热加载到内存池（AT-only，无 RT）
-		newAcc := &auth.Account{
-			DBID:        id,
-			AccessToken: at,
-			ExpiresAt:   time.Now().Add(1 * time.Hour),
-			ProxyURL:    req.ProxyURL,
-		}
-		if atInfo != nil {
-			newAcc.Email = atInfo.Email
-			newAcc.AccountID = atInfo.ChatGPTAccountID
-			newAcc.PlanType = atInfo.PlanType
-			if !atInfo.ExpiresAt.IsZero() {
-				newAcc.ExpiresAt = atInfo.ExpiresAt
+			name := req.Name
+			if name == "" {
+				name = fmt.Sprintf("at-account-%d", idx+1)
+			} else if len(tokens) > 1 {
+				name = fmt.Sprintf("%s-%d", req.Name, idx+1)
 			}
-		}
-		h.store.AddAccount(newAcc)
 
-		// 将解析到的信息持久化到数据库
-		if atInfo != nil {
-			creds := map[string]interface{}{
-				"email":      atInfo.Email,
-				"account_id": atInfo.ChatGPTAccountID,
-				"plan_type":  atInfo.PlanType,
-				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
+			id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
+			if err != nil {
+				log.Printf("添加 AT 账号 %d 失败: %v", idx+1, err)
+				atomic.AddInt64(&failCount, 1)
+				return
 			}
-			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
-				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
+
+			atomic.AddInt64(&successCount, 1)
+			h.db.InsertAccountEventAsync(id, "added", "manual_at")
+
+			// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
+			atInfo := auth.ParseAccessToken(at)
+
+			// 热加载到内存池（AT-only，无 RT）
+			newAcc := &auth.Account{
+				DBID:        id,
+				AccessToken: at,
+				ExpiresAt:   time.Now().Add(1 * time.Hour),
+				ProxyURL:    req.ProxyURL,
 			}
-		}
-		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
+			if atInfo != nil {
+				newAcc.Email = atInfo.Email
+				newAcc.AccountID = atInfo.ChatGPTAccountID
+				newAcc.PlanType = atInfo.PlanType
+				if !atInfo.ExpiresAt.IsZero() {
+					newAcc.ExpiresAt = atInfo.ExpiresAt
+				}
+			}
+			h.store.AddAccount(newAcc)
+
+			// 将解析到的信息持久化到数据库
+			if atInfo != nil {
+				creds := map[string]interface{}{
+					"email":      atInfo.Email,
+					"account_id": atInfo.ChatGPTAccountID,
+					"plan_type":  atInfo.PlanType,
+					"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
+				}
+				if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
+					log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
+				}
+			}
+			log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", idx+1, id, newAcc.Email)
+		}(i, at)
 	}
+	wg.Wait()
 
-	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	successTotal := atomic.LoadInt64(&successCount)
+	failTotal := atomic.LoadInt64(&failCount)
 
-	msg := fmt.Sprintf("成功添加 %d 个 AT 账号", successCount)
-	if failCount > 0 {
-		msg += fmt.Sprintf("，%d 个失败", failCount)
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successTotal, failTotal, c.ClientIP()))
+
+	msg := fmt.Sprintf("成功添加 %d 个 AT 账号", successTotal)
+	if failTotal > 0 {
+		msg += fmt.Sprintf("，%d 个失败", failTotal)
 	}
 
 	h.InvalidateStatsCache()
 	c.JSON(http.StatusOK, gin.H{
 		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"success": successTotal,
+		"failed":  failTotal,
 	})
 }
 
@@ -2146,6 +2204,9 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	// 记录安全审计日志
 	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
 
+	// 立即失效 proxy 鉴权中间件的 dbKeys 缓存，避免新 key 要等 5 分钟才生效
+	h.invalidateAPIKeyCache()
+
 	c.JSON(http.StatusOK, createAPIKeyResponse{
 		ID:   id,
 		Key:  key,
@@ -2168,6 +2229,10 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+
+	// 立即失效 proxy 鉴权中间件的 dbKeys 缓存，避免被删的 key 仍能调用 5 分钟
+	h.invalidateAPIKeyCache()
+
 	writeMessage(c, http.StatusOK, "已删除")
 }
 
@@ -2205,6 +2270,9 @@ type settingsResponse struct {
 	ModelPayloadOverrides            string `json:"model_payload_overrides"`
 	ResinURL                         string `json:"resin_url"`
 	ResinPlatformName                string `json:"resin_platform_name"`
+	RTManagerURL                     string `json:"rt_manager_url"`
+	RTManagerEnabled                 bool   `json:"rt_manager_enabled"`
+	RTManagerPasswordSet             bool   `json:"rt_manager_password_set"`
 }
 
 type updateSettingsReq struct {
@@ -2233,6 +2301,9 @@ type updateSettingsReq struct {
 	ModelPayloadOverrides            *string `json:"model_payload_overrides"`
 	ResinURL                         *string `json:"resin_url"`
 	ResinPlatformName                *string `json:"resin_platform_name"`
+	RTManagerURL                     *string `json:"rt_manager_url"`
+	RTManagerPassword                *string `json:"rt_manager_password"`
+	RTManagerEnabled                 *bool   `json:"rt_manager_enabled"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2243,12 +2314,17 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
 	var resinURL, resinPlatformName string
+	var rtManagerURL string
+	var rtManagerEnabled, rtManagerPasswordSet bool
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
 	if dbSettings != nil {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
+		rtManagerURL = dbSettings.RTManagerURL
+		rtManagerEnabled = dbSettings.RTManagerEnabled
+		rtManagerPasswordSet = strings.TrimSpace(dbSettings.RTManagerPassword) != ""
 	}
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2281,6 +2357,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ModelPayloadOverrides:            h.store.GetModelPayloadOverrides(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		RTManagerURL:                     rtManagerURL,
+		RTManagerEnabled:                 rtManagerEnabled,
+		RTManagerPasswordSet:             rtManagerPasswordSet,
 	})
 }
 
@@ -2522,6 +2601,40 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		})
 	}
 
+	// rt-manager 联动配置（用于刷新 AT-only 账号）
+	rtManagerURL := ""
+	rtManagerPassword := ""
+	rtManagerEnabled := false
+	if existSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && existSettings != nil {
+		rtManagerURL = existSettings.RTManagerURL
+		rtManagerPassword = existSettings.RTManagerPassword
+		rtManagerEnabled = existSettings.RTManagerEnabled
+	}
+	rtManagerChanged := false
+	if req.RTManagerURL != nil {
+		rtManagerURL = strings.TrimSpace(*req.RTManagerURL)
+		rtManagerChanged = true
+		log.Printf("设置已更新: rt_manager_url")
+	}
+	if req.RTManagerPassword != nil {
+		// 空字符串视为"清除密码"；非空则覆盖
+		rtManagerPassword = *req.RTManagerPassword
+		rtManagerChanged = true
+		log.Printf("设置已更新: rt_manager_password (长度=%d)", len(rtManagerPassword))
+	}
+	if req.RTManagerEnabled != nil {
+		rtManagerEnabled = *req.RTManagerEnabled
+		rtManagerChanged = true
+		log.Printf("设置已更新: rt_manager_enabled = %t", rtManagerEnabled)
+	}
+	if rtManagerChanged {
+		h.store.SetRTManagerConfig(auth.RTManagerConfig{
+			URL:      rtManagerURL,
+			Password: rtManagerPassword,
+			Enabled:  rtManagerEnabled,
+		})
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2549,6 +2662,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ModelPayloadOverrides:            h.store.GetModelPayloadOverrides(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		RTManagerURL:                     rtManagerURL,
+		RTManagerPassword:                rtManagerPassword,
+		RTManagerEnabled:                 rtManagerEnabled,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2600,6 +2716,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ModelPayloadOverrides:            h.store.GetModelPayloadOverrides(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		RTManagerURL:                     rtManagerURL,
+		RTManagerEnabled:                 rtManagerEnabled,
+		RTManagerPasswordSet:             strings.TrimSpace(rtManagerPassword) != "",
 	})
 }
 

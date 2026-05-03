@@ -79,6 +79,7 @@ export interface AccountSummary {
   total: number
   normal: number
   rate_limited: number
+  usage_exhausted: number
   banned: number
   locked: number
   healthy: number
@@ -98,6 +99,37 @@ export interface AddAccountRequest {
   name?: string
   refresh_token: string
   proxy_url: string
+}
+
+export interface DuplicateAccountInfo {
+  id: number
+  name: string
+  email: string
+  platform: string
+  status: AccountStatus | string
+  plan_type: string
+  has_rt: boolean
+  has_at: boolean
+  locked: boolean
+  created_at: ISODateString
+  last_used_at?: ISODateString
+  score: number
+}
+
+export interface DuplicateGroup {
+  email: string
+  platform: string
+  winner: DuplicateAccountInfo
+  losers: DuplicateAccountInfo[]
+  total_in_group: number
+}
+
+export interface DuplicateAccountsResponse {
+  groups: DuplicateGroup[]
+  total_groups: number
+  total_losers: number
+  scanned_accounts: number
+  winner_rule: string
 }
 
 export interface AddATAccountRequest {
@@ -246,6 +278,11 @@ export interface SystemSettings {
   model_payload_overrides: string
   resin_url: string
   resin_platform_name: string
+  rt_manager_url: string
+  rt_manager_enabled: boolean
+  rt_manager_password_set: boolean
+  // 仅写入：UpdateSettings 时可携带；GetSettings 不返回，因此可选
+  rt_manager_password?: string
 }
 
 export interface CPAExportEntry {

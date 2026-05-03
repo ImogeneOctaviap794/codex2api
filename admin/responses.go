@@ -52,14 +52,15 @@ type accountsPagedResponse struct {
 
 // accountSummary 账号汇总计数（在筛选前统计）
 type accountSummary struct {
-	Total       int `json:"total"`
-	Normal      int `json:"normal"`
-	RateLimited int `json:"rate_limited"`
-	Banned      int `json:"banned"`
-	Locked      int `json:"locked"`
-	Healthy     int `json:"healthy"`
-	Warm        int `json:"warm"`
-	Risky       int `json:"risky"`
+	Total          int `json:"total"`
+	Normal         int `json:"normal"`
+	RateLimited    int `json:"rate_limited"`    // 软限速：free 7d ∈ [90%, 110%)，仍可调度
+	UsageExhausted int `json:"usage_exhausted"` // 用量耗尽：free 7d ≥ 110% 或上游 5h 限流，已硬阻断
+	Banned         int `json:"banned"`
+	Locked         int `json:"locked"`
+	Healthy        int `json:"healthy"`
+	Warm           int `json:"warm"`
+	Risky          int `json:"risky"`
 }
 
 type createAccountResponse struct {

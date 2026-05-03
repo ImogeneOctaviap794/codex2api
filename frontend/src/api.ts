@@ -10,6 +10,7 @@ import type {
   ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
+  DuplicateAccountsResponse,
   HealthResponse,
   MessageResponse,
   OAuthExchangeResponse,
@@ -190,6 +191,13 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/clean-rate-limited', { method: 'POST' }),
   cleanError: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-error', { method: 'POST' }),
+  listDuplicateAccounts: () =>
+    request<DuplicateAccountsResponse>('/accounts/duplicates'),
+  dedupeAccounts: (loserIds: number[]) =>
+    request<{ message: string; deleted: number }>('/accounts/dedupe', {
+      method: 'POST',
+      body: JSON.stringify({ loser_ids: loserIds }),
+    }),
   exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[] }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))

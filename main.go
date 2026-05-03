@@ -189,6 +189,21 @@ func main() {
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 
+	// 把 proxy 的 API Key 缓存失效方法注入 admin 端：
+	// admin 在 CreateAPIKey/DeleteAPIKey 后调用此回调，让鉴权中间件的
+	// 5 分钟 DB key 缓存立即失效，新 key 立刻生效、被删 key 立刻失效。
+	adminHandler.SetAPIKeyCacheInvalidator(handler.InvalidateAPIKeyCache)
+
+	// 启动自检：若 env 与 DB 都没有 API Key，所有 /v1/* 请求会被 401 拒绝。
+	// 这是 fail-closed 设计的代价，必须打大字提示用户去管理台配置。
+	if !handler.HasAnyKeys() {
+		log.Println("==========================================")
+		log.Println("⚠️  WARNING: 未检测到任何 API Key")
+		log.Println("⚠️  所有 /v1/* 接口将一律返回 401 Unauthorized")
+		log.Println("⚠️  请到管理台 /admin/keys 创建 API Key 后再使用")
+		log.Println("==========================================")
+	}
+
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
 
@@ -258,9 +273,13 @@ func main() {
 	log.Printf("  API:    GET  /v1/models")
 	log.Println("==========================================")
 
-	// 优雅关闭
+	// 优雅关闭：用裸 http.Server 而不是 r.Run，便于调用 Shutdown(ctx) 让存量请求自然结束。
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: r,
+	}
 	go func() {
-		if err := r.Run(addr); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP 服务启动失败: %v", err)
 		}
 	}()
@@ -269,7 +288,18 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("正在关闭...")
+	// graceful shutdown：拒绝新连接 + 等待存量请求自然结束，最长 shutdownTimeout。
+	// 期间 /health 也会停响应，nginx 蓝绿切换前应已把流量切到新容器。
+	const shutdownTimeout = 90 * time.Second
+	log.Printf("收到关闭信号，进入优雅关闭（最长等待 %s 让存量请求收尾）...", shutdownTimeout)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelShutdown()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP 优雅关闭超时或异常: %v（强制继续清理）", err)
+	} else {
+		log.Println("HTTP 存量请求已全部收尾")
+	}
+
 	store.Stop()
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()

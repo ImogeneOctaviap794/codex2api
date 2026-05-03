@@ -72,3 +72,50 @@ func TestRewriteResponseModelIfDrawing_EmptyData(t *testing.T) {
 		t.Errorf("empty data should return nil, got %q", string(out))
 	}
 }
+
+// ResponseAlias 非空时，覆盖 drawingResponseModelAlias 默认值。
+// 典型用例：客户端发 gpt-5.5 → 上游用 gpt-5.4 → 响应里 model 改回 gpt-5.5。
+func TestResponseModelFor_PreferResponseAlias(t *testing.T) {
+	hit := &ModelOverride{BaseModel: "gpt-5.4", ResponseAlias: "gpt-5.5"}
+	if got := responseModelFor("gpt-5.5", hit); got != "gpt-5.5" {
+		t.Errorf("ResponseAlias should win, want %q got %q", "gpt-5.5", got)
+	}
+}
+
+func TestRewriteResponseModelIfDrawing_PreferResponseAlias(t *testing.T) {
+	hit := &ModelOverride{BaseModel: "gpt-5.4", ResponseAlias: "gpt-5.5"}
+	data := []byte(`{"model":"gpt-5.4","choices":[]}`)
+	out := rewriteResponseModelIfDrawing(data, hit, "model")
+	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.5" {
+		t.Errorf("model should be rewritten to ResponseAlias %q, got %q", "gpt-5.5", got)
+	}
+}
+
+// ResponseAlias 为空时，仍 fallback 到 drawingResponseModelAlias（兼容老画图行为）。
+func TestRewriteResponseModelIfDrawing_FallbackWhenAliasEmpty(t *testing.T) {
+	hit := &ModelOverride{BaseModel: "gpt-5.4-mini"} // 无 ResponseAlias
+	data := []byte(`{"model":"gpt-5.4-mini"}`)
+	out := rewriteResponseModelIfDrawing(data, hit, "model")
+	if got := gjson.GetBytes(out, "model").String(); got != drawingResponseModelAlias {
+		t.Errorf("empty ResponseAlias should fall back to %q, got %q", drawingResponseModelAlias, got)
+	}
+}
+
+// ParseModelOverrides 应能识别 response_alias 字段。
+func TestParseModelOverrides_ResponseAlias(t *testing.T) {
+	jsonStr := `{"gpt-5.5":{"base_model":"gpt-5.4","response_alias":"gpt-5.5"}}`
+	m := ParseModelOverrides(jsonStr)
+	if m == nil {
+		t.Fatal("ParseModelOverrides returned nil")
+	}
+	cfg, ok := m["gpt-5.5"]
+	if !ok {
+		t.Fatal("missing gpt-5.5 entry")
+	}
+	if cfg.BaseModel != "gpt-5.4" {
+		t.Errorf("BaseModel = %q, want gpt-5.4", cfg.BaseModel)
+	}
+	if cfg.ResponseAlias != "gpt-5.5" {
+		t.Errorf("ResponseAlias = %q, want gpt-5.5", cfg.ResponseAlias)
+	}
+}

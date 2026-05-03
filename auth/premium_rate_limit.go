@@ -129,6 +129,52 @@ func (s *Store) InferPremiumPlanFromHeaders(acc *Account) bool {
 	return true
 }
 
+// SyncAccountPlanType 同步上游报告的 plan_type 到本地账号（双写：内存 + DB）。
+// 当 OpenAI 在 429 usage_limit_reached 错误体里报告 plan_type 时调用，
+// 用于实时检测被降级的账号（如 plus → free）。
+//
+// 与 InferPremiumPlanFromHeaders 的差异：
+//   - InferPremiumPlanFromHeaders: 仅在本地 plan_type 为空时回退推断为 "plus"
+//   - SyncAccountPlanType: 强制覆盖（包括 plus → free 这种降级场景）
+//
+// 返回 true 表示发生了实际更新（plan_type 改变了）。
+func (s *Store) SyncAccountPlanType(acc *Account, planType string) bool {
+	if acc == nil || s == nil {
+		return false
+	}
+	planType = strings.ToLower(strings.TrimSpace(planType))
+	if planType == "" {
+		return false
+	}
+	acc.mu.Lock()
+	oldPlan := acc.PlanType
+	if oldPlan == planType {
+		acc.mu.Unlock()
+		return false
+	}
+	acc.PlanType = planType
+	dbID := acc.DBID
+	// 重算调度分（plan 改变会影响 score_bias）
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+
+	s.fastSchedulerUpdate(acc)
+
+	log.Printf("[账号 %d] 同步上游 plan_type: %q → %q", dbID, oldPlan, planType)
+
+	if s.db == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, dbID, map[string]interface{}{
+		"plan_type": planType,
+	}); err != nil {
+		log.Printf("[账号 %d] 持久化 plan_type 失败: %v", dbID, err)
+	}
+	return true
+}
+
 // MarkPremium5hRateLimited 将账号标记为 premium 5h 限流态，并按 resetAt 驱动恢复。
 func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	if acc == nil || s == nil {

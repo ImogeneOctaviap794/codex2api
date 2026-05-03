@@ -122,7 +122,8 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			}
 		case "response.completed":
 			// 测试成功即重置冷却状态，用量限制由调度器自行判断
-			if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+			// 100-110% 区间测试通过也清冷却，让账号重新参与调度（仅重罚分）
+			if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < auth.FreeUsageHardLimitPct) {
 				h.store.ClearCooldown(account)
 			}
 			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
@@ -245,7 +246,8 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			case http.StatusOK:
 				usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
 				// 测试成功即重置冷却状态，用量限制由调度器自行判断
-				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+				// 100-110% 区间测试通过也清冷却，让账号重新参与调度（仅重罚分）
+				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < auth.FreeUsageHardLimitPct) {
 					h.store.ClearCooldown(acc)
 				}
 				atomic.AddInt64(&successCount, 1)

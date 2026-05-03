@@ -185,13 +185,22 @@ func (h *Handler) isValidKey(key string) bool {
 	return ok
 }
 
-// hasAnyKeys 检查是否配置了任何密钥
-func (h *Handler) hasAnyKeys() bool {
+// HasAnyKeys 检查是否配置了任何密钥（env configKeys 或 DB api_keys）。
+// 启动自检 / 监控用途；鉴权中间件本身不再依赖此检查（fail-closed）。
+func (h *Handler) HasAnyKeys() bool {
 	if len(h.configKeys) > 0 {
 		return true
 	}
 	dbKeys := h.refreshDBKeys()
 	return len(dbKeys) > 0
+}
+
+// InvalidateAPIKeyCache 让 DB API Key 缓存立即过期，下次鉴权时强制重拉。
+// 用于 admin 端增删 key 后避免 5 分钟生效延迟。
+func (h *Handler) InvalidateAPIKeyCache() {
+	h.dbKeysMu.Lock()
+	h.dbKeysUntil = time.Time{}
+	h.dbKeysMu.Unlock()
 }
 
 // logUsage 记录请求日志（非阻塞，写入内存缓冲由后台批量 flush）
@@ -386,14 +395,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
+// 安全原则：**fail-closed**。未配置任何 key 时一律 401，不走“免鉴权”快通道。
+// 历史上这里曾为了“首次部署免配置”跳过鉴权，但“ DB api_keys 清空中间态”与
+// 5 分钟 dbKeys 缓存叠加，会出现默默裸奔的窗口（漏洞已复现）。
 func (h *Handler) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 如果没有配置任何密钥，跳过鉴权
-		if !h.hasAnyKeys() {
-			c.Next()
-			return
-		}
-
 		authHeader := c.GetHeader("Authorization")
 		// 兼容 Anthropic 客户端的多种认证方式:
 		// - x-api-key: Anthropic SDK 默认方式
@@ -456,18 +462,29 @@ func (h *Handler) applyVirtualModel(rawBody []byte) ([]byte, *ModelOverride) {
 	return ApplyModelOverride(rawBody, overrides)
 }
 
+// resolveResponseAlias 决定虚拟模型命中后，响应里对外展示的 model 名：
+//   - hit.ResponseAlias 非空 → 用该值（典型："gpt-5.5" 别名场景）
+//   - 否则 fallback 到 drawingResponseModelAlias（画图统一遮蔽为 gpt-5.4）
+func resolveResponseAlias(hit *ModelOverride) string {
+	if hit != nil && hit.ResponseAlias != "" {
+		return hit.ResponseAlias
+	}
+	return drawingResponseModelAlias
+}
+
 // responseModelFor 选响应体中对外展示的 model 名。
-// 命中虚拟模型（画图）→返回 drawingResponseModelAlias；否则返回原始 model。
+// 命中虚拟模型时返回 alias（优先 hit.ResponseAlias，否则 drawingResponseModelAlias）；
+// 未命中时原样返回 model。
 func responseModelFor(model string, hit *ModelOverride) string {
 	if hit != nil {
-		return drawingResponseModelAlias
+		return resolveResponseAlias(hit)
 	}
 	return model
 }
 
-// rewriteResponseModelIfDrawing 在画图场景下（hit != nil）把 JSON 数据中指定 path
-// 的 model 字段原地改写为 drawingResponseModelAlias。其他情况原样返回。
-// path 支持 sjson 语法，如 "model" 或 "response.model"。
+// rewriteResponseModelIfDrawing 在虚拟模型命中场景下（hit != nil）把 JSON 数据中
+// 指定 path 的 model 字段原地改写为 alias（参见 resolveResponseAlias）。
+// 其他情况原样返回。path 支持 sjson 语法，如 "model" 或 "response.model"。
 func rewriteResponseModelIfDrawing(data []byte, hit *ModelOverride, path string) []byte {
 	if hit == nil || len(data) == 0 {
 		return data
@@ -475,7 +492,8 @@ func rewriteResponseModelIfDrawing(data []byte, hit *ModelOverride, path string)
 	if !gjson.GetBytes(data, path).Exists() {
 		return data
 	}
-	if rewritten, err := sjson.SetBytes(data, path, drawingResponseModelAlias); err == nil {
+	alias := resolveResponseAlias(hit)
+	if rewritten, err := sjson.SetBytes(data, path, alias); err == nil {
 		return rewritten
 	}
 	return data
@@ -1893,10 +1911,16 @@ func classify429RateLimit(account *auth.Account, body []byte, resp *http.Respons
 }
 
 // Apply429Cooldown 统一处理 429 对账号状态的影响，premium 5h 场景优先写入显式限流态。
+// 同时：从 usage_limit_reached 错误体里读取 error.plan_type，若与本地不一致则同步
+// （治理 plus 被上游降级为 free 但本地仍记 plus 导致调度失误的问题）。
 func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response) codex429Decision {
 	decision := classify429RateLimit(account, body, resp, time.Now())
 	if store == nil || account == nil {
 		return decision
+	}
+	// 优先解析 error.plan_type 同步本地（无论是否 premium 5h 都同步）
+	if details, ok := parseUsageLimitDetails(body); ok && details.planType != "" {
+		store.SyncAccountPlanType(account, details.planType)
 	}
 	if decision.Premium5h {
 		store.MarkPremium5hRateLimited(account, decision.ResetAt)
@@ -1983,7 +2007,16 @@ func compute429Cooldown(account *auth.Account, body []byte, resp *http.Response)
 
 	switch planType {
 	case "free":
-		// Free 只有 7d 窗口，429 = 额度耗尽，冷却 7 天
+		// Free 只有 7d 窗口，429 = 额度耗尽。
+		// 优先使用账号上记录的 Reset7dAt（来自上游响应头 x-codex-primary-reset-after-seconds），
+		// 避免硬写 7 天导致 cooldown 比自然重置更晚。
+		if account != nil {
+			if reset := account.GetReset7dAt(); !reset.IsZero() {
+				if d := time.Until(reset); d > 0 && d <= 7*24*time.Hour {
+					return d
+				}
+			}
+		}
 		return 7 * 24 * time.Hour
 
 	case "team", "teamplus", "pro", "plus", "enterprise":
@@ -2251,16 +2284,21 @@ func bodyRequiresPaidAccount(rawBody []byte) bool {
 
 // planDispatch 计算一次请求的调度策略，就地写入 exclude 集并返回 preferPlan。
 // 规则：
-//   - 命中 premium-only 模型，或请求体（含虚拟模型 inject 之后）带 image_generation 工具
+//   - 命中 premium-only 模型，或请求体（含虚拟模型 inject 之后）带 image_generation 工具，
+//     或虚拟模型本身会注入 image_generation（如 gpt-image-2，rawBody 此时尚未合并 tools）
 //     → 把所有 Free 账号加入 exclude，preferPlan = ""（只调度付费）
 //   - 其他请求（含只 inject reasoning effort 的虚拟模型如 gpt-5.4-high）
 //     → preferPlan = "free"（优先 Free，池空回退付费）
 //
-// 注意：这里**不**再用 `virtualHit != nil` 作为 premium 判据——虚拟模型也可能只
-// inject reasoning/service_tier，Free 完全能承接。统一以 rawBody 是否含
-// image_generation 作为唯一付费判据更准确。
-func (h *Handler) planDispatch(model string, rawBody []byte, _ *ModelOverride, exclude map[int64]bool) string {
+// 注意：bodyRequiresPaidAccount 只能识别用户已显式传入的 image_generation 工具；
+// /v1/images/generations 内部转发到 chat/completions 时 rawBody 还没合并 tools，
+// 因此必须额外检查 virtualHit 是否会注入 image_generation，否则 free 账号会被选中
+// 导致上游返回空 content（gotTerminal + 0 delta）+ 500 image URL not found。
+func (h *Handler) planDispatch(model string, rawBody []byte, virtualHit *ModelOverride, exclude map[int64]bool) string {
 	needPaid := IsPremiumOnlyModel(model) || bodyRequiresPaidAccount(rawBody)
+	if !needPaid && virtualHit != nil && virtualHit.InjectsImageGeneration() {
+		needPaid = true
+	}
 	if needPaid {
 		if exclude != nil && h != nil && h.store != nil {
 			for id := range h.store.AccountIDsByPlan("free") {

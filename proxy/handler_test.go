@@ -138,6 +138,32 @@ func TestSendFinalUpstreamError_Non429StatusPassthrough(t *testing.T) {
 	}
 }
 
+func TestCompute429CooldownFreeUsesAccountReset7dAt(t *testing.T) {
+	handler := &Handler{}
+	resetAt := time.Now().Add(36 * time.Hour)
+	account := &auth.Account{PlanType: "free", Reset7dAt: resetAt}
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "100")
+	resp.Header.Set("x-codex-primary-window-minutes", "10080")
+
+	// body 不带 resets_in_seconds → fallback 路径，应该用 account.Reset7dAt 而非硬写 7 天
+	got := handler.compute429Cooldown(account, []byte(`{"error":{"type":"usage_limit_reached"}}`), resp)
+	if got > 36*time.Hour+5*time.Minute || got < 36*time.Hour-5*time.Minute {
+		t.Fatalf("cooldown = %v, want ≈ 36h (Reset7dAt fallback)", got)
+	}
+}
+
+func TestCompute429CooldownFreeFallbackTo7DaysWhenNoReset(t *testing.T) {
+	handler := &Handler{}
+	account := &auth.Account{PlanType: "free"} // Reset7dAt 零值
+	resp := &http.Response{Header: make(http.Header)}
+
+	got := handler.compute429Cooldown(account, []byte(`{"error":{"type":"usage_limit_reached"}}`), resp)
+	if got != 7*24*time.Hour {
+		t.Fatalf("cooldown = %v, want 7d (no Reset7dAt)", got)
+	}
+}
+
 func TestCompute429CooldownPlusUsesWindowHeaders(t *testing.T) {
 	handler := &Handler{}
 	account := &auth.Account{PlanType: "plus"}
@@ -306,5 +332,90 @@ func TestAuthMiddlewareSetsAPIKeyContext(t *testing.T) {
 	}
 	if payload.Raw != key {
 		t.Fatalf("raw = %q, want %q", payload.Raw, key)
+	}
+}
+
+// TestAuthMiddlewareFailsClosedWithoutAnyKeys 是核心安全回归测试：
+// env 与 DB 都没有 API Key 时，鉴权中间件必须一律 401，绝不放行。
+// 历史漏洞：曾因"没 key 就跳过鉴权"的兼容 fallback 导致裸奔。
+func TestAuthMiddlewareFailsClosedWithoutAnyKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	handler := NewHandler(nil, db, nil, nil)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	cases := []struct {
+		name   string
+		header map[string]string
+	}{
+		{"no header", nil},
+		{"empty bearer", map[string]string{"Authorization": "Bearer "}},
+		{"bogus bearer", map[string]string{"Authorization": "Bearer sk-totally-fake"}},
+		{"x-api-key bogus", map[string]string{"x-api-key": "sk-totally-fake"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+			for k, v := range tc.header {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+// TestInvalidateAPIKeyCacheRefreshesImmediately 验证：admin 增 key 后调用
+// InvalidateAPIKeyCache，下一次鉴权立即重拉 DB（不用等 5 分钟缓存 TTL）。
+func TestInvalidateAPIKeyCacheRefreshesImmediately(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	handler := NewHandler(nil, db, nil, nil)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// 第一次鉴权：DB 空，触发缓存填充为 empty + 5min TTL
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Bearer sk-not-exist-yet")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("step1 status = %d, want 401", rec.Code)
+	}
+
+	// admin 流程：插入新 key + 调用 InvalidateAPIKeyCache
+	newKey := "sk-fresh-1234567890"
+	if _, err := db.InsertAPIKey(context.Background(), "fresh", newKey); err != nil {
+		t.Fatalf("InsertAPIKey: %v", err)
+	}
+	handler.InvalidateAPIKeyCache()
+
+	// 第二次鉴权：缓存已失效，应该立即看到新 key（不依赖 5min TTL）
+	req2 := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req2.Header.Set("Authorization", "Bearer "+newKey)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("step2 status = %d, want 200 (key should be effective immediately)", rec2.Code)
 	}
 }

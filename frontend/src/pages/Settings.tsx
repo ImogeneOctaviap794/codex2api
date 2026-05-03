@@ -26,7 +26,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 
-import { Trash2, Eye, EyeOff } from 'lucide-react'
+import { Trash2, Eye, EyeOff, Plus, ChevronDown, ChevronRight } from 'lucide-react'
 
 // 默认模型映射
 const DEFAULT_MODEL_MAPPING: Record<string, string> = {
@@ -79,6 +79,246 @@ const DEFAULT_DRAW_OVERRIDES = {
     },
     description: '统一画图模型（所有参数交给 metadata.image_* 控制）',
   },
+}
+
+// 虚拟模型别名 - 模型重命名示例（客户端发 X，上游用 Y，响应保持 X）
+// 默认 gpt-5.5 → gpt-5.4 透传；但当 effort=xhigh 时 skip_if 命中，保持 5.5 原样
+// （覆盖 Responses API reasoning.effort 和 Chat Completions reasoning_effort 两种字段命名）
+const DEFAULT_ALIAS_OVERRIDES = {
+  'gpt-5.5': {
+    base_model: 'gpt-5.4',
+    response_alias: 'gpt-5.5',
+    description: '客户端发 gpt-5.5 → 上游用 gpt-5.4；effort=xhigh 时保持 5.5 原样',
+    skip_if: {
+      'reasoning.effort': 'xhigh',
+      'reasoning_effort': 'xhigh',
+    },
+  },
+}
+
+// 虚拟模型条目（与后端 ModelOverride 同构）
+type VirtualModelEntry = {
+  alias: string
+  base_model: string
+  response_alias?: string
+  description?: string
+  inject?: Record<string, unknown>
+  skip_if?: Record<string, unknown>
+}
+
+function parseVirtualModels(jsonStr: string): VirtualModelEntry[] {
+  try {
+    const parsed = JSON.parse(jsonStr || '{}') as Record<string, {
+      base_model?: string
+      response_alias?: string
+      description?: string
+      inject?: Record<string, unknown>
+      skip_if?: Record<string, unknown>
+    }>
+    return Object.entries(parsed).map(([alias, cfg]) => ({
+      alias,
+      base_model: cfg?.base_model ?? '',
+      response_alias: cfg?.response_alias,
+      description: cfg?.description,
+      inject: cfg?.inject,
+      skip_if: cfg?.skip_if,
+    }))
+  } catch {
+    return []
+  }
+}
+
+function serializeVirtualModels(entries: VirtualModelEntry[]): string {
+  const obj: Record<string, Record<string, unknown>> = {}
+  for (const e of entries) {
+    const key = e.alias.trim()
+    if (!key) continue
+    const cfg: Record<string, unknown> = { base_model: e.base_model.trim() }
+    if (e.response_alias && e.response_alias.trim()) cfg.response_alias = e.response_alias.trim()
+    if (e.inject && Object.keys(e.inject).length > 0) cfg.inject = e.inject
+    if (e.skip_if && Object.keys(e.skip_if).length > 0) cfg.skip_if = e.skip_if
+    if (e.description && e.description.trim()) cfg.description = e.description.trim()
+    obj[key] = cfg
+  }
+  return JSON.stringify(obj, null, 2)
+}
+
+// 判断条目是否注入了 image_generation 工具（用于"画图"徽章展示）
+function entryIsDrawing(e: VirtualModelEntry): boolean {
+  const inject = e.inject
+  if (!inject) return false
+  const tc = inject.tool_choice as { type?: string } | undefined
+  if (tc?.type === 'image_generation') return true
+  const tools = inject.tools as Array<{ type?: string }> | undefined
+  if (Array.isArray(tools) && tools.some(t => t?.type === 'image_generation')) return true
+  return false
+}
+
+// 虚拟模型可视化编辑器
+function VirtualModelsEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { t } = useTranslation()
+  const [showJson, setShowJson] = useState(false)
+  const entries = parseVirtualModels(value)
+
+  const writeEntries = (next: VirtualModelEntry[]) => {
+    onChange(serializeVirtualModels(next))
+  }
+
+  const updateEntry = (index: number, patch: Partial<VirtualModelEntry>) => {
+    const next = entries.map((e, i) => (i === index ? { ...e, ...patch } : e))
+    writeEntries(next)
+  }
+
+  const removeEntry = (index: number) => {
+    writeEntries(entries.filter((_, i) => i !== index))
+  }
+
+  // 合并：示例条目追加到现有列表（同 alias 时新覆盖旧，避免静默忽略用户操作）
+  const mergeOverrides = (overrides: Record<string, {
+    base_model: string
+    response_alias?: string
+    description?: string
+    inject?: Record<string, unknown>
+  }>) => {
+    const map = new Map(entries.map(e => [e.alias, e]))
+    for (const [alias, cfg] of Object.entries(overrides)) {
+      map.set(alias, { alias, ...cfg })
+    }
+    writeEntries(Array.from(map.values()))
+  }
+
+  const addAliasEntry = () => {
+    writeEntries([
+      ...entries,
+      { alias: '', base_model: 'gpt-5.4', response_alias: '', description: '' },
+    ])
+  }
+
+  return (
+    <div className="space-y-3">
+      {entries.length > 0 && (
+        <div className="rounded-md border border-input overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs w-[180px]">{t('settings2.vmAlias')}</TableHead>
+                <TableHead className="text-xs w-[160px]">{t('settings2.vmBaseModel')}</TableHead>
+                <TableHead className="text-xs w-[160px]">{t('settings2.vmResponseAlias')}</TableHead>
+                <TableHead className="text-xs w-[110px]">{t('settings2.vmKind')}</TableHead>
+                <TableHead className="text-xs">{t('settings2.vmDescription')}</TableHead>
+                <TableHead className="text-xs w-[60px]" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {entries.map((e, i) => {
+                const drawing = entryIsDrawing(e)
+                return (
+                  <TableRow key={i}>
+                    <TableCell className="py-2">
+                      <Input
+                        className="font-mono text-[12px] h-8"
+                        placeholder="gpt-5.5"
+                        value={e.alias}
+                        onChange={(ev: ChangeEvent<HTMLInputElement>) => updateEntry(i, { alias: ev.target.value })}
+                      />
+                    </TableCell>
+                    <TableCell className="py-2">
+                      <Input
+                        className="font-mono text-[12px] h-8"
+                        placeholder="gpt-5.4"
+                        value={e.base_model}
+                        onChange={(ev: ChangeEvent<HTMLInputElement>) => updateEntry(i, { base_model: ev.target.value })}
+                      />
+                    </TableCell>
+                    <TableCell className="py-2">
+                      <Input
+                        className="font-mono text-[12px] h-8"
+                        placeholder={drawing ? '(默认 gpt-5.4)' : 'gpt-5.5'}
+                        value={e.response_alias ?? ''}
+                        onChange={(ev: ChangeEvent<HTMLInputElement>) => updateEntry(i, { response_alias: ev.target.value })}
+                      />
+                    </TableCell>
+                    <TableCell className="py-2">
+                      <div className="flex flex-wrap gap-1">
+                        {drawing ? (
+                          <Badge variant="default" className="text-[11px]">{t('settings2.vmKindDrawing')}</Badge>
+                        ) : (
+                          <Badge variant="secondary" className="text-[11px]">{t('settings2.vmKindRename')}</Badge>
+                        )}
+                        {e.skip_if && Object.keys(e.skip_if).length > 0 && (
+                          <Badge
+                            variant="outline"
+                            className="text-[11px]"
+                            title={JSON.stringify(e.skip_if, null, 2)}
+                          >
+                            {t('settings2.vmKindConditional')}
+                          </Badge>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell className="py-2">
+                      <Input
+                        className="text-[12px] h-8"
+                        placeholder={t('settings2.vmDescriptionPlaceholder')}
+                        value={e.description ?? ''}
+                        onChange={(ev: ChangeEvent<HTMLInputElement>) => updateEntry(i, { description: ev.target.value })}
+                      />
+                    </TableCell>
+                    <TableCell className="py-2 text-right">
+                      <button
+                        onClick={() => removeEntry(i)}
+                        className="flex items-center justify-center size-8 rounded-md text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                        title={t('common.delete')}
+                      >
+                        <Trash2 className="size-4" />
+                      </button>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      <div className="flex flex-wrap gap-2">
+        <Button variant="outline" size="sm" onClick={addAliasEntry}>
+          <Plus className="size-3.5 mr-1" />{t('settings2.vmAddAlias')}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => mergeOverrides(DEFAULT_DRAW_OVERRIDES as never)}
+        >
+          <Plus className="size-3.5 mr-1" />{t('settings2.virtualModelsExample')}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => mergeOverrides(DEFAULT_ALIAS_OVERRIDES as never)}
+        >
+          <Plus className="size-3.5 mr-1" />{t('settings2.virtualModelsAliasExample')}
+        </Button>
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setShowJson(s => !s)}
+        className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+      >
+        {showJson ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        {t('settings2.vmAdvancedJson')}
+      </button>
+      {showJson && (
+        <textarea
+          className="w-full min-h-[180px] font-mono text-xs rounded-md border border-input bg-background px-3 py-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          spellCheck={false}
+          value={value}
+          onChange={(e: ChangeEvent<HTMLTextAreaElement>) => onChange(e.target.value)}
+        />
+      )}
+    </div>
+  )
 }
 
 // 模型映射编辑器组件
@@ -199,6 +439,9 @@ export default function Settings() {
     model_payload_overrides: '{}',
     resin_url: '',
     resin_platform_name: '',
+    rt_manager_url: '',
+    rt_manager_enabled: false,
+    rt_manager_password_set: false,
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
@@ -299,8 +542,14 @@ export default function Settings() {
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const updated = await api.updateSettings(settingsForm)
-      setSettingsForm(updated)
+      // rt_manager_password 仅在用户实际输入时发送；空字符串表示"未改"，
+      // 否则后端会把已保存的密码清空导致下次刷新失败。
+      const payload: Partial<SystemSettings> = { ...settingsForm }
+      if (!payload.rt_manager_password) {
+        delete payload.rt_manager_password
+      }
+      const updated = await api.updateSettings(payload)
+      setSettingsForm({ ...updated, rt_manager_password: '' })
       setLoadedAdminSecret(updated.admin_secret ?? '')
       if (updated.admin_auth_source !== 'env') {
         setAdminKey(updated.admin_secret ?? '')
@@ -825,26 +1074,11 @@ export default function Settings() {
         {/* Virtual Models (Payload Overrides) */}
         <Card className="mb-4">
           <CardContent className="p-6">
-            <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
-              <h3 className="text-base font-semibold text-foreground">{t('settings2.virtualModelsTitle')}</h3>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setSettingsForm(f => ({
-                  ...f,
-                  model_payload_overrides: JSON.stringify(DEFAULT_DRAW_OVERRIDES, null, 2),
-                }))}
-              >
-                {t('settings2.virtualModelsExample')}
-              </Button>
-            </div>
+            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings2.virtualModelsTitle')}</h3>
             <p className="text-xs text-muted-foreground mb-4">{t('settings2.virtualModelsDesc')}</p>
-            <textarea
-              className="w-full min-h-[220px] font-mono text-xs rounded-md border border-input bg-background px-3 py-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              spellCheck={false}
-              placeholder={'{\n  "gpt-draw-1024x1024": {\n    "base_model": "gpt-5.4-mini",\n    "inject": { "tools": [{"type":"image_generation","size":"1024x1024"}], "tool_choice": {"type":"image_generation"} }\n  }\n}'}
+            <VirtualModelsEditor
               value={settingsForm.model_payload_overrides}
-              onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setSettingsForm(f => ({ ...f, model_payload_overrides: e.target.value }))}
+              onChange={(v) => setSettingsForm(f => ({ ...f, model_payload_overrides: v }))}
             />
             <Button className="mt-4" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
               {savingSettings ? t('common.saving') : t('settings.saveSettings')}
@@ -875,6 +1109,47 @@ export default function Settings() {
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_platform_name: e.target.value }))}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.resinPlatformNameDesc')}</p>
+              </div>
+            </div>
+            <Button className="mt-4" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+              {savingSettings ? t('common.saving') : t('settings.saveSettings')}
+            </Button>
+          </CardContent>
+        </Card>
+
+        {/* RT Manager 联动：用于刷新 AT-only 账号 */}
+        <Card className="mb-4">
+          <CardContent className="p-6">
+            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings.rtManagerTitle')}</h3>
+            <p className="text-xs text-muted-foreground mb-4">{t('settings.rtManagerDesc')}</p>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4">
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.rtManagerEnabled')}</label>
+                <Select
+                  value={settingsForm.rt_manager_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, rt_manager_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.rtManagerEnabledDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.rtManagerUrl')}</label>
+                <Input
+                  placeholder="https://rt.iiusa.edu.kg"
+                  value={settingsForm.rt_manager_url}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, rt_manager_url: e.target.value }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.rtManagerUrlDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.rtManagerPassword')}</label>
+                <Input
+                  type="password"
+                  placeholder={settingsForm.rt_manager_password_set ? t('settings.rtManagerPasswordExisting') : t('settings.rtManagerPasswordPlaceholder')}
+                  value={settingsForm.rt_manager_password ?? ''}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, rt_manager_password: e.target.value }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.rtManagerPasswordDesc')}</p>
               </div>
             </div>
             <Button className="mt-4" onClick={() => void handleSaveSettings()} disabled={savingSettings}>

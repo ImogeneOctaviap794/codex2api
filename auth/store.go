@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -255,9 +256,18 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 	}
 }
 
+// defaultScoreBiasForPlan 给不同 plan 的账号加调度优先级：
+//   - team:       +100（最高，付费请求优先打 team）
+//   - pro/plus:   +50
+//   - free/其他:  0
+//
+// 这是软优先：所有付费账号仍在同一池里参与并发调度，但 team 在排序中
+// 比 plus/pro 高 50 分，会被更优先选中，不会硬性隔离/打爆 team 池。
 func defaultScoreBiasForPlan(planType string) int64 {
 	switch strings.ToLower(strings.TrimSpace(planType)) {
-	case "pro", "plus", "team":
+	case "team":
+		return 100
+	case "pro", "plus":
 		return 50
 	default:
 		return 0
@@ -382,6 +392,8 @@ func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
 
 	if a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
 		switch {
+		case a.UsagePercent7d >= FreeUsageHardLimitPct:
+			breakdown.UsagePenalty7d = 50
 		case a.UsagePercent7d >= 100:
 			breakdown.UsagePenalty7d = 40
 		case a.UsagePercent7d >= 95:
@@ -531,12 +543,15 @@ func (a *Account) IsAvailable() bool {
 	if a.healthTierLocked() == HealthTierBanned {
 		return false
 	}
-	// Free 账号 7d 用量 >= 100%，视为不可用
+	// Free 账号 7d 用量 >= 110%（FreeUsageHardLimitPct），视为不可用
 	if a.usageExhaustedLocked() {
 		return false
 	}
+	// Premium 5h 限流期间完全不可调度，等到 Reset5hAt 自动恢复。
+	// 历史设计是"仍可调度（单并发 + 重罚分）"以利用恢复瞬间，但实测 5h 100% 后
+	// 上游会持续返 429 直到 reset，低概率派发只是浪费请求 + 加重账号风险。
 	if a.premium5hRateLimitedLocked(time.Now()) {
-		return a.AccessToken != ""
+		return false
 	}
 	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
 		return false
@@ -549,19 +564,28 @@ func (a *Account) IsAvailable() bool {
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
+// 注：100% 是 OpenAI 的软上限，超过后上游仍会给少量额度，因此本地阈值留出 10%
+// 缓冲，到 110% 才硬阻断；100-110% 区间继续保留在调度池中（重罚分），由真实 429
+// 触发 cooldown。
 func (a *Account) usageExhaustedLocked() bool {
-	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
+	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= FreeUsageHardLimitPct
 }
 
 // freeUsageRateLimitThresholdPct 定义 Free 账号进入软限速的 7d 用量阈值。
 // 达到该值（默认 90%）时：
 //   - RuntimeStatus 返回 "rate_limited"
 //   - HealthTier 降到 Risky，scheduler 显著降权
-//   - 仍然可被调度（保留 < 10% 剩余额度），直到 100% 触发 usageExhausted 硬阻断
+//   - 仍然可被调度，直到 FreeUsageHardLimitPct (110%) 触发 usageExhausted 硬阻断
 const freeUsageRateLimitThresholdPct = 90.0
 
-// freeUsageRateLimitedLocked 判断 Free 账号 7d 用量是否处于软限速区间 [90%, 100%)
-// （需持有 mu 读锁）
+// FreeUsageHardLimitPct 定义 Free 账号 7d 用量的硬阻断阈值。
+// 100% 是 OpenAI 的软警戒线，上游通常会再多放 10% 左右才真正返回 429；
+// 因此本地保留这部分缓冲，让账号继续参与调度（仅重罚分），由真实 429 自然落入
+// 上游精确 cooldown，避免提前烧死账号。
+const FreeUsageHardLimitPct = 110.0
+
+// freeUsageRateLimitedLocked 判断 Free 账号 7d 用量是否处于软限速区间
+// [freeUsageRateLimitThresholdPct, FreeUsageHardLimitPct)（需持有 mu 读锁）
 func (a *Account) freeUsageRateLimitedLocked() bool {
 	if !a.UsagePercent7dValid {
 		return false
@@ -569,7 +593,7 @@ func (a *Account) freeUsageRateLimitedLocked() bool {
 	if !strings.EqualFold(a.PlanType, "free") {
 		return false
 	}
-	return a.UsagePercent7d >= freeUsageRateLimitThresholdPct && a.UsagePercent7d < 100
+	return a.UsagePercent7d >= freeUsageRateLimitThresholdPct && a.UsagePercent7d < FreeUsageHardLimitPct
 }
 
 // NeedsRefresh 检查 AT 是否需要刷新（过期前 5 分钟刷新）
@@ -645,8 +669,23 @@ func (a *Account) RuntimeStatus() string {
 	if a.usageExhaustedLocked() {
 		return "usage_exhausted"
 	}
+	// Premium 5h 限流：5h 用量 100% + 真 429，是上游真停服，归到 usage_exhausted。
+	// 与 free 110% 的区别仅是恢复速度（5h 滚动窗口 vs 7d 窗口），都是当前不可用。
 	if a.premium5hRateLimitedLocked(now) {
-		return "rate_limited"
+		return "usage_exhausted"
+	}
+	// Cooldown 由真实上游响应触发（如收到 429），必须优先于软限速判定。
+	// 否则一个 free 99% 账号被 OpenAI 真返回 usage_limit_reached 后，
+	// RuntimeStatus 会被软限速分支抢先返回 "rate_limited"，让 UI 误显示"还能用"。
+	// reason="rate_limited" 的 cooldown 语义就是"上游真拒了"，归到 usage_exhausted。
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+		if a.CooldownReason == "rate_limited" {
+			return "usage_exhausted"
+		}
+		if a.CooldownReason != "" {
+			return a.CooldownReason
+		}
+		return "cooldown"
 	}
 	// Free 账号 7d 用量 >= 90% 进入软限速，状态标记为 rate_limited 但仍可用
 	if a.freeUsageRateLimitedLocked() {
@@ -657,6 +696,9 @@ func (a *Account) RuntimeStatus() string {
 		return "error"
 	case StatusCooldown:
 		if now.Before(a.CooldownUtil) {
+			if a.CooldownReason == "rate_limited" {
+				return "usage_exhausted"
+			}
 			if a.CooldownReason != "" {
 				return a.CooldownReason
 			}
@@ -981,6 +1023,10 @@ type Store struct {
 	modelPayloadOverrides atomic.Value // 虚拟模型 payload 覆盖 JSON 字符串
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
+
+	// AT-only 账号通过外部 rt-manager（ChatGPT App scope RT）刷新的客户端，
+	// 配置由 admin/SystemSettings 注入；nil 或未启用时退化为原有跳过逻辑。
+	rtManager *RTManager
 }
 
 type sessionAffinity struct {
@@ -1050,6 +1096,15 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanError.Store(settings.AutoCleanError)
 	s.autoCleanExpired.Store(settings.AutoCleanExpired)
 	s.fastAliasEnabled.Store(settings.FastAliasEnabled)
+
+	// rt-manager 客户端：始终初始化（持久化设置注入），是否真生效由 Enabled() 决定
+	s.rtManager = NewRTManager()
+	s.rtManager.SetConfig(RTManagerConfig{
+		URL:      settings.RTManagerURL,
+		Password: settings.RTManagerPassword,
+		Enabled:  settings.RTManagerEnabled,
+	})
+
 	retries := int64(settings.MaxRetries)
 	if retries <= 0 {
 		retries = 2 // 默认重试 2 次
@@ -1324,6 +1379,22 @@ func (s *Store) GetFastAliasEnabled() bool {
 // SetFastAliasEnabled 设置是否启用 fast→priority 别名。
 func (s *Store) SetFastAliasEnabled(enabled bool) {
 	s.fastAliasEnabled.Store(enabled)
+}
+
+// RTManager 返回外部 rt-manager 联动客户端（启动时一定非 nil，是否启用看 Enabled()）。
+func (s *Store) RTManager() *RTManager {
+	if s == nil {
+		return nil
+	}
+	return s.rtManager
+}
+
+// SetRTManagerConfig 热更新 rt-manager 配置。admin 设置变更后调用。
+func (s *Store) SetRTManagerConfig(cfg RTManagerConfig) {
+	if s == nil || s.rtManager == nil {
+		return
+	}
+	s.rtManager.SetConfig(cfg)
 }
 
 // GetAutoCleanExpired 获取是否自动清理过期账号
@@ -2298,9 +2369,9 @@ func (s *Store) CleanFullUsageAccounts(ctx context.Context) int {
 			continue
 		}
 
-		// 检查用量是否 >= 100%
+		// 检查用量是否 >= 硬阻断阈值（默认 110%）
 		pct, valid := acc.GetUsagePercent7d()
-		if !valid || pct < 100.0 {
+		if !valid || pct < FreeUsageHardLimitPct {
 			continue
 		}
 
@@ -2570,6 +2641,18 @@ func (s *Store) RefreshSingle(ctx context.Context, dbID int64) error {
 	if target == nil {
 		return fmt.Errorf("账号 %d 不存在", dbID)
 	}
+
+	// AT-only 账号（无本地 RT）走 rt-manager 联动路径，与 parallelRefreshAll 一致。
+	target.mu.RLock()
+	hasRT := target.RefreshToken != ""
+	target.mu.RUnlock()
+	if !hasRT {
+		if s.rtManager == nil || !s.rtManager.Enabled() {
+			return errors.New("AT-only 账号需要启用 rt-manager 才能刷新（admin 设置 → RT Manager）")
+		}
+		return s.refreshAccountViaRTManager(ctx, target)
+	}
+
 	return s.refreshAccount(ctx, target)
 }
 
@@ -2688,17 +2771,36 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 		if acc.IsBanned() {
 			continue
 		}
-		if acc.HasActiveCooldown() {
-			continue
-		}
-		// AT-only 账号无 RT，无法刷新
+		// 注意：cooldown 中的账号仍然要继续 token 保活（刷 AT/RT）。
+		// cooldown 只表明“暂不接业务请求”，不应该跳过 token 保活逻辑。
+		// 如果跳过，cooldown_until > AT 过期时间的账号会错过 5min 过期窗口变成死号。
+		// 业务请求调度会在 IsAvailable / PickAccount 那一层接着检查 cooldown，这里不重复。
+
+		// AT-only 账号无本地 RT，按需走 rt-manager 联动刷新；
+		// 否则走原有 OAuth 直刷路径。
 		acc.mu.RLock()
 		hasRT := acc.RefreshToken != ""
 		acc.mu.RUnlock()
-		if !hasRT {
+
+		if !acc.NeedsRefresh() {
 			continue
 		}
-		if !acc.NeedsRefresh() {
+
+		if !hasRT {
+			if s.rtManager == nil || !s.rtManager.Enabled() {
+				continue
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(idx int, account *Account) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := s.refreshAccountViaRTManager(ctx, account); err != nil {
+					log.Printf("[账号 %d] rt-manager 刷新失败: %v", idx+1, err)
+				} else {
+					log.Printf("[账号 %d] rt-manager 刷新成功: email=%s", idx+1, account.Email)
+				}
+			}(i, acc)
 			continue
 		}
 
@@ -2716,6 +2818,133 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 		}(i, acc)
 	}
 	wg.Wait()
+}
+
+// refreshAccountViaRTManager 通过外部 rt-manager 服务刷新 AT-only 账号。
+//
+// 流程：
+//  1. 用 acc.Email 在 rt-manager 索引中找对应 (id, rt)；
+//  2. GET /api/refresh?refresh_token=<rt> 拿到新 AT/RT/id_token；
+//  3. **codex2api 自身不保存这个 RT**（client_id 不同，本地刷不动），
+//     仅写入 access_token/id_token/expires_at；
+//  4. PUT /api/accounts/<id> 把新 RT 持久化到 rt-manager，下次依然能用。
+//
+// 失败处理：rt-manager 找不到 email、上游 RT 已过期（refresh_token_expired
+// 或 invalid_grant）等不可恢复错误 → 把账号置为 error，避免后续轮询继续打。
+func (s *Store) refreshAccountViaRTManager(ctx context.Context, acc *Account) error {
+	if s == nil || s.rtManager == nil || !s.rtManager.Enabled() {
+		return errors.New("rt-manager 未启用")
+	}
+
+	acc.mu.RLock()
+	email := acc.Email
+	dbID := acc.DBID
+	cooldownUntil := acc.CooldownUtil
+	cooldownReason := acc.CooldownReason
+	now := time.Now()
+	premiumCooldownSuppressed := acc.premium5hCooldownSuppressedLocked(now)
+	activeCooldown := acc.Status == StatusCooldown && now.Before(acc.CooldownUtil) && !premiumCooldownSuppressed
+	expiredCooldown := acc.Status == StatusCooldown && !now.Before(acc.CooldownUtil)
+	acc.mu.RUnlock()
+
+	if strings.TrimSpace(email) == "" {
+		return errors.New("AT-only 账号缺少 email，无法在 rt-manager 中匹配")
+	}
+
+	rtmAcc, ok := s.rtManager.Lookup(ctx, email)
+	if !ok {
+		return fmt.Errorf("rt-manager 中未找到 email=%s", email)
+	}
+	if strings.TrimSpace(rtmAcc.RT) == "" {
+		return fmt.Errorf("rt-manager 账号 %s 无 RT", email)
+	}
+
+	// 1. 调 rt-manager 用 RT 换新 AT/RT
+	refreshed, err := s.rtManager.Refresh(ctx, rtmAcc.RT)
+	if err != nil {
+		// invalid_grant / refresh_token_expired 等不可恢复 → 标错
+		if isNonRetryable(err) {
+			acc.mu.Lock()
+			acc.Status = StatusError
+			acc.ErrorMsg = err.Error()
+			acc.mu.Unlock()
+			s.fastSchedulerUpdate(acc)
+			_ = s.db.SetError(ctx, dbID, err.Error())
+		}
+		return err
+	}
+
+	// 2. 解析 id_token（拿 plan_type / chatgpt_account_id）
+	info := parseIDToken(refreshed.IDToken)
+	expiresAt := time.Now().Add(time.Duration(refreshed.ExpiresIn) * time.Second)
+
+	// 3. 写回 rt-manager 持久化新 RT（必须在我们更新自己之前完成，避免并发刷复用旧 RT）
+	if putErr := s.rtManager.UpdateAccount(ctx, rtmAcc.ID, refreshed); putErr != nil {
+		// 不致命，但要打日志：下次拉索引时会同步到旧值，又会失败
+		log.Printf("[账号 %d] rt-manager 回写新 RT 失败: %v", dbID, putErr)
+	}
+
+	// 4. 更新内存
+	acc.mu.Lock()
+	acc.AccessToken = refreshed.AccessToken
+	// 注意：codex2api 不持有 ChatGPT App scope 的 RT，留空让原刷新路径继续 skip
+	acc.ExpiresAt = expiresAt
+	acc.ErrorMsg = ""
+	if info != nil {
+		if info.ChatGPTAccountID != "" {
+			acc.AccountID = info.ChatGPTAccountID
+		}
+		if info.Email != "" {
+			acc.Email = info.Email
+		}
+		if info.PlanType != "" {
+			acc.PlanType = info.PlanType
+		}
+	}
+	if activeCooldown {
+		acc.Status = StatusCooldown
+		acc.CooldownUtil = cooldownUntil
+		acc.CooldownReason = cooldownReason
+	} else {
+		acc.Status = StatusReady
+		acc.CooldownUtil = time.Time{}
+		acc.CooldownReason = ""
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+
+	// 5. 写 token cache
+	ttl := time.Until(expiresAt) - 5*time.Minute
+	if ttl > 0 {
+		_ = s.tokenCache.SetAccessToken(ctx, dbID, refreshed.AccessToken, ttl)
+	}
+
+	// 6. 更新 codex2api 自己的 credentials（不写 refresh_token，避免误用）
+	credentials := map[string]interface{}{
+		"access_token": refreshed.AccessToken,
+		"id_token":     refreshed.IDToken,
+		"expires_at":   expiresAt.Format(time.RFC3339),
+	}
+	if info != nil {
+		if info.ChatGPTAccountID != "" {
+			credentials["account_id"] = info.ChatGPTAccountID
+		}
+		if info.Email != "" {
+			credentials["email"] = info.Email
+		}
+		if info.PlanType != "" {
+			credentials["plan_type"] = info.PlanType
+		}
+	}
+	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
+		log.Printf("[账号 %d] rt-manager 路径更新数据库失败: %v", dbID, err)
+	}
+
+	if expiredCooldown {
+		_ = s.db.ClearCooldown(ctx, dbID)
+	}
+	return nil
 }
 
 // refreshAccount 刷新单个账号的 AT（带缓存锁与 token 缓存）

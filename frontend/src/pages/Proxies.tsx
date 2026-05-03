@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { Globe, Plus, Trash2, Play, MapPin, Loader2, Zap, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { api, type ProxyRow, type ProxyTestResult } from '../api'
+import { normalizeProxyUrls } from '../lib/utils'
 
 const PAGE_SIZE = 10
 
@@ -77,7 +78,9 @@ export default function Proxies() {
   }
 
   const handleAdd = async () => {
-    const urls = addInput.split('\n').map(s => s.trim()).filter(Boolean)
+    // 前端归一化：把 host:port:user:pass 转成 http://user:pass@host:port，再发给后端
+    const rawLines = addInput.split('\n').filter(s => s.trim())
+    const urls = normalizeProxyUrls(rawLines)
     if (urls.length === 0) return
     setAddLoading(true)
     try {
@@ -249,8 +252,8 @@ export default function Proxies() {
             <textarea
               value={addInput}
               onChange={e => setAddInput(e.target.value)}
-              placeholder={"http://user:pass@ip:port\nsocks5://ip:port"}
-              className="w-full h-32 px-3 py-2 text-sm rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
+              placeholder={"# 一行一个，支持以下格式混合粘贴：\nhost:port:user:pass        例: 212.212.18.189:6840:uoxreqmq:6kla3g97zady\nhost:port                 例: 1.2.3.4:8080\nhttp://user:pass@ip:port\nsocks5://ip:port"}
+              className="w-full h-40 px-3 py-2 text-sm rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
             />
             <div className="flex items-center gap-3">
               <input
