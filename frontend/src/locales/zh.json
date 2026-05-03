@@ -584,6 +584,8 @@
     "fastSchedulerEnabledDesc": "启用后，账号选择将使用内存快速调度算法，大幅降低高并发场景下的调度延迟。适合大号池（100+ 账号）场景。",
     "fastAliasEnabled": "service_tier=fast 快速通道",
     "fastAliasEnabledDesc": "启用时，客户端传 service_tier=fast 会被映射为上游 priority 档（插队、价格 ≈ 2×）。关闭时 fast 会被静默剥离，上游走 default。两种情况下使用日志都会在请求行显示 Fast 徽章，便于审计。",
+    "freeGPT55Enabled": "Free 账号承接 gpt-5.5",
+    "freeGPT55EnabledDesc": "开启：gpt-5.5 跟 5.4 一样优先调度 free 池（最省付费号额度）。关闭：恢复硬编码 premium-only 行为，free 账号被排除在 5.5 候选池之外。若 OpenAI 再次对 free 的 5.5 返回 400，可关闭本开关快速回退。",
     "allowRemoteMigration": "允许远程迁移",
     "allowRemoteMigrationDesc": "开启后，其他 codex2api 实例可通过导出接口拉取本实例的健康账号。",
     "allowRemoteMigrationRequiresSecret": "请先设置管理密钥，未设置密码时不能启用远程迁移。",

@@ -442,6 +442,7 @@ export default function Settings() {
     rt_manager_url: '',
     rt_manager_enabled: false,
     rt_manager_password_set: false,
+    free_gpt55_enabled: true,
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
@@ -921,6 +922,15 @@ export default function Settings() {
                   options={booleanOptions}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.fastAliasEnabledDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.freeGPT55Enabled')}</label>
+                <Select
+                  value={settingsForm.free_gpt55_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, free_gpt55_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.freeGPT55EnabledDesc')}</p>
               </div>
             </div>
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.display')}</h3>

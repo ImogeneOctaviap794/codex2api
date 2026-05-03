@@ -998,6 +998,7 @@ type Store struct {
 	autoCleanExpired          atomic.Bool
 	autoCleanupBatch          atomic.Bool
 	fastAliasEnabled          atomic.Bool // 是否把客户端的 service_tier=fast 映射为上游 priority
+	freeGPT55Enabled          atomic.Bool // 是否允许 free 账号承接 gpt-5.5（默认 ON；OFF 时 5.5 走 premium-only）
 	maxRetries                int64 // 请求失败最大重试次数（换号重试）
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
@@ -1096,6 +1097,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanError.Store(settings.AutoCleanError)
 	s.autoCleanExpired.Store(settings.AutoCleanExpired)
 	s.fastAliasEnabled.Store(settings.FastAliasEnabled)
+	s.freeGPT55Enabled.Store(settings.FreeGPT55Enabled)
 
 	// rt-manager 客户端：始终初始化（持久化设置注入），是否真生效由 Enabled() 决定
 	s.rtManager = NewRTManager()
@@ -1379,6 +1381,24 @@ func (s *Store) GetFastAliasEnabled() bool {
 // SetFastAliasEnabled 设置是否启用 fast→priority 别名。
 func (s *Store) SetFastAliasEnabled(enabled bool) {
 	s.fastAliasEnabled.Store(enabled)
+}
+
+// GetFreeGPT55Enabled 是否允许 free 账号承接 gpt-5.5。
+// true：5.5 跟其他模型一样优先调度 free。
+// false：恢复指接的 premium-only 行为，将所有 free 账号排除出候选池。
+func (s *Store) GetFreeGPT55Enabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.freeGPT55Enabled.Load()
+}
+
+// SetFreeGPT55Enabled 设置是否允许 free 账号承接 gpt-5.5。
+func (s *Store) SetFreeGPT55Enabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.freeGPT55Enabled.Store(enabled)
 }
 
 // RTManager 返回外部 rt-manager 联动客户端（启动时一定非 nil，是否启用看 Enabled()）。

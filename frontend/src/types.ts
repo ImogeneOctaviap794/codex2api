@@ -283,6 +283,7 @@ export interface SystemSettings {
   rt_manager_password_set: boolean
   // 仅写入：UpdateSettings 时可携带；GetSettings 不返回，因此可选
   rt_manager_password?: string
+  free_gpt55_enabled: boolean
 }
 
 export interface CPAExportEntry {

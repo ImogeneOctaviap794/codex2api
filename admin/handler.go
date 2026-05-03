@@ -2273,6 +2273,7 @@ type settingsResponse struct {
 	RTManagerURL                     string `json:"rt_manager_url"`
 	RTManagerEnabled                 bool   `json:"rt_manager_enabled"`
 	RTManagerPasswordSet             bool   `json:"rt_manager_password_set"`
+	FreeGPT55Enabled                 bool   `json:"free_gpt55_enabled"`
 }
 
 type updateSettingsReq struct {
@@ -2304,6 +2305,7 @@ type updateSettingsReq struct {
 	RTManagerURL                     *string `json:"rt_manager_url"`
 	RTManagerPassword                *string `json:"rt_manager_password"`
 	RTManagerEnabled                 *bool   `json:"rt_manager_enabled"`
+	FreeGPT55Enabled                 *bool   `json:"free_gpt55_enabled"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2360,6 +2362,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		RTManagerURL:                     rtManagerURL,
 		RTManagerEnabled:                 rtManagerEnabled,
 		RTManagerPasswordSet:             rtManagerPasswordSet,
+		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
 	})
 }
 
@@ -2635,6 +2638,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		})
 	}
 
+	// free_gpt55_enabled：全局开关，控制 free 账号是否可走 gpt-5.5 调度
+	if req.FreeGPT55Enabled != nil {
+		h.store.SetFreeGPT55Enabled(*req.FreeGPT55Enabled)
+		log.Printf("设置已更新: free_gpt55_enabled = %t", *req.FreeGPT55Enabled)
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2665,6 +2674,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RTManagerURL:                     rtManagerURL,
 		RTManagerPassword:                rtManagerPassword,
 		RTManagerEnabled:                 rtManagerEnabled,
+		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2719,6 +2729,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RTManagerURL:                     rtManagerURL,
 		RTManagerEnabled:                 rtManagerEnabled,
 		RTManagerPasswordSet:             strings.TrimSpace(rtManagerPassword) != "",
+		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
 	})
 }
 
@@ -2909,8 +2920,13 @@ func (h *Handler) ListModels(c *gin.Context) {
 	models := make([]string, 0, len(proxy.SupportedModels)+4)
 	models = append(models, proxy.SupportedModels...)
 	policies := make(map[string]proxy.ModelPlanPolicy, len(proxy.SupportedModels)+4)
+	// 使用 h.store 作为 gating，让 free_gpt55_enabled 运行时开关生效到前端展示
+	var gating proxy.PremiumOnlyGating
+	if h.store != nil {
+		gating = h.store
+	}
 	for _, m := range proxy.SupportedModels {
-		policies[m] = proxy.PolicyForModel(m)
+		policies[m] = proxy.PolicyForModelWithGating(gating, m)
 	}
 
 	// 虚拟模型：只有 inject image_generation 的（画图系）才是 premium_only，
@@ -2926,7 +2942,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 				PreferPlan:   "",
 			}
 		} else {
-			policies[v] = proxy.PolicyForModel(ov.BaseModel)
+			policies[v] = proxy.PolicyForModelWithGating(gating, ov.BaseModel)
 		}
 	}
 

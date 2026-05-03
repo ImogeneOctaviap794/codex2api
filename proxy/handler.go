@@ -2251,10 +2251,30 @@ var premiumOnlyModels = map[string]struct{}{
 	"gpt-5.5": {},
 }
 
-// IsPremiumOnlyModel 判断模型是否仅对付费账号开放。
+// IsPremiumOnlyModel 静态判断模型是否位于付费专属清单。
+// 通常上层应调用 IsEffectivePremiumOnly 以叠加运行时开关（如 free_gpt55_enabled）。
 func IsPremiumOnlyModel(model string) bool {
 	_, ok := premiumOnlyModels[strings.ToLower(strings.TrimSpace(model))]
 	return ok
+}
+
+// PremiumOnlyGating 外部运行时开关注入点，用于覆盖部分 premium-only 模型的硬编码行为。
+type PremiumOnlyGating interface {
+	// GetFreeGPT55Enabled 返回 true 时允许 free 账号承接 gpt-5.5。
+	GetFreeGPT55Enabled() bool
+}
+
+// IsEffectivePremiumOnly 结合运行时开关判断模型是否仍对 free 封闭。
+// gpt-5.5：若 gating.GetFreeGPT55Enabled()==true，放开限制，让 5.5 走 prefer_free 路径。
+func IsEffectivePremiumOnly(gating PremiumOnlyGating, model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if _, ok := premiumOnlyModels[m]; !ok {
+		return false
+	}
+	if m == "gpt-5.5" && gating != nil && gating.GetFreeGPT55Enabled() {
+		return false
+	}
+	return true
 }
 
 // bodyRequiresPaidAccount 判断请求体是否必须由付费账号承接。
@@ -2295,7 +2315,11 @@ func bodyRequiresPaidAccount(rawBody []byte) bool {
 // 因此必须额外检查 virtualHit 是否会注入 image_generation，否则 free 账号会被选中
 // 导致上游返回空 content（gotTerminal + 0 delta）+ 500 image URL not found。
 func (h *Handler) planDispatch(model string, rawBody []byte, virtualHit *ModelOverride, exclude map[int64]bool) string {
-	needPaid := IsPremiumOnlyModel(model) || bodyRequiresPaidAccount(rawBody)
+	var gating PremiumOnlyGating
+	if h != nil && h.store != nil {
+		gating = h.store
+	}
+	needPaid := IsEffectivePremiumOnly(gating, model) || bodyRequiresPaidAccount(rawBody)
 	if !needPaid && virtualHit != nil && virtualHit.InjectsImageGeneration() {
 		needPaid = true
 	}
@@ -2317,9 +2341,16 @@ type ModelPlanPolicy struct {
 	PreferPlan   string   `json:"prefer_plan"`   // 优先派发的 plan；premium_only 时为空
 }
 
-// PolicyForModel 返回模型的派发策略。
+// PolicyForModel 返回模型的派发策略（静态版本，不考虑运行时开关）。
+// 前端展示请调用 PolicyForModelWithGating。
 func PolicyForModel(model string) ModelPlanPolicy {
-	if IsPremiumOnlyModel(model) {
+	return PolicyForModelWithGating(nil, model)
+}
+
+// PolicyForModelWithGating 结合运行时开关返回模型的派发策略。
+// gating 为 nil 时等同于静态硬编码判断（保持 5.5 默认 premium_only）。
+func PolicyForModelWithGating(gating PremiumOnlyGating, model string) ModelPlanPolicy {
+	if IsEffectivePremiumOnly(gating, model) {
 		return ModelPlanPolicy{
 			Plan:         "premium_only",
 			AllowedPlans: []string{"plus", "pro", "team"},
