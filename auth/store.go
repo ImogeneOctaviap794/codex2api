@@ -1715,8 +1715,10 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 			continue
 		}
 
-		// 锁定账号跳过自动清理
-		if atomic.LoadInt32(&acc.Locked) == 1 {
+		// 锁定账号跳过自动清理，但 unauthorized 状态除外：
+		// 账号被上游永久封禁（RT 失效 / workspace deactivated）后，
+		// 自动锁定已失去意义，继续保留只会使死号永远清不掉。
+		if targetStatus != "unauthorized" && atomic.LoadInt32(&acc.Locked) == 1 {
 			continue
 		}
 
@@ -2154,6 +2156,17 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 	acc.SetCooldownUntil(until, reason)
 	s.fastSchedulerUpdate(acc)
 
+	// 封禁状态（unauthorized / deactivated_workspace）清除 Locked 标志：
+	// 自动锁定本意是避免 auto-cleanup 误删付费号，但账号被上游永久封禁
+	// （RT 失效/workspace deactivated）后保留 locked 反而使死号永不被清。
+	unlockedFromBan := false
+	switch reason {
+	case "unauthorized", "deactivated_workspace":
+		if atomic.CompareAndSwapInt32(&acc.Locked, 1, 0) {
+			unlockedFromBan = true
+		}
+	}
+
 	if s.db == nil {
 		return
 	}
@@ -2162,6 +2175,13 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 	defer cancel()
 	if err := s.db.SetCooldown(ctx, acc.DBID, reason, until); err != nil {
 		log.Printf("[账号 %d] 持久化冷却状态失败: %v", acc.DBID, err)
+	}
+	if unlockedFromBan {
+		if err := s.db.SetAccountLocked(ctx, acc.DBID, false); err != nil {
+			log.Printf("[账号 %d] 封禁后解锁失败: %v", acc.DBID, err)
+		} else {
+			log.Printf("[账号 %d] 封禁（%s）后自动解锁，恢复可清理状态", acc.DBID, reason)
+		}
 	}
 }
 
@@ -3117,10 +3137,12 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		log.Printf("[账号 %d] 更新数据库失败: %v", dbID, err)
 	}
 
-	// 自动锁定 free 以上的账号（pro/plus/team/teamplus 等）
-	if info != nil && atomic.LoadInt32(&acc.Locked) == 0 {
+	// 自动锁定 free 以上的账号（pro/plus/team/teamplus 等），避免 auto-cleanup 误删付费号。
+	// 已被封禁（HealthTierBanned）的账号即使 RT 偶然刷新成功也不再重新上锁，
+	// 确保 MarkCooldown 中 unauthorized/deactivated_workspace 路径的解锁不被覆盖。
+	if info != nil && atomic.LoadInt32(&acc.Locked) == 0 && !acc.IsBanned() {
 		plan := strings.ToLower(info.PlanType)
-		if plan != "" && plan != "free" {
+		if plan != "free" && plan != "" {
 			atomic.StoreInt32(&acc.Locked, 1)
 			_ = s.db.SetAccountLocked(ctx, dbID, true)
 			log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, info.PlanType)
