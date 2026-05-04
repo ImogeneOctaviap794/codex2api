@@ -644,19 +644,34 @@ func (h *Handler) Responses(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
 
+	// === Keepalive 初始化（防 CF/反代 idle timeout；生图等长耗时请求保活）===
+	// Responses 用 Codex 原生心跳（response.in_progress），客户端会幂等处理。
+	sseW, jsonW, cancelHB, okKA := SetupKeepalive(c, isStream, KeepaliveModeCodex, "", "", 0)
+	if !okKA {
+		return
+	}
+	defer cancelHB()
+	defer func() {
+		if sseW != nil {
+			sseW.Close()
+		}
+		if jsonW != nil {
+			jsonW.Close()
+		}
+	}()
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
 			if account == nil {
+				cancelHB()
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					h.sendFinalUpstreamErrorKA(c, sseW, jsonW, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
-				})
+				WriteErrorKA(c, sseW, jsonW, http.StatusServiceUnavailable, "无可用账号，请稍后重试", "server_error")
 				return
 			}
 		}
@@ -738,7 +753,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				continue
 			}
 
-			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			cancelHB()
+			h.sendFinalUpstreamErrorKA(c, sseW, jsonW, resp.StatusCode, errBody)
 			return
 		}
 
@@ -763,22 +779,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
 		if isStream {
-			// 流式透传 + TTFT 跟踪
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("X-Accel-Buffering", "no")
-
-			flusher, ok := c.Writer.(http.Flusher)
-			if !ok {
-				c.JSON(http.StatusInternalServerError, gin.H{
-					"error": gin.H{"message": "streaming not supported", "type": "server_error"},
-				})
-				resp.Body.Close()
-				h.store.Release(account)
-				return
-			}
-
+			// 流式透传 + TTFT 跟踪（headers 已在 SetupKeepalive 里设置）
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
@@ -820,12 +821,11 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				// 画图场景下将 SSE 事件里的 response.model 改为 gpt-5.4
 				dataToWrite := rewriteResponseModelIfDrawing(data, virtualHit, "response.model")
-				if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", dataToWrite); err != nil {
+				if err := sseW.WriteEvent(dataToWrite); err != nil {
 					writeErr = err
 					return false
 				}
 				wroteAnyBody = true
-				flusher.Flush()
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
 		} else {
@@ -939,12 +939,13 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 		if !isStream {
+			cancelHB() // 停心跳，避免与 Commit 写竞争
 			if responseJSON != nil {
-				c.Data(http.StatusOK, "application/json", responseJSON)
+				if err := jsonW.Commit(responseJSON); err != nil {
+					log.Printf("commit /v1/responses json failed: %v", err)
+				}
 			} else {
-				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": "未收到完整的上游响应", "type": "upstream_error"},
-				})
+				WriteErrorKA(c, nil, jsonW, http.StatusBadGateway, "未收到完整的上游响应", "upstream_error")
 			}
 		}
 
@@ -988,12 +989,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	// 所有重试都失败
+	cancelHB()
 	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
-		})
+		WriteErrorKA(c, sseW, jsonW, http.StatusBadGateway, "上游请求失败: "+lastErr.Error(), "upstream_error")
 	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+		h.sendFinalUpstreamErrorKA(c, sseW, jsonW, lastStatusCode, lastBody)
 	}
 }
 
@@ -1063,18 +1063,29 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool)
 	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
 
+	// === Keepalive 初始化（防 CF/反代 idle timeout；compact 为非流式 JSON 响应）===
+	_, jsonW, cancelHB, okKA := SetupKeepalive(c, false, KeepaliveModeCodex, "", "", 0)
+	if !okKA {
+		return
+	}
+	defer cancelHB()
+	defer func() {
+		if jsonW != nil {
+			jsonW.Close()
+		}
+	}()
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
 			if account == nil {
+				cancelHB()
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					h.sendFinalUpstreamErrorKA(c, nil, jsonW, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
-				})
+				WriteErrorKA(c, nil, jsonW, http.StatusServiceUnavailable, "无可用账号，请稍后重试", "server_error")
 				return
 			}
 		}
@@ -1145,7 +1156,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				continue
 			}
 
-			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			cancelHB()
+			h.sendFinalUpstreamErrorKA(c, nil, jsonW, resp.StatusCode, errBody)
 			return
 		}
 
@@ -1188,17 +1200,19 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		h.store.Release(account)
 		// 画图场景对外统一显示 gpt-5.4
 		respBody = rewriteResponseModelIfDrawing(respBody, virtualHit, "model")
-		c.Data(http.StatusOK, "application/json", respBody)
+		cancelHB()
+		if err := jsonW.Commit(respBody); err != nil {
+			log.Printf("commit /v1/responses/compact json failed: %v", err)
+		}
 		return
 	}
 
 	// 所有重试都失败
+	cancelHB()
 	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
-		})
+		WriteErrorKA(c, nil, jsonW, http.StatusBadGateway, "上游请求失败: "+lastErr.Error(), "upstream_error")
 	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+		h.sendFinalUpstreamErrorKA(c, nil, jsonW, lastStatusCode, lastBody)
 	}
 }
 
@@ -1271,19 +1285,36 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
 
+	// === Keepalive 初始化（防 CF/反代 idle timeout；生图等长耗时请求保活）===
+	chunkID := "chatcmpl-" + uuid.New().String()[:8]
+	created := time.Now().Unix()
+	responseModel := responseModelFor(model, virtualHit)
+	sseW, jsonW, cancelHB, okKA := SetupKeepalive(c, isStream, KeepaliveModeOpenAI, chunkID, responseModel, created)
+	if !okKA {
+		return
+	}
+	defer cancelHB()
+	defer func() {
+		if sseW != nil {
+			sseW.Close()
+		}
+		if jsonW != nil {
+			jsonW.Close()
+		}
+	}()
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
 			if account == nil {
+				cancelHB()
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					h.sendFinalUpstreamErrorKA(c, sseW, jsonW, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
-				})
+				WriteErrorKA(c, sseW, jsonW, http.StatusServiceUnavailable, "无可用账号，请稍后重试", "server_error")
 				return
 			}
 		}
@@ -1365,7 +1396,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				continue
 			}
 
-			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			cancelHB()
+			h.sendFinalUpstreamErrorKA(c, sseW, jsonW, resp.StatusCode, errBody)
 			return
 		}
 
@@ -1389,28 +1421,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
 		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
-		chunkID := "chatcmpl-" + uuid.New().String()[:8]
-		created := time.Now().Unix()
-
-		// 画图请求响应体中的 model 统一显示为 gpt-5.4（不泄露 base_model）
-		responseModel := responseModelFor(model, virtualHit)
+		// chunkID / created / responseModel 已在 retry 循环外定义供 keepalive 共用
 
 		if isStream {
 			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("X-Accel-Buffering", "no")
-
-			flusher, ok := c.Writer.(http.Flusher)
-			if !ok {
-				c.JSON(http.StatusInternalServerError, gin.H{
-					"error": gin.H{"message": "streaming not supported", "type": "server_error"},
-				})
-				resp.Body.Close()
-				h.store.Release(account)
-				return
-			}
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -1450,20 +1464,18 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 
 				if chunk != nil {
-					if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", chunk); err != nil {
+					if err := sseW.WriteEvent(chunk); err != nil {
 						writeErr = err
 						return false
 					}
 					wroteAnyBody = true
-					flusher.Flush()
 				}
 				if done {
-					if _, err := fmt.Fprintf(c.Writer, "data: [DONE]\n\n"); err != nil {
+					if err := sseW.WriteRaw("data: [DONE]\n\n"); err != nil {
 						writeErr = err
 						return false
 					}
 					wroteAnyBody = true
-					flusher.Flush()
 					return false
 				}
 				return true
@@ -1569,12 +1581,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		if !isStream {
+			cancelHB() // 停心跳，避免与 Commit 写竞争
 			if compactResult != nil {
-				c.Data(http.StatusOK, "application/json", compactResult)
+				if err := jsonW.Commit(compactResult); err != nil {
+					log.Printf("commit compact response failed: %v", err)
+				}
 			} else {
-				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": "未收到完整的上游响应", "type": "upstream_error"},
-				})
+				WriteErrorKA(c, nil, jsonW, http.StatusBadGateway, "未收到完整的上游响应", "upstream_error")
 			}
 		}
 
@@ -1618,12 +1631,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	// 所有重试都失败
+	cancelHB()
 	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
-		})
+		WriteErrorKA(c, sseW, jsonW, http.StatusBadGateway, "上游请求失败: "+lastErr.Error(), "upstream_error")
 	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+		h.sendFinalUpstreamErrorKA(c, sseW, jsonW, lastStatusCode, lastBody)
 	}
 }
 
@@ -2235,6 +2247,61 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, statusCode int, body []byte) {
 	h.applyCooldown(account, statusCode, body, nil)
 	h.sendUpstreamError(c, statusCode, body)
+}
+
+// sendFinalUpstreamErrorKA 在 keepalive 上下文下发送最终上游错误响应：
+//   - stream:true（sseW != nil）：通过 SSE 发 error chunk + [DONE]，避免与 text/event-stream header 冲突
+//   - stream:false 且 jsonW 已 Started：用 Commit(errorBody) 保持 200 status（客户端 JSON 解析看到 error 字段会报错）
+//   - 其他：退回原 sendFinalUpstreamError 走 c.JSON/c.Data 正常错误响应
+func (h *Handler) sendFinalUpstreamErrorKA(c *gin.Context, sseW *SSEWriter, jsonW *JSONKeepaliveWriter, statusCode int, body []byte) {
+	if sseW == nil && (jsonW == nil || !jsonW.Started()) {
+		h.sendFinalUpstreamError(c, statusCode, body)
+		return
+	}
+	// 已写过响应头 / 已是 SSE 流：构造与 sendFinalUpstreamError 等价的 error body
+	var finalBody []byte
+	if statusCode == http.StatusTooManyRequests {
+		if details, ok := parseUsageLimitDetails(body); ok {
+			message := "账号池额度已耗尽，请稍后重试"
+			if details.message != "" {
+				message = fmt.Sprintf("%s：%s", message, details.message)
+			}
+			errInfo := map[string]interface{}{
+				"message": message,
+				"type":    "server_error",
+				"code":    "account_pool_usage_limit_reached",
+			}
+			if details.planType != "" {
+				errInfo["plan_type"] = details.planType
+			}
+			if details.resetsAt != 0 {
+				errInfo["resets_at"] = details.resetsAt
+			}
+			if details.resetsInSeconds != 0 {
+				errInfo["resets_in_seconds"] = details.resetsInSeconds
+			}
+			finalBody, _ = json.Marshal(map[string]interface{}{"error": errInfo})
+		}
+	}
+	if finalBody == nil {
+		// 上游 body 若已是合法 JSON 就透传；否则包装成 OpenAI error 结构
+		if len(body) > 0 && json.Valid(body) {
+			finalBody = body
+		} else {
+			finalBody, _ = json.Marshal(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": fmt.Sprintf("upstream error status %d: %s", statusCode, string(body)),
+					"type":    "upstream_error",
+				},
+			})
+		}
+	}
+	if sseW != nil {
+		_ = sseW.WriteEvent(finalBody)
+		_ = sseW.WriteRaw("data: [DONE]\n\n")
+		return
+	}
+	_ = jsonW.Commit(finalBody)
 }
 
 // SupportedModels 支持的模型列表（全局共享）
