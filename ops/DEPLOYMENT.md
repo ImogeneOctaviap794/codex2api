@@ -2,20 +2,23 @@
 
 > 真值以 `docker ps` 为准，不信文档。文档滞后时以线上状态为准并反向更新本文。
 
-## 1. 线上状态（截至 2026-05-10）
+## 1. 线上状态（截至 2026-05-10 22:40）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.45-sse-keepalive`（`latest`）|
+| 镜像 | `codex2api:v1.7.48-upstream-may10-paid`（`latest`）|
 | 容器 | `codex2api` |
-| 端口 | `8122`（nginx upstream 指向 127.0.0.1:8122）|
+| 端口 | `8123`（nginx upstream 指向 127.0.0.1:8123）|
 | 部署目录 | `/data/codex2api/` |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`, Redis `codex2api-redis`, 网络 `codex2api_codex2api-net` |
 | 图像卷 | `/data/codex2api-images:/app/images`（独立持久卷，蓝绿不会重建）|
 | nginx conf | `/www/server/panel/vhost/nginx/cx.wyzai.top.conf` |
 | nginx body 上限 | `client_max_body_size 500m` |
-| 本地 git HEAD | 见 `git log -1` |
+| 容器 body 上限 | **64 MB**（`CODEX_MAX_REQUEST_BODY_SIZE_MB=64`）|
+| Dialog 采集 | ✅ 启用（默认 true，写入 PG `dialog_logs`）|
+| Prefer-paid 调度 | Admin 面板运行时开关（默认 OFF = prefer_free）|
+| 本地 git HEAD | `9fcd50b`（`main` / `merge/upstream-2026-05-10`）|
 
 ## 2. SSH 接入
 
@@ -37,8 +40,10 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 ```bash
 SSH='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP='sshpass -p f3t7uCBeTCizT12 scp -P 22222 -o StrictHostKeyChecking=no'
-OLD=8122; NEW=8123; TAG=v1.7.46-xxx
+OLD=8123; NEW=8120; TAG=v1.7.49-xxx
 ```
+
+> **下次端口**：8123 → 8120（轮换到最老的回收端口即可）
 
 ### Step 1 · 本地 tar 打包（5-10s）
 
@@ -167,7 +172,8 @@ docker exec codex2api-postgres psql -U codex2api -d codex2api -c \
 | v1.7.43-free-55 | 8120 | - | free 账号承接 gpt-5.5 运行时开关 |
 | v1.7.44-unlock-banned | 8121 | - | 封禁 plus 账号自动解锁可清理 |
 | v1.7.45-sse-keepalive | 8122 | 2026-05-04 | SSE/JSON 双路径 keepalive 防 CF 100s idle |
-| **v1.7.46-upstream-may10** | **8123** | **2026-05-10** | **port 4 上游 commit：流式 usage 追踪 / 5h 紧迫性 / 工具参数剥离 / validation 扩充** |
+| v1.7.47-prefer-paid | 8125 | 2026-05-08 | 付费账号优先 Free 兜底（admin 开关）+ Dialog logs 异步采集（⚠️ 代码曾仅在服务器，已合并回本地 9fcd50b）|
+| **v1.7.48-upstream-may10-paid** | **8123** | **2026-05-10** | **upstream port（流式 usage / 5h 紧迫性 / 工具参数剥离 / validation 扩充）+ 合并回 v1.7.47 的 prefer-paid & dialog logs + 413 提到 64MB** |
 
 ## 8. 不要再做的事
 
@@ -190,9 +196,31 @@ docker exec codex2api-postgres psql -U codex2api -d codex2api -c \
 | MaxRequestBodySize 默认 | 32 MB | `security/validator.go` |
 | CF idle timeout | 100s | Cloudflare 硬限 |
 
-## 10. 本次（v1.7.46）新增环境变量
+## 10. 关键环境变量
 
 ```bash
-# /data/codex2api/.env 追加
-CODEX_MAX_REQUEST_BODY_SIZE_MB=64    # 默认 32MB，调到 64MB 容纳长上下文 / 图片
+# /data/codex2api/.env
+CODEX_PORT=8123                         # 当前端口（随蓝绿轮换）
+CODEX_MAX_REQUEST_BODY_SIZE_MB=64       # 请求体上限，默认 32MB；v1.7.48 起调到 64MB 解决 413
+DIALOG_COLLECTION_ENABLED=true          # 对话采集总开关（默认 true，启动级）；false=不创建实例
+CODEX_TRANSPORT_MODE=standard           # TLS 指纹：standard=Go 原生 / utls_chrome=仿 Chrome
+# 其余参数（DB/Redis/image/admin 等）见 `.env` 本体
 ```
+
+## 11. v1.7.48 合并变更要点（2026-05-10）
+
+### 功能层
+- **Prefer-paid 调度**（admin 运行时开关）：ON 时 plus/pro/team 优先派发，free 兜底；OFF（默认）时 prefer_free 最省额度
+- **Dialog logs**：异步写入 PG `dialog_logs` 表，panic 隔离 + channel drop，不阻塞主链路
+- **请求体上限 64MB**：解决 Codex CLI 长上下文 / 图片上传触发 413
+
+### Upstream port（来自 james-6-23）
+- `4694c54` 流式 usage 追踪：上游 ctx 解耦 + TTFT 黑名单 + function_call 去重
+- `4a48799` premium 账号 5h 窗口紧迫性 bonus
+- `4bd3c03` 流式工具参数空字段剥离
+- `e0919ce`（partial）：validation 补 7 官方类型 + cache item id 剥离
+
+### Admin 面板路径
+- **Prefer-paid 开关**：Settings → 派发策略卡片（标签：付费账号优先 Free 兜底）
+- **Dialog logs 开关**：Settings（运行时热开关，不影响启动级 env 开关）
+- **Dialog 浏览页**：Sidebar → Dialogs（WIP 前端页，可查询近期对话）
