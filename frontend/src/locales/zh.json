@@ -491,7 +491,8 @@
     "reasonTimeout": "超时",
     "reasonFailure": "失败串",
     "reasonLatency": "延迟",
-    "reasonSuccess": "成功"
+    "reasonSuccess": "成功",
+    "reason5hUrgency": "5h 即将重置"
   },
   "usage": {
     "title": "使用统计",

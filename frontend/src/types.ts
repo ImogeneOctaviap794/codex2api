@@ -50,7 +50,9 @@ export interface AccountRow {
     failure_penalty: number
     success_bonus: number
     usage_penalty_7d: number
+    usage_urgency_bonus_5h?: number
     latency_penalty: number
+    success_rate_penalty?: number
   }
   last_unauthorized_at?: ISODateString
   last_rate_limited_at?: ISODateString

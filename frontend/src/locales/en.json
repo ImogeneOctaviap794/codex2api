@@ -491,7 +491,8 @@
     "reasonTimeout": "Timeout",
     "reasonFailure": "Failure Run",
     "reasonLatency": "Latency",
-    "reasonSuccess": "Success"
+    "reasonSuccess": "Success",
+    "reason5hUrgency": "5h Reset Soon"
   },
   "usage": {
     "title": "Usage Statistics",

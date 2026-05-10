@@ -466,3 +466,65 @@ func TestFastSchedulerRelease(t *testing.T) {
 		t.Fatalf("ActiveRequests after Release() = %d, want 0", got)
 	}
 }
+
+func TestFastSchedulerPrefersPremium5hResetSoonWithinTier(t *testing.T) {
+	now := time.Now()
+	later := newFastSchedulerTestAccount(1, HealthTierHealthy, 150, 1)
+	later.PlanType = "plus"
+	later.UsagePercent5h = 25
+	later.UsagePercent5hValid = true
+	later.Reset5hAt = now.Add(5 * time.Hour)
+
+	soon := newFastSchedulerTestAccount(2, HealthTierHealthy, 150, 1)
+	soon.PlanType = "plus"
+	soon.UsagePercent5h = 25
+	soon.UsagePercent5hValid = true
+	soon.Reset5hAt = now.Add(30 * time.Minute)
+
+	scheduler := NewFastScheduler(1)
+	scheduler.Rebuild([]*Account{later, soon})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != soon.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want reset-soon account %d", got.DBID, soon.DBID)
+	}
+}
+
+func TestPersistUsageSnapshot5hOnlyUpdatesFastSchedulerPriority(t *testing.T) {
+	now := time.Now()
+	later := newFastSchedulerTestAccount(1, HealthTierHealthy, 150, 1)
+	later.PlanType = "plus"
+	later.UsagePercent5h = 25
+	later.UsagePercent5hValid = true
+	later.Reset5hAt = now.Add(5 * time.Hour)
+
+	soon := newFastSchedulerTestAccount(2, HealthTierHealthy, 150, 1)
+	soon.PlanType = "plus"
+	soon.UsagePercent5h = 25
+	soon.UsagePercent5hValid = true
+	soon.Reset5hAt = now.Add(5 * time.Hour)
+
+	store := &Store{
+		accounts:       []*Account{later, soon},
+		maxConcurrency: 1,
+	}
+	store.SetFastSchedulerEnabled(true)
+
+	soon.SetUsageSnapshot5h(25, time.Now().Add(30*time.Minute))
+	store.PersistUsageSnapshot5hOnly(soon)
+
+	got := store.Next()
+	if got == nil {
+		t.Fatal("Next() returned nil")
+	}
+	defer store.Release(got)
+
+	if got.DBID != soon.DBID {
+		t.Fatalf("Next() picked dbID=%d, want reset-soon account %d", got.DBID, soon.DBID)
+	}
+}

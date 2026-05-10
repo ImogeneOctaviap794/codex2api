@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -237,8 +238,8 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		if exclude != nil && exclude[entry.dbID] {
 			continue
 		}
-		tier, _, limit, _, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
-		if tier != expectedTier {
+		tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+		if tier != expectedTier || proven != entry.proven || math.Abs(dispatchScore-entry.dispatchScore) >= 1 {
 			s.removeLocked(entry.dbID)
 			if available && limit > 0 {
 				s.insertLocked(entry.acc, now)
