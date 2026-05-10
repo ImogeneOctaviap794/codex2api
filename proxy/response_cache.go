@@ -223,22 +223,49 @@ func cacheCompletedResponse(expandedInputRaw []byte, completedData []byte) {
 
 	var items []json.RawMessage
 
-	// 添加展开后的请求 input items
+	// 添加展开后的请求 input items（剥离 id）
 	inputItems := gjson.ParseBytes(expandedInputRaw)
 	if inputItems.IsArray() {
 		inputItems.ForEach(func(_, v gjson.Result) bool {
-			items = append(items, json.RawMessage(v.Raw))
+			if item, ok := stripResponseItemID(json.RawMessage(v.Raw)); ok {
+				items = append(items, item)
+			}
 			return true
 		})
 	}
 
-	// 添加响应 output items
+	// 添加响应 output 中真正需要续链的工具上下文；reasoning/message 等
+	// 服务端输出 item 带有 rs_/msg_ id，store=false 时回灌会触发 item not found。
 	output.ForEach(func(_, v gjson.Result) bool {
-		items = append(items, json.RawMessage(v.Raw))
+		if v.Get("type").String() != "function_call" {
+			return true
+		}
+		if item, ok := stripResponseItemID(json.RawMessage(v.Raw)); ok {
+			items = append(items, item)
+		}
 		return true
 	})
 
 	if len(items) > 0 {
 		setResponseCache(respID, items)
 	}
+}
+
+// stripResponseItemID 去掉缓存 item 的 id 字段（保留 call_id）。
+// 服务端返回的 rs_/msg_/fc_ 前缀 id 在 store=false 的 replay 场景下
+// 会触发上游 "item not found"，而 call_id 是请求方自定义的工具调用链 id，必须保留。
+func stripResponseItemID(raw json.RawMessage) (json.RawMessage, bool) {
+	var item map[string]any
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return raw, true
+	}
+	if _, exists := item["id"]; !exists {
+		return raw, true
+	}
+	delete(item, "id")
+	stripped, err := json.Marshal(item)
+	if err != nil {
+		return nil, false
+	}
+	return stripped, true
 }

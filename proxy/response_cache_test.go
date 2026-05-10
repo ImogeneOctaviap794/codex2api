@@ -60,3 +60,37 @@ func TestExpandPreviousResponseLeavesBodyUntouchedOnCacheMiss(t *testing.T) {
 		t.Fatalf("body mutated on cache miss; got=%s want=%s", got, body)
 	}
 }
+
+func TestCacheCompletedResponseStripsItemIDsAndSkipsReasoning(t *testing.T) {
+	resetResponseCacheForTest()
+
+	cacheCompletedResponse(
+		[]byte(`[{"type":"message","id":"msg_input","role":"user","content":"call a tool"}]`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_strip","output":[`+
+			`{"type":"reasoning","id":"rs_0609","encrypted_content":"opaque"},`+
+			`{"type":"message","id":"msg_output","role":"assistant","content":[{"type":"output_text","text":"thinking"}]},`+
+			`{"type":"function_call","id":"fc_123","call_id":"call_abc","name":"lookup","arguments":"{}"}`+
+			`]}}`),
+	)
+
+	cached := getResponseCache("resp_strip")
+	if len(cached) != 2 {
+		t.Fatalf("cached items = %d, want input message + function_call only (reasoning/message output should be skipped)", len(cached))
+	}
+	if typ := gjson.GetBytes(cached[0], "type").String(); typ != "message" {
+		t.Fatalf("cached[0].type = %q, want message", typ)
+	}
+	if id := gjson.GetBytes(cached[0], "id"); id.Exists() {
+		t.Fatalf("cached input id should be stripped, got %s", id.Raw)
+	}
+	if typ := gjson.GetBytes(cached[1], "type").String(); typ != "function_call" {
+		t.Fatalf("cached[1].type = %q, want function_call", typ)
+	}
+	if id := gjson.GetBytes(cached[1], "id"); id.Exists() {
+		t.Fatalf("cached function_call id should be stripped, got %s", id.Raw)
+	}
+	// call_id 必须保留——它是续链所依赖的关键字段
+	if callID := gjson.GetBytes(cached[1], "call_id").String(); callID != "call_abc" {
+		t.Fatalf("cached function_call call_id = %q, want call_abc (must be preserved)", callID)
+	}
+}
