@@ -660,6 +660,16 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 	}()
 
+	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
+	// defer 兜底确保函数退出时上游被释放。
+	// 目的：客户端断连后仍给上游 upstreamDrainTimeout 时间捞 response.completed 的 usage。
+	var lastUpstreamCancel context.CancelFunc
+	defer func() {
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+	}()
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
@@ -698,7 +708,15 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
+		// response.completed 拿到 usage（流式计费的关键）。
+		// 重试前先 cancel 上一轮的上游 ctx。
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		lastUpstreamCancel = upstreamCancel
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -779,6 +797,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
 		if isStream {
+			// clientGone：客户端写失败后置位，后续事件不再写客户端，
+			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
+			clientGone := false
 			// 流式透传 + TTFT 跟踪（headers 已在 SetupKeepalive 里设置）
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -794,8 +815,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				// TTFT: 记录第一个 output_text.delta 事件的时间
-				if !ttftRecorded && eventType == "response.output_text.delta" {
+				// TTFT: 黑名单策略 —— 排除控制/终止事件，其余均视为首字（覆盖纯工具调用/图像/推理流）
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -821,11 +842,15 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				// 画图场景下将 SSE 事件里的 response.model 改为 gpt-5.4
 				dataToWrite := rewriteResponseModelIfDrawing(data, virtualHit, "response.model")
-				if err := sseW.WriteEvent(dataToWrite); err != nil {
-					writeErr = err
-					return false
+				if !clientGone {
+					if err := sseW.WriteEvent(dataToWrite); err != nil {
+						writeErr = err
+						clientGone = true
+					} else {
+						wroteAnyBody = true
+					}
 				}
-				wroteAnyBody = true
+				// 客户端断开后仍继续读上游直到 terminal 事件，确保拿到 usage
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
 		} else {
@@ -838,7 +863,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				if !ttftRecorded && eventType == "response.output_text.delta" {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -1303,6 +1328,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 	}()
 
+	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
+	// defer 兜底确保函数退出时上游被释放。
+	// 目的：客户端断连后仍给上游 upstreamDrainTimeout 时间捞 response.completed 的 usage。
+	var lastUpstreamCancel context.CancelFunc
+	defer func() {
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+	}()
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
@@ -1341,7 +1376,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
+		// response.completed 拿到 usage（流式计费的关键）。
+		// 重试前先 cancel 上一轮的上游 ctx。
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		lastUpstreamCancel = upstreamCancel
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1426,6 +1469,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if isStream {
 			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
 
+			// clientGone：客户端写失败后置位，后续事件不再写客户端，
+			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
+			clientGone := false
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
@@ -1444,7 +1490,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 				chunk, done := streamTranslator.Translate(data)
 
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -1463,19 +1509,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if chunk != nil {
+				if !clientGone && chunk != nil {
 					if err := sseW.WriteEvent(chunk); err != nil {
 						writeErr = err
-						return false
+						clientGone = true
+					} else {
+						wroteAnyBody = true
 					}
-					wroteAnyBody = true
 				}
-				if done {
+				if !clientGone && done {
 					if err := sseW.WriteRaw("data: [DONE]\n\n"); err != nil {
 						writeErr = err
+						clientGone = true
+					} else {
+						wroteAnyBody = true
+					}
+					if !clientGone {
 						return false
 					}
-					wroteAnyBody = true
+				}
+				// 客户端断开后，要等到 terminal 事件才退出，确保拿到 usage。
+				if gotTerminal {
 					return false
 				}
 				return true
@@ -1487,7 +1541,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}

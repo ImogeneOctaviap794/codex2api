@@ -272,10 +272,8 @@ func (h *Handler) Messages(c *gin.Context) {
 					}
 				}
 
-				// TTFT 跟踪
-				if !ttftRecorded && (eventType == "response.output_text.delta" ||
-					eventType == "response.reasoning_summary_text.delta" ||
-					eventType == "response.reasoning_text.delta") {
+				// TTFT 跟踪：黑名单策略统一语义，覆盖纯工具调用/图像/推理流
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -331,7 +329,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
