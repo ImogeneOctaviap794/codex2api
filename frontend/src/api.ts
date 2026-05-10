@@ -224,6 +224,88 @@ export const api = {
     request<OAuthURLResponse>('/oauth/generate-auth-url', { method: 'POST', body: JSON.stringify(data) }),
   exchangeOAuthCode: (data: { session_id: string; code: string; state: string; name?: string; proxy_url?: string }) =>
     request<OAuthExchangeResponse>('/oauth/exchange-code', { method: 'POST', body: JSON.stringify(data) }),
+
+  // 对话采集监控
+  getDialogStats: () => request<DialogStatsResponse>('/dialog-stats'),
+  toggleDialogCollection: (enabled: boolean) =>
+    request<{ enabled: boolean; runtime: DialogRuntimeStats }>('/dialog-toggle', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
+  listDialogLogs: (params: { endpoint?: string; model?: string; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams()
+    if (params.endpoint) qs.set('endpoint', params.endpoint)
+    if (params.model) qs.set('model', params.model)
+    qs.set('limit', String(params.limit ?? 50))
+    qs.set('offset', String(params.offset ?? 0))
+    return request<DialogLogListResponse>(`/dialog-logs?${qs.toString()}`)
+  },
+  getDialogLogDetail: (id: number) => request<DialogLogDetail>(`/dialog-logs/${id}`),
+}
+
+export interface DialogRuntimeStats {
+  enabled: boolean
+  submitted: number
+  dropped: number
+  written: number
+  failed: number
+  queue_len: number
+  queue_cap: number
+}
+
+export interface DialogDbStats {
+  total_rows: number
+  today: number
+  yesterday: number
+  last_7d: number
+  table_size: string
+  partitions: string[]
+  oldest_ts?: string
+  newest_ts?: string
+}
+
+export interface DialogStatsResponse {
+  installed: boolean
+  runtime?: DialogRuntimeStats
+  db?: DialogDbStats
+  db_error?: string
+}
+
+export interface DialogLogSummary {
+  id: number
+  ts: string
+  endpoint: string
+  model: string
+  base_model?: string
+  account_id: number
+  api_key_hash: string
+  is_stream: boolean
+  prompt_tokens: number
+  completion_tokens: number
+  reasoning_tokens: number
+  cached_tokens: number
+  duration_ms: number
+  status_code: number
+  service_tier?: string
+  reasoning_effort?: string
+  request_size: number
+  response_size: number
+  has_reasoning: boolean
+  has_tool_calls: boolean
+}
+
+export interface DialogLogListResponse {
+  items: DialogLogSummary[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface DialogLogDetail extends DialogLogSummary {
+  request_body?: unknown
+  response_body?: unknown
+  reasoning_content?: string
+  tool_calls?: unknown
 }
 
 export interface ProxyRow {

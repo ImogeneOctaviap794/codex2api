@@ -4,6 +4,7 @@ import Layout from './components/Layout'
 import Accounts from './pages/Accounts'
 import Dashboard from './pages/Dashboard'
 import Operations from './pages/Operations'
+import Dialogs from './pages/Dialogs'
 import Proxies from './pages/Proxies'
 import SchedulerBoard from './pages/SchedulerBoard'
 import Settings from './pages/Settings'
@@ -24,6 +25,7 @@ export default function App() {
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />
           <Route path="/analytics" element={<Analytics />} />
+          <Route path="/dialogs" element={<Dialogs />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/docs" element={<Guide />} />
           <Route path="/api-reference" element={<ApiReference />} />

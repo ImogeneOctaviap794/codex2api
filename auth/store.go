@@ -1057,6 +1057,7 @@ type Store struct {
 	autoCleanupBatch          atomic.Bool
 	fastAliasEnabled          atomic.Bool // 是否把客户端的 service_tier=fast 映射为上游 priority
 	freeGPT55Enabled          atomic.Bool // 是否允许 free 账号承接 gpt-5.5（默认 ON；OFF 时 5.5 走 premium-only）
+	preferPaidEnabled         atomic.Bool // 是否切换为「付费优先 free 兜底」调度（默认 OFF；ON 时 prefer plus/pro/team）
 	maxRetries                int64 // 请求失败最大重试次数（换号重试）
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
@@ -1156,6 +1157,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanExpired.Store(settings.AutoCleanExpired)
 	s.fastAliasEnabled.Store(settings.FastAliasEnabled)
 	s.freeGPT55Enabled.Store(settings.FreeGPT55Enabled)
+	s.preferPaidEnabled.Store(settings.PreferPaidEnabled)
 
 	// rt-manager 客户端：始终初始化（持久化设置注入），是否真生效由 Enabled() 决定
 	s.rtManager = NewRTManager()
@@ -1457,6 +1459,25 @@ func (s *Store) SetFreeGPT55Enabled(enabled bool) {
 		return
 	}
 	s.freeGPT55Enabled.Store(enabled)
+}
+
+// GetPreferPaidEnabled 是否启用「付费优先 free 兜底」调度。
+// false（默认）：preferPlan = "free"，沿用原有 prefer_free（省付费额度）。
+// true：preferPlan = "plus,pro,team"，付费账号优先调度，free 兜底（体验优先）。
+// 与 free_gpt55_enabled / premium_only 解耦：5.5 仍按其自身策略决定 free 是否参与。
+func (s *Store) GetPreferPaidEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.preferPaidEnabled.Load()
+}
+
+// SetPreferPaidEnabled 设置是否启用「付费优先 free 兜底」调度。
+func (s *Store) SetPreferPaidEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.preferPaidEnabled.Store(enabled)
 }
 
 // RTManager 返回外部 rt-manager 联动客户端（启动时一定非 nil，是否启用看 Enabled()）。

@@ -51,6 +51,9 @@ type Handler struct {
 	// 增删 key 后调用，让鉴权中间件的 dbKeys 缓存立即过期。
 	apiKeyCacheInvalidator func()
 
+	// 对话采集器引用（main.go 注入，可空表示未启用）
+	dialogCollector *proxy.DialogCollector
+
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
@@ -94,6 +97,122 @@ func (h *Handler) InvalidateStatsCache() {
 	h.usageStatsCache.Store(nil)
 	h.opsOverviewCache.Store(nil)
 	h.listActiveCache.Store(nil)
+}
+
+// SetDialogCollector 注入对话采集器（main.go 在初始化时调用）。
+// 允许传入 nil（采集功能未启用时所有 dialog API 返回 disabled 状态）。
+func (h *Handler) SetDialogCollector(c *proxy.DialogCollector) {
+	if h == nil {
+		return
+	}
+	h.dialogCollector = c
+}
+
+// GetDialogStats 查询对话采集运行时指标 + DB 累计量。
+// GET /api/admin/dialog-stats
+func (h *Handler) GetDialogStats(c *gin.Context) {
+	out := gin.H{
+		"installed": h.dialogCollector != nil,
+	}
+	if h.dialogCollector != nil {
+		out["runtime"] = h.dialogCollector.Stats()
+	}
+	if h.db != nil {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+		if dbStats, err := h.db.GetDialogStats(ctx); err == nil {
+			out["db"] = dbStats
+		} else {
+			out["db_error"] = err.Error()
+		}
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListDialogLogs 分页列出对话采集记录（不含 body 大字段）。
+// GET /api/admin/dialog-logs?endpoint=&model=&limit=50&offset=0
+func (h *Handler) ListDialogLogs(c *gin.Context) {
+	if h.db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "db unavailable"})
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	rows, total, err := h.db.ListDialogLogs(ctx, database.DialogLogListParams{
+		Endpoint: strings.TrimSpace(c.Query("endpoint")),
+		Model:    strings.TrimSpace(c.Query("model")),
+		Limit:    limit,
+		Offset:   offset,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"items":  rows,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// GetDialogLogDetail 查看单条详情（含完整 body）。
+// GET /api/admin/dialog-logs/:id
+func (h *Handler) GetDialogLogDetail(c *gin.Context) {
+	if h.db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "db unavailable"})
+		return
+	}
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	detail, err := h.db.GetDialogLogByID(ctx, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if detail == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, detail)
+}
+
+// ToggleDialogCollection 运行时开关，无需重启容器。
+// POST /api/admin/dialog-toggle  body: {"enabled": true/false}
+func (h *Handler) ToggleDialogCollection(c *gin.Context) {
+	if h.dialogCollector == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{"message": "采集器未启用（启动级 ENV 关闭或非 PG 后端）", "type": "not_available"},
+		})
+		return
+	}
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "invalid body: " + err.Error(), "type": "invalid_request"},
+		})
+		return
+	}
+	h.dialogCollector.SetEnabled(req.Enabled)
+	c.JSON(http.StatusOK, gin.H{
+		"enabled": req.Enabled,
+		"runtime": h.dialogCollector.Stats(),
+	})
 }
 
 // getCachedListActive 返回带 5 秒 TTL 缓存的 ListActive 结果，
@@ -196,6 +315,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/proxies/:id", h.UpdateProxy)
 	api.POST("/proxies/batch-delete", h.BatchDeleteProxies)
 	api.POST("/proxies/test", h.TestProxy)
+
+	// 对话采集（dialog_logs）
+	api.GET("/dialog-stats", h.GetDialogStats)
+	api.POST("/dialog-toggle", h.ToggleDialogCollection)
+	api.GET("/dialog-logs", h.ListDialogLogs)
+	api.GET("/dialog-logs/:id", h.GetDialogLogDetail)
 
 	// OAuth 授权流程
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
@@ -2276,6 +2401,7 @@ type settingsResponse struct {
 	RTManagerEnabled                 bool   `json:"rt_manager_enabled"`
 	RTManagerPasswordSet             bool   `json:"rt_manager_password_set"`
 	FreeGPT55Enabled                 bool   `json:"free_gpt55_enabled"`
+	PreferPaidEnabled                bool   `json:"prefer_paid_enabled"`
 }
 
 type updateSettingsReq struct {
@@ -2308,6 +2434,7 @@ type updateSettingsReq struct {
 	RTManagerPassword                *string `json:"rt_manager_password"`
 	RTManagerEnabled                 *bool   `json:"rt_manager_enabled"`
 	FreeGPT55Enabled                 *bool   `json:"free_gpt55_enabled"`
+	PreferPaidEnabled                *bool   `json:"prefer_paid_enabled"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2365,6 +2492,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		RTManagerEnabled:                 rtManagerEnabled,
 		RTManagerPasswordSet:             rtManagerPasswordSet,
 		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
+		PreferPaidEnabled:                h.store.GetPreferPaidEnabled(),
 	})
 }
 
@@ -2646,6 +2774,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: free_gpt55_enabled = %t", *req.FreeGPT55Enabled)
 	}
 
+	// prefer_paid_enabled：全局开关，false=prefer_free（默认省额度） / true=prefer_paid（体验优先）
+	if req.PreferPaidEnabled != nil {
+		h.store.SetPreferPaidEnabled(*req.PreferPaidEnabled)
+		log.Printf("设置已更新: prefer_paid_enabled = %t", *req.PreferPaidEnabled)
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2677,6 +2811,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RTManagerPassword:                rtManagerPassword,
 		RTManagerEnabled:                 rtManagerEnabled,
 		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
+		PreferPaidEnabled:                h.store.GetPreferPaidEnabled(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2732,6 +2867,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RTManagerEnabled:                 rtManagerEnabled,
 		RTManagerPasswordSet:             strings.TrimSpace(rtManagerPassword) != "",
 		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
+		PreferPaidEnabled:                h.store.GetPreferPaidEnabled(),
 	})
 }
 

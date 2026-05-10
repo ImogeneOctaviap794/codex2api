@@ -8,7 +8,8 @@
     "settings": "Settings",
     "console": "Console",
     "proxies": "Proxies",
-    "analytics": "Analytics"
+    "analytics": "Analytics",
+    "dialogs": "Dialog Logs"
   },
   "common": {
     "online": "Online",
@@ -587,6 +588,8 @@
     "fastAliasEnabledDesc": "When enabled, clients passing service_tier=fast are mapped to the upstream priority tier (queue jumping, ≈ 2× price). When disabled, fast is silently stripped and upstream goes to default. In both cases the Fast badge shows on the request log for audit.",
     "freeGPT55Enabled": "Free accounts handle gpt-5.5",
     "freeGPT55EnabledDesc": "On: gpt-5.5 is scheduled on the free pool first (just like 5.4), maximizing paid quota savings. Off: falls back to the hard-coded premium-only behavior, excluding free accounts from the 5.5 candidate pool. If OpenAI starts returning 400 on free 5.5 again, turn this off for an instant rollback.",
+    "preferPaidEnabled": "Paid accounts first, Free as fallback",
+    "preferPaidEnabledDesc": "Off (default): all non-premium-only models use prefer_free dispatch (free pool first, maximizing paid quota savings). On: switches to prefer_paid dispatch where plus/pro/team paid accounts are scheduled first and free accounts only fall back when the paid pool is fully busy or unavailable (UX-first). Decoupled from free_gpt55_enabled \u2014 gpt-5.5 continues to follow its own policy for free participation.",
     "allowRemoteMigration": "Allow Remote Migration",
     "allowRemoteMigrationDesc": "When enabled, other codex2api instances can pull healthy accounts from this instance.",
     "allowRemoteMigrationRequiresSecret": "Set an admin secret first. Remote migration cannot be enabled without admin authentication.",

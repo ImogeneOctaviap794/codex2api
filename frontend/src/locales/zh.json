@@ -8,7 +8,8 @@
     "settings": "系统设置",
     "console": "控制台",
     "proxies": "代理管理",
-    "analytics": "数据总览"
+    "analytics": "数据总览",
+    "dialogs": "对话采集"
   },
   "common": {
     "online": "在线",
@@ -587,6 +588,8 @@
     "fastAliasEnabledDesc": "启用时，客户端传 service_tier=fast 会被映射为上游 priority 档（插队、价格 ≈ 2×）。关闭时 fast 会被静默剥离，上游走 default。两种情况下使用日志都会在请求行显示 Fast 徽章，便于审计。",
     "freeGPT55Enabled": "Free 账号承接 gpt-5.5",
     "freeGPT55EnabledDesc": "开启：gpt-5.5 跟 5.4 一样优先调度 free 池（最省付费号额度）。关闭：恢复硬编码 premium-only 行为，free 账号被排除在 5.5 候选池之外。若 OpenAI 再次对 free 的 5.5 返回 400，可关闭本开关快速回退。",
+    "preferPaidEnabled": "付费账号优先 Free 兜底",
+    "preferPaidEnabledDesc": "关闭（默认）：所有非付费专属模型走 prefer_free 调度（free 池优先，最省付费额度）。开启：切换为 prefer_paid 调度，plus/pro/team 三类付费账号优先派发，free 账号仅在付费池全忙/不可用时兜底（用户体验优先）。与 free_gpt55_enabled 解耦，gpt-5.5 仍按其自身策略决定 free 是否参与。",
     "allowRemoteMigration": "允许远程迁移",
     "allowRemoteMigrationDesc": "开启后，其他 codex2api 实例可通过导出接口拉取本实例的健康账号。",
     "allowRemoteMigrationRequiresSecret": "请先设置管理密钥，未设置密码时不能启用远程迁移。",

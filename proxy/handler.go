@@ -37,6 +37,40 @@ type Handler struct {
 	dbKeysMu    sync.RWMutex
 	dbKeys      map[string]*database.APIKeyRow
 	dbKeysUntil time.Time
+
+	// 对话采集（可空；nil 时所有 submit 都是 no-op）
+	dialogCollector *DialogCollector
+}
+
+// SetDialogCollector 在 NewHandler 之后注入采集器。允许 nil 表示不采集。
+// 即使 collector 为 nil，handler 仍正常工作。
+func (h *Handler) SetDialogCollector(c *DialogCollector) {
+	if h == nil {
+		return
+	}
+	h.dialogCollector = c
+}
+
+// DialogCollector 返回当前采集器（admin API 查询状态用，可能为 nil）。
+func (h *Handler) DialogCollector() *DialogCollector {
+	if h == nil {
+		return nil
+	}
+	return h.dialogCollector
+}
+
+// safeSubmitDialog 始终安全的采集提交：nil collector / panic 都被吞掉，
+// 绝不向上传播。这是主链路与采集子系统的硬隔离边界。
+func (h *Handler) safeSubmitDialog(rec *database.DialogLogInput) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("dialog: safeSubmit panic recovered: %v", r)
+		}
+	}()
+	if h == nil || h.dialogCollector == nil || rec == nil {
+		return
+	}
+	h.dialogCollector.Submit(rec)
 }
 
 func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool) (*auth.Account, string) {
@@ -50,13 +84,14 @@ func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool
 //  1. 先把 preferPlan 以外的账号全部视作 exclude，只在偏好池中选；
 //  2. 偏好池空/全忙时，回退到普通 exclude 选号。
 // preferPlan 为空则退化为普通选号。
+// 支持多 plan CSV（如 "plus,pro,team"），用于 prefer_paid 模式：付费账号优先，free 兜底。
 func (h *Handler) nextAccountForSessionWithPreference(sessionID string, exclude map[int64]bool, preferPlan string) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
-	preferPlan = strings.ToLower(strings.TrimSpace(preferPlan))
-	if preferPlan != "" {
-		nonPref := h.store.AccountIDsExcludingPlans(preferPlan)
+	preferPlans := splitPreferPlans(preferPlan)
+	if len(preferPlans) > 0 {
+		nonPref := h.store.AccountIDsExcludingPlans(preferPlans...)
 		if len(nonPref) > 0 {
 			merged := make(map[int64]bool, len(exclude)+len(nonPref))
 			for id := range exclude {
@@ -71,6 +106,30 @@ func (h *Handler) nextAccountForSessionWithPreference(sessionID string, exclude 
 		}
 	}
 	return h.store.NextForSession(sessionID, exclude)
+}
+
+// splitPreferPlans 拆分 CSV 格式的 preferPlan，去重去空去空格 + 小写化。
+// 输入 "" 返回 nil；输入 "free" 返回 ["free"]；输入 "plus,pro,team" 返回 ["plus","pro","team"]。
+func splitPreferPlans(preferPlan string) []string {
+	s := strings.TrimSpace(preferPlan)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }
 
 type usageLimitDetails struct {
@@ -796,6 +855,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
 		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
+		// 对话采集：累积上游 Codex SSE 原始事件（用于训练数据落盘）
+		var dialogRawEvents []json.RawMessage
+
 		if isStream {
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -804,6 +866,13 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+
+				// 采集：raw event 拷贝一份
+				if h.dialogCollector != nil {
+					dup := make([]byte, len(data))
+					copy(dup, data)
+					dialogRawEvents = append(dialogRawEvents, dup)
+				}
 
 				// 容量错误透明重试：首包前上游报 "at capacity"，吞掉该事件不转发
 				if eventType == "response.failed" {
@@ -863,6 +932,13 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy）
+				if h.dialogCollector != nil {
+					dup := make([]byte, len(data))
+					copy(dup, data)
+					dialogRawEvents = append(dialogRawEvents, dup)
+				}
+
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -1010,6 +1086,33 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
+
+		// === 对话采集（异步、有损、永不影响主链路）===
+		if h.dialogCollector != nil && outcome.logStatusCode == http.StatusOK {
+			rec := &database.DialogLogInput{
+				Timestamp:        time.Now(),
+				Endpoint:         "/v1/responses",
+				Model:            model,
+				BaseModel:        baseModelOf(virtualHit),
+				AccountID:        account.ID(),
+				APIKeyHash:       HashAPIKey(apiKey),
+				IsStream:         isStream,
+				RequestBody:      json.RawMessage(rawBody),
+				ResponseBody:     MergeCodexEventsAsResponseJSON(dialogRawEvents),
+				ReasoningContent: ExtractReasoningFromCodexEvents(dialogRawEvents),
+				DurationMs:       totalDuration,
+				StatusCode:       outcome.logStatusCode,
+				ServiceTier:      resolvedServiceTier,
+				ReasoningEffort:  reasoningEffort,
+			}
+			if usage != nil {
+				rec.PromptTokens = usage.PromptTokens
+				rec.CompletionTokens = usage.CompletionTokens
+				rec.ReasoningTokens = usage.ReasoningTokens
+				rec.CachedTokens = usage.CachedTokens
+			}
+			h.safeSubmitDialog(rec)
+		}
 		return
 	}
 
@@ -1228,6 +1331,30 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		cancelHB()
 		if err := jsonW.Commit(respBody); err != nil {
 			log.Printf("commit /v1/responses/compact json failed: %v", err)
+		}
+
+		// === 对话采集（异步、有损、永不影响主链路）===
+		if h.dialogCollector != nil {
+			rec := &database.DialogLogInput{
+				Timestamp:        time.Now(),
+				Endpoint:         "/v1/responses/compact",
+				Model:            model,
+				BaseModel:        baseModelOf(virtualHit),
+				AccountID:        account.ID(),
+				APIKeyHash:       HashAPIKey(apiKey),
+				IsStream:         false,
+				RequestBody:      json.RawMessage(rawBody),
+				ResponseBody:     json.RawMessage(respBody),
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				ReasoningTokens:  reasoningTokens,
+				CachedTokens:     cachedTokens,
+				DurationMs:       totalDuration,
+				StatusCode:       http.StatusOK,
+				ServiceTier:      resolvedServiceTier,
+				ReasoningEffort:  reasoningEffort,
+			}
+			h.safeSubmitDialog(rec)
 		}
 		return
 	}
@@ -1464,6 +1591,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
 		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
+		// 对话采集：累积上游 Codex SSE 原始事件（用于训练数据落盘）
+		var dialogRawEvents []json.RawMessage
+
 		// chunkID / created / responseModel 已在 retry 循环外定义供 keepalive 共用
 
 		if isStream {
@@ -1475,6 +1605,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+
+				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy）
+				if h.dialogCollector != nil {
+					dup := make([]byte, len(data))
+					copy(dup, data)
+					dialogRawEvents = append(dialogRawEvents, dup)
+				}
 
 				// 容量错误透明重试：若流尚未向下游写入任何字节，且上游报 response.failed
 				// 携带 "at capacity"/"try a different mode" 类错误，则吞掉该事件不翻译、
@@ -1541,6 +1678,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy）
+				if h.dialogCollector != nil {
+					dup := make([]byte, len(data))
+					copy(dup, data)
+					dialogRawEvents = append(dialogRawEvents, dup)
+				}
+
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -1681,6 +1825,33 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
+
+		// === 对话采集（异步、有损、永不影响主链路）===
+		if h.dialogCollector != nil && outcome.logStatusCode == http.StatusOK {
+			rec := &database.DialogLogInput{
+				Timestamp:        time.Now(),
+				Endpoint:         "/v1/chat/completions",
+				Model:            model,
+				BaseModel:        baseModelOf(virtualHit),
+				AccountID:        account.ID(),
+				APIKeyHash:       HashAPIKey(apiKey),
+				IsStream:         isStream,
+				RequestBody:      json.RawMessage(rawBody),
+				ResponseBody:     MergeCodexEventsAsResponseJSON(dialogRawEvents),
+				ReasoningContent: ExtractReasoningFromCodexEvents(dialogRawEvents),
+				DurationMs:       totalDuration,
+				StatusCode:       outcome.logStatusCode,
+				ServiceTier:      resolvedServiceTier,
+				ReasoningEffort:  reasoningEffort,
+			}
+			if usage != nil {
+				rec.PromptTokens = usage.PromptTokens
+				rec.CompletionTokens = usage.CompletionTokens
+				rec.ReasoningTokens = usage.ReasoningTokens
+				rec.CachedTokens = usage.CachedTokens
+			}
+			h.safeSubmitDialog(rec)
+		}
 		return
 	}
 
@@ -1691,6 +1862,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	} else if lastStatusCode != 0 {
 		h.sendFinalUpstreamErrorKA(c, sseW, jsonW, lastStatusCode, lastBody)
 	}
+}
+
+// baseModelOf 安全提取虚拟模型 base_model（nil 安全）。
+func baseModelOf(o *ModelOverride) string {
+	if o == nil {
+		return ""
+	}
+	return o.BaseModel
 }
 
 // handleStreamResponse 处理流式响应（翻译 Codex → OpenAI）
@@ -2385,6 +2564,13 @@ type PremiumOnlyGating interface {
 	GetFreeGPT55Enabled() bool
 }
 
+// DispatchModeGating 调度模式开关接口：prefer_free vs prefer_paid。
+// 独立于 PremiumOnlyGating，避免对原接口使用者（如独立单元测试）造成破坏。
+type DispatchModeGating interface {
+	// GetPreferPaidEnabled 返回 true 时切换为付费优先 free 兜底 (preferPlan = "plus,pro,team")。
+	GetPreferPaidEnabled() bool
+}
+
 // IsEffectivePremiumOnly 结合运行时开关判断模型是否仍对 free 封闭。
 // gpt-5.5：若 gating.GetFreeGPT55Enabled()==true，放开限制，让 5.5 走 prefer_free 路径。
 func IsEffectivePremiumOnly(gating PremiumOnlyGating, model string) bool {
@@ -2429,7 +2615,9 @@ func bodyRequiresPaidAccount(rawBody []byte) bool {
 //     或虚拟模型本身会注入 image_generation（如 gpt-image-2，rawBody 此时尚未合并 tools）
 //     → 把所有 Free 账号加入 exclude，preferPlan = ""（只调度付费）
 //   - 其他请求（含只 inject reasoning effort 的虚拟模型如 gpt-5.4-high）
-//     → preferPlan = "free"（优先 Free，池空回退付费）
+//     → 根据 DispatchModeGating.GetPreferPaidEnabled() 返回：
+//       · false（默认）：preferPlan = "free"（优先 Free，池空回退付费）
+//       · true：preferPlan = "plus,pro,team"（付费优先，Free 兜底）
 //
 // 注意：bodyRequiresPaidAccount 只能识别用户已显式传入的 image_generation 工具；
 // /v1/images/generations 内部转发到 chat/completions 时 rawBody 还没合并 tools，
@@ -2452,14 +2640,18 @@ func (h *Handler) planDispatch(model string, rawBody []byte, virtualHit *ModelOv
 		}
 		return ""
 	}
+	// 付费优先模式：运行时开关打开后的「体验优先」路径。
+	if h != nil && h.store != nil && h.store.GetPreferPaidEnabled() {
+		return "plus,pro,team"
+	}
 	return "free"
 }
 
 // ModelPlanPolicy 描述某个模型的派发策略（供前端展示）。
 type ModelPlanPolicy struct {
-	Plan         string   `json:"plan_policy"`   // "premium_only" / "prefer_free"
+	Plan         string   `json:"plan_policy"`   // "premium_only" / "prefer_free" / "prefer_paid"
 	AllowedPlans []string `json:"allowed_plans"` // 可承接该模型的 plan 列表
-	PreferPlan   string   `json:"prefer_plan"`   // 优先派发的 plan；premium_only 时为空
+	PreferPlan   string   `json:"prefer_plan"`   // 优先派发的 plan（CSV 多 plan 表示付费优先）；premium_only 时为空
 }
 
 // PolicyForModel 返回模型的派发策略（静态版本，不考虑运行时开关）。
@@ -2470,12 +2662,21 @@ func PolicyForModel(model string) ModelPlanPolicy {
 
 // PolicyForModelWithGating 结合运行时开关返回模型的派发策略。
 // gating 为 nil 时等同于静态硬编码判断（保持 5.5 默认 premium_only）。
+// 若 gating 同时实现了 DispatchModeGating，则反映付费优先开关。
 func PolicyForModelWithGating(gating PremiumOnlyGating, model string) ModelPlanPolicy {
 	if IsEffectivePremiumOnly(gating, model) {
 		return ModelPlanPolicy{
 			Plan:         "premium_only",
 			AllowedPlans: []string{"plus", "pro", "team"},
 			PreferPlan:   "",
+		}
+	}
+	// 运行时「付费优先」开关反映到前端展示：
+	if dm, ok := gating.(DispatchModeGating); ok && dm != nil && dm.GetPreferPaidEnabled() {
+		return ModelPlanPolicy{
+			Plan:         "prefer_paid",
+			AllowedPlans: []string{"plus", "pro", "team", "free"},
+			PreferPlan:   "plus,pro,team",
 		}
 	}
 	return ModelPlanPolicy{

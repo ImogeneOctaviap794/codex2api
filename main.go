@@ -189,6 +189,46 @@ func main() {
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 
+	// === 对话采集（dialog_logs）：可选、异步、永不影响主链路 ===
+	// 启动级开关：DIALOG_COLLECTION_ENABLED=true（默认 true，明确传 false 关闭）
+	// 仅 PostgreSQL 支持；SQLite 路径会自动跳过。
+	dialogEnabled := strings.ToLower(strings.TrimSpace(os.Getenv("DIALOG_COLLECTION_ENABLED"))) != "false"
+	var dialogCollector *proxy.DialogCollector
+	if dialogEnabled && cfg.Database.Driver == "postgres" {
+		// 1) 建主表 + 索引（idempotent）
+		schemaCtx, schemaCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := db.EnsureDialogLogsSchema(schemaCtx); err != nil {
+			log.Printf("dialog_logs schema 初始化失败（采集功能将不可用，主链路不受影响）: %v", err)
+		} else {
+			// 2) 建当月 + 前后各一个月的分区（idempotent）
+			if err := db.EnsureDialogPartitionsAround(schemaCtx, time.Now()); err != nil {
+				log.Printf("dialog_logs 分区创建失败（采集功能将不可用，主链路不受影响）: %v", err)
+			} else {
+				// 3) 启动 collector
+				dialogCollector = proxy.NewDialogCollector(db, true)
+				handler.SetDialogCollector(dialogCollector)
+				adminHandler.SetDialogCollector(dialogCollector)
+				log.Println("✅ 对话采集已启用（dialog_logs，异步落盘到 PG）")
+
+				// 4) 后台每天检查一次分区（兜底月初）
+				go func() {
+					ticker := time.NewTicker(12 * time.Hour)
+					defer ticker.Stop()
+					for range ticker.C {
+						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						_ = db.EnsureDialogPartitionsAround(ctx, time.Now())
+						cancel()
+					}
+				}()
+			}
+		}
+		schemaCancel()
+	} else if !dialogEnabled {
+		log.Println("ℹ️  对话采集已通过 DIALOG_COLLECTION_ENABLED=false 关闭")
+	} else {
+		log.Println("ℹ️  对话采集仅支持 PostgreSQL，当前是 SQLite，跳过")
+	}
+
 	// 把 proxy 的 API Key 缓存失效方法注入 admin 端：
 	// admin 在 CreateAPIKey/DeleteAPIKey 后调用此回调，让鉴权中间件的
 	// 5 分钟 DB key 缓存立即失效，新 key 立刻生效、被删 key 立刻失效。
@@ -303,6 +343,14 @@ func main() {
 	store.Stop()
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()
+
+	// 停 collector 时把 channel 里残留的批次落盘后再退出
+	if dialogCollector != nil {
+		log.Println("等待对话采集队列 flush...")
+		dialogCollector.Stop(15 * time.Second)
+		log.Println("对话采集队列已关闭")
+	}
+
 	log.Println("已关闭")
 }
 
