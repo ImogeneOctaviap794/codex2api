@@ -6,9 +6,9 @@
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.53.2-proxy-auth`（`latest`）|
+| 镜像 | `codex2api:v1.7.54-trajectory-ids`（`latest`）|
 | 容器 | `codex2api` |
-| 端口 | `8121`（nginx upstream 指向 127.0.0.1:8121）|
+| 端口 | `8122`（nginx upstream 指向 127.0.0.1:8122）|
 | 部署目录 | `/data/codex2api/` |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`, Redis `codex2api-redis`, 网络 `codex2api_codex2api-net` |
@@ -40,7 +40,7 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 ```bash
 SSH='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP='sshpass -p f3t7uCBeTCizT12 scp -P 22222 -o StrictHostKeyChecking=no'
-OLD=8121; NEW=8122; TAG=v1.7.54-xxx
+OLD=8122; NEW=8123; TAG=v1.7.55-xxx
 ```
 
 > **下次端口**：8121 → 8122（或 8123；切忌选 8120 = sms-relay）
@@ -184,6 +184,7 @@ docker exec codex2api-postgres psql -U codex2api -d codex2api -c \
 | v1.7.53-retry-reason | 8122 | 2026-05-13 | 重试拼救成功的 usage_log 行也携带首次重试原因（`firstRetryReasonMsg` 跨 attempt sticky，覆盖 capacity / stream-break 两种 continue 路径）|
 | v1.7.53.1-retry-reason-fix | 8123 | 2026-05-13 | 补 transport-error （dial fail / proxy fail 等）continue 点同样 capture firstRetryReason，现在所有重试拼救行都能看到原因 |
 | v1.7.53.2-proxy-auth | 8121 | 2026-05-13 | 发现上个版本暴露出大量代理 407 Proxy Authentication 错误被错误归类为 `auth` kind。拆出独立 `proxy_auth` kind（优先级高于 auth，避免 "Proxy Authentication" 被 "authentication" 同化）+ UI 橙色 badge 区分 |
+| v1.7.54-trajectory-ids | 8122 | 2026-05-13 | dialog_logs 加 `session_id` + `request_id` 两列（40 万条训练轨迹采购规范必填）。部署后 TRUNCATE 91 GB 老数据重新采集。现在每条 dialog 都能跨会话关联 + 全局唯一 |
 | **v1.7.51-overload-retry** | **8123** | **2026-05-13** | **扩充 capacity 重试 marker：原有 `at capacity` / `try a different model` 只能识别 codex CLI 客户端渲染文案，未命中上游真实载荷。10min 实测样本：886 请求 / 149 `response.failed` = **17% 隐藏故障率**，全部漏出到客户端。新增 markers 覆盖 `Our servers are currently overloaded` (90%) / `An error occurred while processing your request` (10%) / `try again later`，透明重试机制现在能实际拦住这些错误** |
 
 ## 8. 不要再做的事 / 踩过的坑
