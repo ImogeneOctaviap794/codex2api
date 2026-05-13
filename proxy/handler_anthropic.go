@@ -117,6 +117,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
+	var firstRetryReasonMsg string // 跨 attempt sticky：首次重试原因文案
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
@@ -216,6 +217,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if (isRetryableStatus(resp.StatusCode) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				captureFirstRetryReason(&firstRetryReasonMsg, msgErrInput.UpstreamErrorMsg)
 				continue
 			}
 
@@ -378,6 +380,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 			lastErr = errors.New(capacityErrMsg)
+			captureFirstRetryReason(&firstRetryReasonMsg, capacityErrMsg)
 			continue
 		}
 
@@ -393,6 +396,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			captureFirstRetryReason(&firstRetryReasonMsg, outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
@@ -447,7 +451,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
-		annotateUpstreamFailure(logInput, lastFailedErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
+		effectiveErrMsg := lastFailedErrMsg
+		if effectiveErrMsg == "" && attempt > 0 {
+			effectiveErrMsg = firstRetryReasonMsg // 拼救成功：回填首次重试原因
+		}
+		annotateUpstreamFailure(logInput, effectiveErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()

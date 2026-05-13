@@ -700,6 +700,15 @@ func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
 	}, true
 }
 
+// captureFirstRetryReason 跨 attempt 暂存第一个导致重试的错误文案。
+// 在 continue 之前调用；sticky，后续 attempt 不覆盖。空字符串不记。
+func captureFirstRetryReason(dst *string, errMsg string) {
+	if dst == nil || *dst != "" || errMsg == "" {
+		return
+	}
+	*dst = errMsg
+}
+
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
 func (h *Handler) Responses(c *gin.Context) {
 	// 1. 读取请求体
@@ -767,6 +776,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
+	var firstRetryReasonMsg string // 跨 attempt sticky：第一个导致重试的上游错误文案，用于拼救成功行的 usage_log 回填
 
 	// === Keepalive 初始化（防 CF/反代 idle timeout；生图等长耗时请求保活）===
 	// Responses 用 Codex 原生心跳（response.in_progress），客户端会幂等处理。
@@ -899,6 +909,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				captureFirstRetryReason(&firstRetryReasonMsg, logInput.UpstreamErrorMsg)
 				continue
 			}
 
@@ -1069,6 +1080,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 			lastErr = errors.New(capacityErrMsg)
+			captureFirstRetryReason(&firstRetryReasonMsg, capacityErrMsg)
 			continue
 		}
 
@@ -1083,6 +1095,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			captureFirstRetryReason(&firstRetryReasonMsg, outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -1147,7 +1160,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
-		annotateUpstreamFailure(logInput, lastFailedErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
+		effectiveErrMsg := lastFailedErrMsg
+		if effectiveErrMsg == "" && attempt > 0 {
+			effectiveErrMsg = firstRetryReasonMsg // 拼救成功：回填首次重试原因
+		}
+		annotateUpstreamFailure(logInput, effectiveErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
@@ -1263,6 +1280,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
+	var firstRetryReasonMsg string // 跨 attempt sticky：首次重试原因文案
 
 	// === Keepalive 初始化（防 CF/反代 idle timeout；compact 为非流式 JSON 响应）===
 	_, jsonW, cancelHB, okKA := SetupKeepalive(c, false, KeepaliveModeCodex, "", "", 0)
@@ -1361,6 +1379,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				captureFirstRetryReason(&firstRetryReasonMsg, compactErrInput.UpstreamErrorMsg)
 				continue
 			}
 
@@ -1406,6 +1425,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		compactOKInput.RetryCount = attempt
 		compactOKInput.FinalOutcome = OutcomeSuccess
+		if attempt > 0 && firstRetryReasonMsg != "" {
+			compactOKInput.UpstreamErrorKind = ClassifyUpstreamError(firstRetryReasonMsg)
+			compactOKInput.UpstreamErrorMsg = TruncateErrMsg(firstRetryReasonMsg, 500)
+		}
 		h.logUsageForRequest(c, compactOKInput)
 
 		h.store.Release(account)
@@ -1519,6 +1542,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 	preferPlan := h.planDispatch(model, rawBody, virtualHit, excludeAccounts)
+	var firstRetryReasonMsg string // 跨 attempt sticky：首次重试原因文案
 
 	// === Keepalive 初始化（防 CF/反代 idle timeout；生图等长耗时请求保活）===
 	chunkID := "chatcmpl-" + uuid.New().String()[:8]
@@ -1653,6 +1677,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				captureFirstRetryReason(&firstRetryReasonMsg, chatErrInput.UpstreamErrorMsg)
 				continue
 			}
 
@@ -1837,6 +1862,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 			lastErr = errors.New(capacityErrMsg)
+			captureFirstRetryReason(&firstRetryReasonMsg, capacityErrMsg)
 			continue
 		}
 
@@ -1851,6 +1877,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			captureFirstRetryReason(&firstRetryReasonMsg, outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -1915,7 +1942,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
-		annotateUpstreamFailure(logInput, lastFailedErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
+		effectiveErrMsg := lastFailedErrMsg
+		if effectiveErrMsg == "" && attempt > 0 {
+			effectiveErrMsg = firstRetryReasonMsg // 拼救成功：回填首次重试原因
+		}
+		annotateUpstreamFailure(logInput, effectiveErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
