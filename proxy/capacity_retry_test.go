@@ -17,6 +17,15 @@ func TestIsCapacityError(t *testing.T) {
 		{"try a different model", "Please try a different model.", true},
 		{"rate limit is NOT capacity", "Rate limit exceeded", false},
 		{"quota is NOT capacity", "You exceeded your current quota", false},
+		// v1.7.51 起新增 markers（生产 dialog_logs 实测样本）
+		{"servers overloaded (90% 样本)",
+			"Our servers are currently overloaded. Please try again later.", true},
+		{"generic upstream error (10% 样本)",
+			"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists.", true},
+		{"only 'try again later' tail", "Service unavailable. Try again later.", true},
+		// 反向防误伤
+		{"auth error must NOT retry", "Invalid authentication credentials", false},
+		{"context length must NOT retry", "This model's maximum context length is 128000 tokens", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
