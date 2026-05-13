@@ -89,6 +89,11 @@ type usageLogEntry struct {
 	APIKeyID         int64
 	APIKeyName       string
 	APIKeyMasked     string
+	// v1.7.52 上游错误 + 重试采集
+	UpstreamErrorKind string
+	UpstreamErrorMsg  string
+	RetryCount        int
+	FinalOutcome      string
 }
 
 // New 创建数据库连接并自动建表。
@@ -259,7 +264,17 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_name VARCHAR(255) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_masked VARCHAR(64) DEFAULT '';
 
+	-- v1.7.52 上游错误 + 重试采集字段
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_error_kind VARCHAR(40) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_error_msg TEXT DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS final_outcome VARCHAR(20) DEFAULT '';
+
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
+	-- 部分索引：只索引有上游错误的行，帮助 /usage/error-breakdown 等聚合查询
+	CREATE INDEX IF NOT EXISTS idx_usage_logs_err_kind
+		ON usage_logs(created_at, upstream_error_kind)
+		WHERE upstream_error_kind <> '';
 
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id         SERIAL PRIMARY KEY,
@@ -746,33 +761,42 @@ type UsageLog struct {
 	APIKeyMasked     string    `json:"api_key_masked"`
 	AccountEmail     string    `json:"account_email"`
 	CreatedAt        time.Time `json:"created_at"`
+	// v1.7.52 上游错误 + 重试采集
+	UpstreamErrorKind string `json:"upstream_error_kind"`
+	UpstreamErrorMsg  string `json:"upstream_error_msg"`
+	RetryCount        int    `json:"retry_count"`
+	FinalOutcome      string `json:"final_outcome"`
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
 func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 	db.logMu.Lock()
 	db.logBuf = append(db.logBuf, usageLogEntry{
-		AccountID:        log.AccountID,
-		Endpoint:         log.Endpoint,
-		Model:            log.Model,
-		PromptTokens:     log.PromptTokens,
-		CompletionTokens: log.CompletionTokens,
-		TotalTokens:      log.TotalTokens,
-		StatusCode:       log.StatusCode,
-		DurationMs:       log.DurationMs,
-		InputTokens:      log.InputTokens,
-		OutputTokens:     log.OutputTokens,
-		ReasoningTokens:  log.ReasoningTokens,
-		FirstTokenMs:     log.FirstTokenMs,
-		ReasoningEffort:  log.ReasoningEffort,
-		InboundEndpoint:  log.InboundEndpoint,
-		UpstreamEndpoint: log.UpstreamEndpoint,
-		Stream:           log.Stream,
-		CachedTokens:     log.CachedTokens,
-		ServiceTier:      log.ServiceTier,
-		APIKeyID:         log.APIKeyID,
-		APIKeyName:       log.APIKeyName,
-		APIKeyMasked:     log.APIKeyMasked,
+		AccountID:         log.AccountID,
+		Endpoint:          log.Endpoint,
+		Model:             log.Model,
+		PromptTokens:      log.PromptTokens,
+		CompletionTokens:  log.CompletionTokens,
+		TotalTokens:       log.TotalTokens,
+		StatusCode:        log.StatusCode,
+		DurationMs:        log.DurationMs,
+		InputTokens:       log.InputTokens,
+		OutputTokens:      log.OutputTokens,
+		ReasoningTokens:   log.ReasoningTokens,
+		FirstTokenMs:      log.FirstTokenMs,
+		ReasoningEffort:   log.ReasoningEffort,
+		InboundEndpoint:   log.InboundEndpoint,
+		UpstreamEndpoint:  log.UpstreamEndpoint,
+		Stream:            log.Stream,
+		CachedTokens:      log.CachedTokens,
+		ServiceTier:       log.ServiceTier,
+		APIKeyID:          log.APIKeyID,
+		APIKeyName:        log.APIKeyName,
+		APIKeyMasked:      log.APIKeyMasked,
+		UpstreamErrorKind: log.UpstreamErrorKind,
+		UpstreamErrorMsg:  log.UpstreamErrorMsg,
+		RetryCount:        log.RetryCount,
+		FinalOutcome:      log.FinalOutcome,
 	})
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
@@ -807,6 +831,15 @@ type UsageLogInput struct {
 	APIKeyID         int64
 	APIKeyName       string
 	APIKeyMasked     string
+	// v1.7.52 上游错误 + 重试采集。
+	// UpstreamErrorKind 应由 proxy.ClassifyUpstreamError 得出（稳定 token）。
+	// UpstreamErrorMsg 包含原始 error.message，建议 < 500 字节。
+	// RetryCount：-1=耗尽重试仍失败 / 0=首次成功 / N=重试 N 次后才成功。
+	// FinalOutcome: success / upstream_failed / client_gone / timeout / ''(未填充).
+	UpstreamErrorKind string
+	UpstreamErrorMsg  string
+	RetryCount        int
+	FinalOutcome      string
 }
 
 // startLogFlusher 启动后台定时 flush 协程（每 5 秒一次）
@@ -860,8 +893,9 @@ func (db *DB) flushLogs() {
 	stmt, err := tx.PrepareContext(ctx,
 		`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
-		  api_key_id, api_key_name, api_key_masked)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`)
+		  api_key_id, api_key_name, api_key_masked,
+		  upstream_error_kind, upstream_error_msg, retry_count, final_outcome)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("批量写入日志失败（准备语句）: %v", err)
@@ -872,7 +906,8 @@ func (db *DB) flushLogs() {
 	for _, e := range batch {
 		if _, err := stmt.ExecContext(ctx, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
-			e.APIKeyID, e.APIKeyName, e.APIKeyMasked); err != nil {
+			e.APIKeyID, e.APIKeyName, e.APIKeyMasked,
+			e.UpstreamErrorKind, e.UpstreamErrorMsg, e.RetryCount, e.FinalOutcome); err != nil {
 			tx.Rollback()
 			log.Printf("批量写入日志失败（执行）: %v", err)
 			return
@@ -896,7 +931,7 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 		return nil
 	}
 
-	const maxRowsPerBatch = 3000 // 安全阈值，低于 3120 行的理论上限
+	const maxRowsPerBatch = 2500 // 安全阈值：25 params/row * 2500 = 62500 < 65535 PG 参数上限
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -920,23 +955,28 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) e
 	}
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
+	const paramsPerRow = 25
 	valueStrings := make([]string, 0, len(batch))
-	valueArgs := make([]interface{}, 0, len(batch)*21)
+	valueArgs := make([]interface{}, 0, len(batch)*paramsPerRow)
 	argIdx := 1
 
 	for _, e := range batch {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+		valueStrings = append(valueStrings, fmt.Sprintf(
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
 			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
-			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19, argIdx+20))
+			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19, argIdx+20,
+			argIdx+21, argIdx+22, argIdx+23, argIdx+24))
 		valueArgs = append(valueArgs, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
-			e.APIKeyID, e.APIKeyName, e.APIKeyMasked)
-		argIdx += 21
+			e.APIKeyID, e.APIKeyName, e.APIKeyMasked,
+			e.UpstreamErrorKind, e.UpstreamErrorMsg, e.RetryCount, e.FinalOutcome)
+		argIdx += paramsPerRow
 	}
 
 	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
-		api_key_id, api_key_name, api_key_masked)
+		api_key_id, api_key_name, api_key_masked,
+		upstream_error_kind, upstream_error_msg, retry_count, final_outcome)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
@@ -956,6 +996,13 @@ type UsageStats struct {
 	TPM               float64 `json:"tpm"`
 	AvgDurationMs     float64 `json:"avg_duration_ms"`
 	ErrorRate         float64 `json:"error_rate"`
+	// v1.7.52 上游错误 + 重试可视化字段。都是当天口径。
+	// UpstreamErrorRate: 今天内（status!=499）有 upstream_error_kind 记录的行占比 (%)。
+	// RetryTotalToday: 今天内发生过重试的行数（retry_count > 0）。
+	// RetrySaveRate: 重试拯救成功率（retry_count>0 AND final_outcome=success / retry_count>0 总数，%）。
+	UpstreamErrorRate float64 `json:"upstream_error_rate"`
+	RetryTotalToday   int64   `json:"retry_total_today"`
+	RetrySaveRate     float64 `json:"retry_save_rate"`
 }
 
 // TrafficSnapshot 近实时流量快照
@@ -987,24 +1034,29 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
 		COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
-		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors,
+		COALESCE(SUM(CASE WHEN COALESCE(upstream_error_kind, '') <> '' THEN 1 ELSE 0 END), 0) AS today_upstream_errors,
+		COALESCE(SUM(CASE WHEN COALESCE(retry_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS today_retries,
+		COALESCE(SUM(CASE WHEN COALESCE(retry_count, 0) > 0 AND final_outcome = 'success' THEN 1 ELSE 0 END), 0) AS today_retry_saves
 	FROM usage_logs
 	WHERE created_at >= $1
 	  AND status_code <> 499
 	`
 
-	var todayErrors int64
+	var todayErrors, todayUpstreamErrors, todayRetries, todayRetrySaves int64
 	var todayPrompt, todayCompletion, todayCached int64 // 仅用于 scan 对齐，不参与总量计算
 	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &todayPrompt, &todayCompletion, &todayCached,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
 		&todayErrors,
+		&todayUpstreamErrors, &todayRetries, &todayRetrySaves,
 	)
 	_, _, _ = todayPrompt, todayCompletion, todayCached
 	if err != nil {
 		return nil, err
 	}
+	stats.RetryTotalToday = todayRetries
 
 	// 统计当前可见日志的全量汇总（排除 499，保证与使用统计列表口径一致）
 	var visibleTotal, visibleTokens, visiblePrompt, visibleCompletion, visibleCached int64
@@ -1032,9 +1084,82 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 
 	if stats.TodayRequests > 0 {
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
+		stats.UpstreamErrorRate = float64(todayUpstreamErrors) / float64(stats.TodayRequests) * 100
+	}
+	if todayRetries > 0 {
+		stats.RetrySaveRate = float64(todayRetrySaves) / float64(todayRetries) * 100
 	}
 
 	return stats, nil
+}
+
+// ErrorBreakdownRow 单一错误类型在指定时间窗口内的聚合统计
+type ErrorBreakdownRow struct {
+	Kind         string  `json:"kind"`           // upstream_error_kind 取值，空字符串聚合为 "ok"
+	Count        int64   `json:"count"`          // 该 kind 的行数
+	RetrySuccess int64   `json:"retry_success"`  // 该 kind 中 retry_count>0 且 final_outcome=success 的行数
+	SampleMsg    string  `json:"sample_message"` // 该 kind 最近一条 upstream_error_msg（用于 UI 展示典型样本）
+	Percent      float64 `json:"percent"`        // count / total_rows 在窗口内的百分比
+}
+
+// ErrorBreakdown 错误类型聚合响应包络
+type ErrorBreakdown struct {
+	WindowHours int                  `json:"window_hours"`
+	TotalRows   int64                `json:"total_rows"`
+	Rows        []*ErrorBreakdownRow `json:"rows"`
+}
+
+// GetUsageErrorBreakdown 按 upstream_error_kind 聚合最近 windowHours 小时的请求日志。
+// windowHours <= 0 时默认 24 小时，最大限制 168 小时（7 天）。
+// 排除 status_code = 499（客户端断开）以匹配 usage 页面口径。
+func (db *DB) GetUsageErrorBreakdown(ctx context.Context, windowHours int) (*ErrorBreakdown, error) {
+	if windowHours <= 0 {
+		windowHours = 24
+	}
+	if windowHours > 168 {
+		windowHours = 168
+	}
+	since := time.Now().Add(-time.Duration(windowHours) * time.Hour)
+
+	// 用 MAX(upstream_error_msg) 当 sample。对 PG/SQLite 都成立。
+	// kind=='' 的行也参与聚合（代表"无错误"，UI 可选择展示）。
+	query := `
+		SELECT COALESCE(upstream_error_kind, '') AS kind,
+		       COUNT(*) AS cnt,
+		       COALESCE(SUM(CASE WHEN COALESCE(retry_count,0) > 0 AND final_outcome = 'success' THEN 1 ELSE 0 END), 0) AS retry_success,
+		       COALESCE(MAX(upstream_error_msg), '') AS sample_msg
+		FROM usage_logs
+		WHERE created_at >= $1 AND status_code <> 499
+		GROUP BY COALESCE(upstream_error_kind, '')
+		ORDER BY cnt DESC
+	`
+	rows, err := db.conn.QueryContext(ctx, query, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := &ErrorBreakdown{WindowHours: windowHours, Rows: []*ErrorBreakdownRow{}}
+	for rows.Next() {
+		r := &ErrorBreakdownRow{}
+		if err := rows.Scan(&r.Kind, &r.Count, &r.RetrySuccess, &r.SampleMsg); err != nil {
+			return nil, err
+		}
+		if r.Kind == "" {
+			r.Kind = "ok"
+		}
+		result.TotalRows += r.Count
+		result.Rows = append(result.Rows, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if result.TotalRows > 0 {
+		for _, r := range result.Rows {
+			r.Percent = float64(r.Count) / float64(result.TotalRows) * 100
+		}
+	}
+	return result, nil
 }
 
 // GetTrafficSnapshot 获取近实时流量快照
@@ -1092,6 +1217,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
+	            COALESCE(u.upstream_error_kind, ''), COALESCE(u.upstream_error_msg, ''), COALESCE(u.retry_count, 0), COALESCE(u.final_outcome, ''),
 	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1110,7 +1236,9 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &credentialRaw, &createdAtRaw); err != nil {
+			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked,
+			&l.UpstreamErrorKind, &l.UpstreamErrorMsg, &l.RetryCount, &l.FinalOutcome,
+			&credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1315,6 +1443,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
+	            COALESCE(u.upstream_error_kind, ''), COALESCE(u.upstream_error_msg, ''), COALESCE(u.retry_count, 0), COALESCE(u.final_outcome, ''),
 	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1334,7 +1463,9 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &credentialRaw, &createdAtRaw); err != nil {
+			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked,
+			&l.UpstreamErrorKind, &l.UpstreamErrorMsg, &l.RetryCount, &l.FinalOutcome,
+			&credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1423,6 +1554,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
+	            COALESCE(u.upstream_error_kind, ''), COALESCE(u.upstream_error_msg, ''), COALESCE(u.retry_count, 0), COALESCE(u.final_outcome, ''),
 	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
@@ -1442,7 +1574,9 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens,
-			&l.ServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			&l.ServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked,
+			&l.UpstreamErrorKind, &l.UpstreamErrorMsg, &l.RetryCount, &l.FinalOutcome,
+			&credentialRaw, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)

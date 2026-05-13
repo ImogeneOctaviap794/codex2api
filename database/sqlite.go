@@ -143,6 +143,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "api_key_id", "INTEGER DEFAULT 0"},
 		{"usage_logs", "api_key_name", "TEXT DEFAULT ''"},
 		{"usage_logs", "api_key_masked", "TEXT DEFAULT ''"},
+		// v1.7.52 上游错误 + 重试采集
+		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
+		{"usage_logs", "upstream_error_msg", "TEXT DEFAULT ''"},
+		{"usage_logs", "retry_count", "INTEGER DEFAULT 0"},
+		{"usage_logs", "final_outcome", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
@@ -517,7 +522,8 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
-		       cached_tokens, duration_ms, status_code
+		       cached_tokens, duration_ms, status_code,
+		       COALESCE(upstream_error_kind, ''), COALESCE(retry_count, 0), COALESCE(final_outcome, '')
 		FROM usage_logs
 		WHERE created_at >= $1 AND status_code <> 499
 	`, todayStart)
@@ -527,7 +533,7 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	defer rows.Close()
 
 	stats := &UsageStats{}
-	var todayErrors int64
+	var todayErrors, todayUpstreamErrors, todayRetries, todayRetrySaves int64
 	var totalDuration float64
 
 	for rows.Next() {
@@ -535,8 +541,11 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		var totalTokens, promptTokens, completionTokens, cachedTokens int64
 		var durationMs int
 		var statusCode int
+		var upstreamErrKind, finalOutcome string
+		var retryCount int
 		if err := rows.Scan(&createdRaw, &totalTokens, &promptTokens, &completionTokens,
-			&cachedTokens, &durationMs, &statusCode); err != nil {
+			&cachedTokens, &durationMs, &statusCode,
+			&upstreamErrKind, &retryCount, &finalOutcome); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -554,6 +563,15 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		if statusCode >= 400 {
 			todayErrors++
 		}
+		if upstreamErrKind != "" {
+			todayUpstreamErrors++
+		}
+		if retryCount > 0 {
+			todayRetries++
+			if finalOutcome == "success" {
+				todayRetrySaves++
+			}
+		}
 		// 最近 1 分钟窗口：RPM / TPM
 		if !createdAt.Before(minuteAgo) {
 			stats.RPM++
@@ -567,6 +585,11 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	if stats.TodayRequests > 0 {
 		stats.AvgDurationMs = totalDuration / float64(stats.TodayRequests)
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
+		stats.UpstreamErrorRate = float64(todayUpstreamErrors) / float64(stats.TodayRequests) * 100
+	}
+	stats.RetryTotalToday = todayRetries
+	if todayRetries > 0 {
+		stats.RetrySaveRate = float64(todayRetrySaves) / float64(todayRetries) * 100
 	}
 
 	// 可见请求总数（排除 499）
