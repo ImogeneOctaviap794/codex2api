@@ -88,6 +88,9 @@ function getUpstreamErrorBadgeClass(kind: string): string {
       return 'border-transparent bg-red-500/12 text-red-600 dark:bg-red-500/20 dark:text-red-300'
     case 'auth':
       return 'border-transparent bg-purple-500/12 text-purple-600 dark:bg-purple-500/20 dark:text-purple-300'
+    case 'proxy_auth':
+      // 与 auth 区分：代理凭据失效需要刷代理而不是 token
+      return 'border-transparent bg-orange-500/12 text-orange-600 dark:bg-orange-500/20 dark:text-orange-300'
     case 'context_length':
       return 'border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300'
     case 'content_filter':

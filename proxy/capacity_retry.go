@@ -62,7 +62,8 @@ const (
 	ErrKindCapacity         = "capacity"          // "at capacity" / "try a different model" 家族
 	ErrKindProcessingError  = "processing_error"  // "An error occurred while processing your request"
 	ErrKindRateLimit        = "rate_limit"        // 429 / "rate limit exceeded"
-	ErrKindAuth             = "auth"              // 401 / unauthorized
+	ErrKindAuth             = "auth"              // 401 / unauthorized【OpenAI 账号 token】
+	ErrKindProxyAuth        = "proxy_auth"        // 407 Proxy Authentication Required【代理凭据失效】
 	ErrKindContextLength    = "context_length"    // context length exceeded
 	ErrKindContentFilter    = "content_filter"    // content policy / safety
 	ErrKindTimeout          = "timeout"           // 上游超时
@@ -104,6 +105,10 @@ func ClassifyUpstreamError(errMsg string) string {
 		strings.Contains(lower, "safety") ||
 		strings.Contains(lower, "content_filter"):
 		return ErrKindContentFilter
+	case strings.Contains(lower, "proxy authentication") ||
+		strings.Contains(lower, "407 "):
+		// 代理认证错误优先于通用 auth，避免被 "authentication" 子串同化
+		return ErrKindProxyAuth
 	case strings.Contains(lower, "unauthorized") ||
 		strings.Contains(lower, "invalid auth") ||
 		strings.Contains(lower, "authentication"):

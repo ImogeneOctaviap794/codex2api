@@ -60,6 +60,11 @@ func TestClassifyUpstreamError(t *testing.T) {
 		// 优先级测试：overloaded 优先于 try again later
 		{"overloaded takes precedence over try again later",
 			"Our servers are currently overloaded. Please try again later.", ErrKindOverloaded},
+		// 优先级测试：proxy_auth 优先于通用 auth（"Proxy Authentication" 含 "authentication" 子串）
+		{"proxy_auth wins over auth (生产实测)",
+			`upstream_error: 请求上游失败 (caused by: Post "https://chatgpt.com/backend-api/codex/responses": Proxy Authentication Required)`,
+			ErrKindProxyAuth},
+		{"proxy_auth 407 prefix", "got HTTP 407 from proxy", ErrKindProxyAuth},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
