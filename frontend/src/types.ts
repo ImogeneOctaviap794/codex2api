@@ -312,6 +312,10 @@ export interface UsageStats {
   tpm: number
   avg_duration_ms: number
   error_rate: number
+  // v1.7.52 上游错误可视化
+  upstream_error_rate?: number
+  retry_total_today?: number
+  retry_save_rate?: number
 }
 
 export interface UsageLog {
@@ -339,6 +343,25 @@ export interface UsageLog {
   api_key_masked: string
   account_email: string
   created_at: ISODateString
+  // v1.7.52 上游错误可视化
+  upstream_error_kind?: string
+  upstream_error_msg?: string
+  retry_count?: number
+  final_outcome?: string
+}
+
+export interface ErrorBreakdownRow {
+  kind: string
+  count: number
+  retry_success: number
+  sample_message: string
+  percent: number
+}
+
+export interface ErrorBreakdown {
+  window_hours: number
+  total_rows: number
+  rows: ErrorBreakdownRow[]
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>

@@ -24,7 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, RefreshCw, ServerCrash } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -74,6 +74,31 @@ function getStatusBadgeClassName(statusCode: number): string {
 }
 
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
+
+// upstream_error_kind 颜色映射；未识别的 kind 走默认灰色。
+function getUpstreamErrorBadgeClass(kind: string): string {
+  switch (kind) {
+    case 'overloaded':
+    case 'capacity':
+      return 'border-transparent bg-rose-500/12 text-rose-600 dark:bg-rose-500/20 dark:text-rose-300'
+    case 'rate_limit':
+      return 'border-transparent bg-amber-500/12 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300'
+    case 'processing_error':
+    case 'upstream_5xx':
+      return 'border-transparent bg-red-500/12 text-red-600 dark:bg-red-500/20 dark:text-red-300'
+    case 'auth':
+      return 'border-transparent bg-purple-500/12 text-purple-600 dark:bg-purple-500/20 dark:text-purple-300'
+    case 'context_length':
+      return 'border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300'
+    case 'content_filter':
+      return 'border-transparent bg-pink-500/12 text-pink-600 dark:bg-pink-500/20 dark:text-pink-300'
+    case 'timeout':
+    case 'client_disconnect':
+      return 'border-transparent bg-cyan-500/12 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-300'
+    default:
+      return 'border-transparent bg-slate-500/12 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
+  }
+}
 
 function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
   return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
@@ -222,6 +247,9 @@ export default function Usage() {
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
+  const upstreamErrorRate = stats?.upstream_error_rate ?? 0
+  const retryTotalToday = stats?.retry_total_today ?? 0
+  const retrySaveRate = stats?.retry_save_rate ?? 0
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
   const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
@@ -330,6 +358,36 @@ export default function Usage() {
                 {errorRate.toFixed(1)}%
               </div>
               <div className="text-[12px] text-muted-foreground">{t('usage.avgLatencyInline', { value: Math.round(avgDurationMs) })}</div>
+            </CardContent>
+          </Card>
+
+          <Card className="py-0">
+            <CardContent className="flex flex-col gap-2 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">{t('usage.upstreamErrorRateCard', '上游错误率')}</span>
+                <div className="size-10 flex items-center justify-center rounded-xl bg-rose-500/12 text-rose-600 dark:bg-rose-500/20 dark:text-rose-300">
+                  <ServerCrash className="size-[18px]" />
+                </div>
+              </div>
+              <div className="text-[28px] font-bold leading-none tracking-tighter">
+                {upstreamErrorRate.toFixed(1)}%
+              </div>
+              <div className="text-[12px] text-muted-foreground">{t('usage.upstreamErrorRateDesc', '今日有上游错误的请求占比')}</div>
+            </CardContent>
+          </Card>
+
+          <Card className="py-0">
+            <CardContent className="flex flex-col gap-2 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">{t('usage.retrySaveRateCard', '重试拯救率')}</span>
+                <div className="size-10 flex items-center justify-center rounded-xl bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300">
+                  <RefreshCw className="size-[18px]" />
+                </div>
+              </div>
+              <div className="text-[28px] font-bold leading-none tracking-tighter">
+                {retrySaveRate.toFixed(1)}%
+              </div>
+              <div className="text-[12px] text-muted-foreground">{t('usage.retrySaveRateDesc', '今日 {{count}} 次重试中拯救成功的比例', { count: retryTotalToday })}</div>
             </CardContent>
           </Card>
         </div>
@@ -510,6 +568,7 @@ export default function Usage() {
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableToken')}</TableHead>
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableCached')}</TableHead>
                       <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableFirstToken')}</TableHead>
+                      <TableHead className="text-[14px] font-semibold">{t('usage.tableUpstreamError', '上游错误')}</TableHead>
                       <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableDuration')}</TableHead>
                       <TableHead className="text-[13px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableTime')}</TableHead>
                     </TableRow>
@@ -625,6 +684,25 @@ export default function Usage() {
                               {log.first_token_ms > 1000 ? `${(log.first_token_ms / 1000).toFixed(1)}s` : `${log.first_token_ms}ms`}
                             </span>
                           ) : <span className="text-[16px] text-muted-foreground" style={{ fontFamily: "'Geist Mono', monospace" }}>-</span>}
+                        </TableCell>
+                        <TableCell>
+                          {(log.upstream_error_kind || (log.retry_count ?? 0) > 0) ? (
+                            <div className="flex items-center gap-1.5 flex-wrap" title={log.upstream_error_msg || ''}>
+                              {log.upstream_error_kind && (
+                                <Badge variant="outline" className={`text-[12px] font-medium ${getUpstreamErrorBadgeClass(log.upstream_error_kind)}`}>
+                                  {log.upstream_error_kind}
+                                </Badge>
+                              )}
+                              {(log.retry_count ?? 0) > 0 && (
+                                <Badge variant="outline" className={`text-[11px] font-medium gap-0.5 ${log.final_outcome === 'success' ? 'border-transparent bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300' : 'border-transparent bg-slate-500/12 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'}`}>
+                                  <RefreshCw className="size-3" />
+                                  {log.retry_count}
+                                </Badge>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-[14px] text-muted-foreground">-</span>
+                          )}
                         </TableCell>
                         <TableCell>
                           <span className={`text-[16px] ${log.duration_ms > 30000 ? 'text-red-500' : log.duration_ms > 10000 ? 'text-amber-500' : 'text-muted-foreground'}`} style={{ fontFamily: "'Geist Mono', monospace" }}>

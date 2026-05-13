@@ -24,6 +24,7 @@ import type {
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
+  ErrorBreakdown,
 } from './types'
 
 const BASE = '/api/admin'
@@ -131,6 +132,8 @@ export const api = {
   getHealth: () => request<HealthResponse>('/health'),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getUsageStats: () => request<UsageStats>('/usage/stats'),
+  getUsageErrorBreakdown: (hours = 24) =>
+    request<ErrorBreakdown>(`/usage/error-breakdown?hours=${hours}`),
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start && params.end) {
