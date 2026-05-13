@@ -176,6 +176,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d, /v1/messages): %v", attempt+1, reqErr)
 			lastErr = reqErr
+			captureFirstRetryReason(&firstRetryReasonMsg, reqErr.Error())
 			continue
 		}
 

@@ -869,6 +869,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			lastErr = reqErr
+			captureFirstRetryReason(&firstRetryReasonMsg, reqErr.Error())
 			continue
 		}
 
@@ -1341,6 +1342,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 			log.Printf("compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			lastErr = reqErr
+			captureFirstRetryReason(&firstRetryReasonMsg, reqErr.Error())
 			continue
 		}
 
@@ -1637,6 +1639,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			lastErr = reqErr
+			captureFirstRetryReason(&firstRetryReasonMsg, reqErr.Error())
 			continue
 		}
 
