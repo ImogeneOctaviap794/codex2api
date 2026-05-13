@@ -36,7 +36,9 @@ import (
 //   - moderation       (string)  "auto" / "low"
 //   - response_format  (string)  "url" / "b64_json"，默认 "url"（我们的扩展，
 //                                OpenAI gpt-image-1 官方只返回 b64_json）
-//   - partial_images   (int)     0-3（流式，本实现暂返回终稿）
+//   - partial_images   (int)     0-3（流式渐进预览，v1.7.50 起经 ChatCompletions
+//                                 翻译层透出为多张 markdown image content chunk；
+//                                 /v1/images/generations 内部走非流式仍返回终稿）
 //   - user             (string)  终端用户标识（仅透传到日志）
 //
 // 响应格式（与 OpenAI gpt-image-1 对齐）：

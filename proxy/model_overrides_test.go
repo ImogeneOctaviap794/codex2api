@@ -216,3 +216,55 @@ func TestTranslateStreamChunk_NonImageOutputItemDoneIgnored(t *testing.T) {
 		t.Fatalf("non-image output_item.done should return (nil, false), got (%v, %v)", chunk, done)
 	}
 }
+
+// 回归 v1.7.49 bug：metadata.image_partial_images 被透传到上游，但翻译层把
+// response.image_generation_call.partial_image 事件直接 drop 掉。
+// 修复后必须 emit 为 markdown image content chunk（和终稿同源路径）。
+func TestTranslateStreamChunk_PartialImageEmitsMarkdown(t *testing.T) {
+	b64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+	event := []byte(`{"type":"response.image_generation_call.partial_image","item_id":"ig_x","output_index":0,"sequence_number":0,"partial_image_index":0,"partial_image_b64":"` + b64 + `"}`)
+
+	chunk, done := TranslateStreamChunk(event, "gpt-image-2", "chatcmpl-x", 0)
+	if done {
+		t.Fatal("partial_image must not finish the stream")
+	}
+	if chunk == nil {
+		t.Fatal("expected content chunk for partial_image, got nil (regression: drop bug returned)")
+	}
+	s := string(chunk)
+	if !strings.Contains(s, "data:image/png;base64,"+b64) {
+		t.Fatalf("chunk missing markdown image; got %s", s)
+	}
+	if !strings.Contains(s, `"chat.completion.chunk"`) {
+		t.Fatalf("not a chat.completion.chunk; got %s", s)
+	}
+}
+
+func TestStreamTranslator_PartialImageEmitsMarkdown(t *testing.T) {
+	b64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+	event := []byte(`{"type":"response.image_generation_call.partial_image","partial_image_b64":"` + b64 + `"}`)
+
+	st := NewStreamTranslator("chatcmpl-x", "gpt-image-2", 0)
+	chunk, done := st.Translate(event)
+	if done {
+		t.Fatal("partial_image must not finish the stream")
+	}
+	if chunk == nil {
+		t.Fatal("expected content chunk, got nil (regression: drop bug returned)")
+	}
+	if !strings.Contains(string(chunk), "data:image/png;base64,"+b64) {
+		t.Fatalf("chunk missing markdown image; got %s", string(chunk))
+	}
+	if st.HasToolCalls {
+		t.Fatal("partial_image must not set HasToolCalls")
+	}
+}
+
+// partial_image 无 b64 时（理论上不会，但防御）必须静默忽略。
+func TestTranslateStreamChunk_PartialImageMissingB64Ignored(t *testing.T) {
+	event := []byte(`{"type":"response.image_generation_call.partial_image","partial_image_index":0}`)
+	chunk, done := TranslateStreamChunk(event, "gpt-image-2", "id", 0)
+	if done || chunk != nil {
+		t.Fatalf("missing partial_image_b64 should be silently ignored, got (%v, %v)", chunk, done)
+	}
+}

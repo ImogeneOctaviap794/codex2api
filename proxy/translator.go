@@ -1035,6 +1035,17 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		}
 		return newErrorResponse(errMsg), true
 
+	case "response.image_generation_call.partial_image":
+		// 渐进式预览帧：客户端通过 metadata.image_partial_images = N
+		// 让上游在终稿之前发 N 张中间帧。每帧 partial_image_b64 字段都是
+		// 一张完整的 base64 PNG，按图像生成的 SSE 顺序到达。
+		// 这里和终稿走同样的落盘路径，作为 markdown image 注入 content delta；
+		// 客户端可以收到一系列 ![image](url1) ![image](url2) ![image](finalurl)。
+		if b64 := gjson.GetBytes(eventData, "partial_image_b64").String(); b64 != "" {
+			return newContentChunk(chunkID, model, created, imageMarkdownFromBase64(b64)), false
+		}
+		return nil, false
+
 	case "response.content_part.done",
 		"response.created", "response.in_progress",
 		"response.output_item.added", "response.content_part.added",
@@ -1042,7 +1053,7 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		"response.reasoning.encrypted_content.delta", "response.reasoning.encrypted_content.done",
 		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
 		"response.image_generation_call.in_progress", "response.image_generation_call.generating",
-		"response.image_generation_call.partial_image", "response.image_generation_call.completed":
+		"response.image_generation_call.completed":
 		return nil, false
 
 	default:
@@ -1147,6 +1158,13 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		}
 		return newErrorResponse(errMsg), true
 
+	case "response.image_generation_call.partial_image":
+		// 渐进式预览帧：见 stateless Translate 路径的同名 case 说明。
+		if b64 := gjson.GetBytes(eventData, "partial_image_b64").String(); b64 != "" {
+			return newContentChunk(st.ChunkID, st.Model, st.Created, imageMarkdownFromBase64(b64)), false
+		}
+		return nil, false
+
 	case "response.content_part.done",
 		"response.created", "response.in_progress",
 		"response.content_part.added",
@@ -1154,7 +1172,7 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		"response.reasoning.encrypted_content.delta", "response.reasoning.encrypted_content.done",
 		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
 		"response.image_generation_call.in_progress", "response.image_generation_call.generating",
-		"response.image_generation_call.partial_image", "response.image_generation_call.completed":
+		"response.image_generation_call.completed":
 		return nil, false
 
 	default:
