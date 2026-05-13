@@ -31,6 +31,8 @@ type DialogLogInput struct {
 	BaseModel        string          // 虚拟模型对应的 base_model（画图场景）
 	AccountID        int64           // 命中的上游账号 ID
 	APIKeyHash       string          // 调用方 API key 的 SHA256 前 16 字节 hex（不存原文）
+	SessionID        string          // 客户端会话 ID，同一会话下多次调用共享（采购规范必填）
+	RequestID        string          // 单次调用唯一 ID，UUID（采购规范必填）
 	IsStream         bool            // 客户端 stream:true / false
 	RequestBody      json.RawMessage // 原始请求 JSON
 	ResponseBody     json.RawMessage // 完整响应 JSON（流式拼合后；非流式直接是 body）
@@ -82,6 +84,12 @@ CREATE TABLE IF NOT EXISTS dialog_logs (
 CREATE INDEX IF NOT EXISTS dialog_logs_ts_idx ON dialog_logs (ts);
 CREATE INDEX IF NOT EXISTS dialog_logs_model_idx ON dialog_logs (model);
 CREATE INDEX IF NOT EXISTS dialog_logs_account_idx ON dialog_logs (account_id);
+
+-- v1.7.54 采购规范必填字段：session_id (同会话多 call 关联) + request_id (单 call 全局唯一)
+ALTER TABLE dialog_logs ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE dialog_logs ADD COLUMN IF NOT EXISTS request_id TEXT;
+CREATE INDEX IF NOT EXISTS dialog_logs_session_idx ON dialog_logs (session_id);
+CREATE INDEX IF NOT EXISTS dialog_logs_request_idx ON dialog_logs (request_id);
 `
 	if _, err := db.conn.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("create dialog_logs: %w", err)
@@ -139,8 +147,9 @@ func (db *DB) InsertDialogLogs(ctx context.Context, batch []DialogLogInput) erro
 	const cols = `(ts, endpoint, model, base_model, account_id, api_key_hash, is_stream,
 		request_body, response_body, reasoning_content, tool_calls,
 		prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
-		duration_ms, status_code, service_tier, reasoning_effort)`
-	const numCols = 19
+		duration_ms, status_code, service_tier, reasoning_effort,
+		session_id, request_id)`
+	const numCols = 21
 
 	// 分块以避免单 SQL 参数过多（PG 上限 65535）
 	const maxRowsPerStmt = 100
@@ -203,6 +212,8 @@ func (db *DB) InsertDialogLogs(ctx context.Context, batch []DialogLogInput) erro
 				r.StatusCode,
 				nullableString(r.ServiceTier),
 				nullableString(r.ReasoningEffort),
+				nullableString(r.SessionID),
+				nullableString(r.RequestID),
 			)
 		}
 
