@@ -299,6 +299,71 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	h.logUsage(input)
 }
 
+// FinalOutcome 常量。usage_logs.final_outcome 字段值，前端按此着色 / 翻译。
+const (
+	OutcomeSuccess        = "success"
+	OutcomeUpstreamFailed = "upstream_failed"
+	OutcomeClientGone     = "client_gone"
+	OutcomeTimeout        = "timeout"
+)
+
+// annotateUpstreamFailure 把上游失败信息填充到 UsageLogInput 的 4 个新字段。
+// errMsg 可来自 SSE response.failed 事件 或 HTTP error body；空字符串表示无失败信息。
+// attempt 是 0 起的当前尝试次数（用作 retry_count）。
+// outcome 必须是 OutcomeXxx 常量之一。
+//
+// 注意：errMsg 非空但分类为空时，仍然写入原始 msg + kind="unknown"，保证可观测性。
+func annotateUpstreamFailure(input *database.UsageLogInput, errMsg string, attempt int, outcome string) {
+	if input == nil {
+		return
+	}
+	if errMsg != "" {
+		input.UpstreamErrorKind = ClassifyUpstreamError(errMsg)
+		input.UpstreamErrorMsg = TruncateErrMsg(errMsg, 500)
+	}
+	input.RetryCount = attempt
+	input.FinalOutcome = outcome
+}
+
+// classifyHTTPErrorBody 从 HTTP 错误响应体提取 error.message 后分类。
+// 兼容两种格式：{"error":{"message":"..."}} 和原始字符串。
+func classifyHTTPErrorBody(errBody []byte) (kind, msg string) {
+	if len(errBody) == 0 {
+		return "", ""
+	}
+	extracted := gjson.GetBytes(errBody, "error.message").String()
+	if extracted == "" {
+		extracted = string(errBody)
+	}
+	return ClassifyUpstreamError(extracted), TruncateErrMsg(extracted, 500)
+}
+
+// finalOutcomeForStream 在流式 / 非流式上游响应"读完"之后，根据 outcome 和
+// SSE 流内是否捕获到 response.failed 文案，决定 usage_logs.final_outcome 取值。
+//
+//   - 上游 SSE 显式抛 response.failed（lastFailedErrMsg != ""）→ upstream_failed
+//   - outcome.logStatusCode == 200 + 无失败文案 → success
+//   - outcome.failureKind 含 "client" → client_gone
+//   - outcome.failureKind 含 "timeout"/"deadline" → timeout
+//   - 其他失败 → upstream_failed
+func finalOutcomeForStream(outcome streamOutcome, lastFailedErrMsg string) string {
+	if lastFailedErrMsg != "" {
+		return OutcomeUpstreamFailed
+	}
+	if outcome.logStatusCode == http.StatusOK && !outcome.penalize {
+		return OutcomeSuccess
+	}
+	kindLower := strings.ToLower(outcome.failureKind)
+	switch {
+	case strings.Contains(kindLower, "client"):
+		return OutcomeClientGone
+	case strings.Contains(kindLower, "timeout"), strings.Contains(kindLower, "deadline"):
+		return OutcomeTimeout
+	default:
+		return OutcomeUpstreamFailed
+	}
+}
+
 // extractReasoningEffort 从请求体提取推理强度
 // 支持 reasoning.effort（Responses API）和 reasoning_effort（Chat Completions API）
 func extractReasoningEffort(body []byte) string {
@@ -810,7 +875,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			logInput := &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
 				Model:            model,
@@ -821,7 +886,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				UpstreamEndpoint: "/v1/responses",
 				Stream:           isStream,
 				ServiceTier:      serviceTier,
-			})
+			}
+			if kind, msg := classifyHTTPErrorBody(errBody); kind != "" || msg != "" {
+				logInput.UpstreamErrorKind = kind
+				logInput.UpstreamErrorMsg = msg
+			}
+			logInput.RetryCount = attempt
+			logInput.FinalOutcome = OutcomeUpstreamFailed
+			h.logUsageForRequest(c, logInput)
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
 			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
@@ -1075,6 +1147,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		annotateUpstreamFailure(logInput, lastFailedErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
@@ -1265,7 +1338,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			excludeAccounts[account.ID()] = true
 
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			compactErrInput := &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses/compact",
 				Model:            model,
@@ -1275,7 +1348,14 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				InboundEndpoint:  "/v1/responses/compact",
 				UpstreamEndpoint: "/v1/responses/compact",
 				ServiceTier:      serviceTier,
-			})
+			}
+			if kind, msg := classifyHTTPErrorBody(errBody); kind != "" || msg != "" {
+				compactErrInput.UpstreamErrorKind = kind
+				compactErrInput.UpstreamErrorMsg = msg
+			}
+			compactErrInput.RetryCount = attempt
+			compactErrInput.FinalOutcome = OutcomeUpstreamFailed
+			h.logUsageForRequest(c, compactErrInput)
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
 			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
@@ -1306,7 +1386,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
 
 		totalDuration := int(time.Since(start).Milliseconds())
-		h.logUsageForRequest(c, &database.UsageLogInput{
+		compactOKInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/responses/compact",
 			Model:            model,
@@ -1323,7 +1403,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			InboundEndpoint:  "/v1/responses/compact",
 			UpstreamEndpoint: "/v1/responses/compact",
 			ServiceTier:      resolvedServiceTier,
-		})
+		}
+		compactOKInput.RetryCount = attempt
+		compactOKInput.FinalOutcome = OutcomeSuccess
+		h.logUsageForRequest(c, compactOKInput)
 
 		h.store.Release(account)
 		// 画图场景对外统一显示 gpt-5.4
@@ -1546,7 +1629,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			chatErrInput := &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",
 				Model:            model,
@@ -1557,7 +1640,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				UpstreamEndpoint: "/v1/responses",
 				Stream:           isStream,
 				ServiceTier:      serviceTier,
-			})
+			}
+			if kind, msg := classifyHTTPErrorBody(errBody); kind != "" || msg != "" {
+				chatErrInput.UpstreamErrorKind = kind
+				chatErrInput.UpstreamErrorMsg = msg
+			}
+			chatErrInput.RetryCount = attempt
+			chatErrInput.FinalOutcome = OutcomeUpstreamFailed
+			h.logUsageForRequest(c, chatErrInput)
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
 			if (isRetryableStatus(resp.StatusCode) || isUpstreamToolNotSupported(resp.StatusCode, errBody) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
@@ -1825,6 +1915,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		annotateUpstreamFailure(logInput, lastFailedErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()

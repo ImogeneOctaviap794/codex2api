@@ -193,7 +193,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			msgErrInput := &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/messages",
 				Model:            model,
@@ -203,7 +203,14 @@ func (h *Handler) Messages(c *gin.Context) {
 				InboundEndpoint:  "/v1/messages",
 				UpstreamEndpoint: "/v1/responses",
 				Stream:           isStream,
-			})
+			}
+			if kind, msg := classifyHTTPErrorBody(errBody); kind != "" || msg != "" {
+				msgErrInput.UpstreamErrorKind = kind
+				msgErrInput.UpstreamErrorMsg = msg
+			}
+			msgErrInput.RetryCount = attempt
+			msgErrInput.FinalOutcome = OutcomeUpstreamFailed
+			h.logUsageForRequest(c, msgErrInput)
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
 			if (isRetryableStatus(resp.StatusCode) || isDeactivatedWorkspace(errBody)) && attempt < maxRetries {
@@ -440,6 +447,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		annotateUpstreamFailure(logInput, lastFailedErrMsg, attempt, finalOutcomeForStream(outcome, lastFailedErrMsg))
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()

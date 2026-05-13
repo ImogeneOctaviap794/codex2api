@@ -298,6 +298,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
 	api.GET("/usage/stats", h.GetUsageStats)
+	api.GET("/usage/error-breakdown", h.GetUsageErrorBreakdown)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
@@ -2086,6 +2087,29 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 		expiresAt: time.Now().Add(10 * time.Second),
 	})
 	c.JSON(http.StatusOK, stats)
+}
+
+// GetUsageErrorBreakdown 返回最近窗口内按 upstream_error_kind 聚合的错误分布。
+// Query 参数:
+//   - hours: 窗口小时数 (1..168)，默认 24
+func (h *Handler) GetUsageErrorBreakdown(c *gin.Context) {
+	hours, _ := strconv.Atoi(c.DefaultQuery("hours", "24"))
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 168 {
+		hours = 168
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	breakdown, err := h.db.GetUsageErrorBreakdown(ctx, hours)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, breakdown)
 }
 
 // GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
