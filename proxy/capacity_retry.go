@@ -55,6 +55,83 @@ func isCapacityError(errMsg string) bool {
 	return false
 }
 
+// Upstream error kind 常量。用作 usage_logs.upstream_error_kind 字段值，
+// 也是前端 UI / API 聚合分类的稳定 token（不要随便改名，前端有对应翻译）。
+const (
+	ErrKindOverloaded       = "overloaded"        // "Our servers are currently overloaded"
+	ErrKindCapacity         = "capacity"          // "at capacity" / "try a different model" 家族
+	ErrKindProcessingError  = "processing_error"  // "An error occurred while processing your request"
+	ErrKindRateLimit        = "rate_limit"        // 429 / "rate limit exceeded"
+	ErrKindAuth             = "auth"              // 401 / unauthorized
+	ErrKindContextLength    = "context_length"    // context length exceeded
+	ErrKindContentFilter    = "content_filter"    // content policy / safety
+	ErrKindTimeout          = "timeout"           // 上游超时
+	ErrKindClientDisconnect = "client_disconnect" // 客户端断开
+	ErrKindUpstream5xx      = "upstream_5xx"      // 其他 5xx
+	ErrKindUpstream4xx      = "upstream_4xx"      // 其他 4xx
+	ErrKindUnknown          = "unknown"           // 兜底
+)
+
+// ClassifyUpstreamError 把 response.failed 事件携带的 error.message 文本分类到
+// 稳定的 kind token。空字符串返回 ""（表示无错误）。
+//
+// 用于 usage_logs.upstream_error_kind 字段，让前端 UI 可以稳定地按错误类型
+// 聚合 / 着色 / 国际化，不依赖随时间漂移的英文文案。
+func ClassifyUpstreamError(errMsg string) string {
+	if errMsg == "" {
+		return ""
+	}
+	lower := strings.ToLower(errMsg)
+
+	switch {
+	case strings.Contains(lower, "currently overloaded") ||
+		strings.Contains(lower, "servers are currently"):
+		return ErrKindOverloaded
+	case strings.Contains(lower, "at capacity") ||
+		strings.Contains(lower, "try a different mode") ||
+		strings.Contains(lower, "try a different model"):
+		return ErrKindCapacity
+	case strings.Contains(lower, "an error occurred while processing your request"):
+		return ErrKindProcessingError
+	case strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "too many requests"):
+		return ErrKindRateLimit
+	case strings.Contains(lower, "context length") ||
+		strings.Contains(lower, "maximum context") ||
+		strings.Contains(lower, "context_length_exceeded"):
+		return ErrKindContextLength
+	case strings.Contains(lower, "content policy") ||
+		strings.Contains(lower, "safety") ||
+		strings.Contains(lower, "content_filter"):
+		return ErrKindContentFilter
+	case strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "invalid auth") ||
+		strings.Contains(lower, "authentication"):
+		return ErrKindAuth
+	case strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "timed out") ||
+		strings.Contains(lower, "deadline"):
+		return ErrKindTimeout
+	case strings.Contains(lower, "try again later"):
+		// 通用"稍后重试"——放在最后兜底，避免和上面更具体的分类抢
+		return ErrKindOverloaded
+	default:
+		return ErrKindUnknown
+	}
+}
+
+// TruncateErrMsg 截断错误消息到指定字节数，用于持久化到 usage_logs.upstream_error_msg。
+// 默认 500 字节够保留完整 OpenAI 错误模板（包含 request ID 等关键信息）。
+func TruncateErrMsg(errMsg string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = 500
+	}
+	if len(errMsg) <= maxBytes {
+		return errMsg
+	}
+	return errMsg[:maxBytes]
+}
+
 // extractResponseFailedErrMsg 从 Codex Responses SSE 的 `response.failed`
 // 事件体里提取 error.message 字段。若字段缺失返回空字符串。
 func extractResponseFailedErrMsg(eventData []byte) string {

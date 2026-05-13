@@ -36,6 +36,59 @@ func TestIsCapacityError(t *testing.T) {
 	}
 }
 
+func TestClassifyUpstreamError(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{"empty returns empty", "", ""},
+		{"overloaded (90% production)",
+			"Our servers are currently overloaded. Please try again later.", ErrKindOverloaded},
+		{"capacity classic",
+			"Selected model is at capacity. Please try a different mode", ErrKindCapacity},
+		{"processing error (10% production)",
+			"An error occurred while processing your request. You can retry your request, or contact us...", ErrKindProcessingError},
+		{"rate limit", "Rate limit exceeded", ErrKindRateLimit},
+		{"too many requests", "Too Many Requests", ErrKindRateLimit},
+		{"context length", "This model's maximum context length is 128000 tokens", ErrKindContextLength},
+		{"content filter", "Your request was blocked by content policy", ErrKindContentFilter},
+		{"auth", "Invalid authentication credentials", ErrKindAuth},
+		{"timeout", "Request timed out", ErrKindTimeout},
+		{"try again later tail → overloaded", "Service unavailable. Try again later.", ErrKindOverloaded},
+		{"unknown garbage", "something exploded server-side", ErrKindUnknown},
+		// 优先级测试：overloaded 优先于 try again later
+		{"overloaded takes precedence over try again later",
+			"Our servers are currently overloaded. Please try again later.", ErrKindOverloaded},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ClassifyUpstreamError(c.msg); got != c.want {
+				t.Errorf("ClassifyUpstreamError(%q) = %q, want %q", c.msg, got, c.want)
+			}
+		})
+	}
+}
+
+func TestTruncateErrMsg(t *testing.T) {
+	cases := []struct {
+		in       string
+		maxBytes int
+		want     string
+	}{
+		{"short", 500, "short"},
+		{"exact", 5, "exact"},
+		{"hello world", 5, "hello"},
+		{"", 100, ""},
+		{"default", 0, "default"}, // 0 → 用默认 500
+	}
+	for _, c := range cases {
+		if got := TruncateErrMsg(c.in, c.maxBytes); got != c.want {
+			t.Errorf("TruncateErrMsg(%q,%d) = %q, want %q", c.in, c.maxBytes, got, c.want)
+		}
+	}
+}
+
 func TestTruncateForLog(t *testing.T) {
 	cases := []struct {
 		in     string
