@@ -18,7 +18,7 @@
 | 容器 body 上限 | **64 MB**（`CODEX_MAX_REQUEST_BODY_SIZE_MB=64`）|
 | Dialog 采集 | ✅ 启用（默认 true，写入 PG `dialog_logs`）|
 | Prefer-paid 调度 | Admin 面板运行时开关（默认 OFF = prefer_free）|
-| 本地 git HEAD | `6380626`（`merge/upstream-2026-05-10`，未 push）|
+| 本地 git HEAD | `ead9ef8`（`merge/upstream-2026-05-10`，已 push origin main + merge 分支）|
 
 ## 2. SSH 接入
 
@@ -144,8 +144,9 @@ $SSH "sed -i 's|:<NEW_PORT>|:<OLD_PORT>|' /www/server/panel/vhost/nginx/cx.wyzai
 ## 6. 常用运维
 
 ```bash
-# 健康
-curl -s http://127.0.0.1:8122/health
+# 健康（当前端口以 docker ps 为准）
+curl -s http://127.0.0.1:8123/health
+curl -s https://cx.wyzai.top/health
 docker logs codex2api --tail 200 2>&1 | grep -vE '历史数据修复'
 
 # plan_type 实时同步日志（v1.7.29+）
@@ -180,16 +181,33 @@ docker exec codex2api-postgres psql -U codex2api -d codex2api -c \
 | v1.7.50-partial-images | 8122 | 2026-05-13 | 修复 `metadata.image_partial_images` 不生效：Translator 在两条路径上都把 `response.image_generation_call.partial_image` 事件静默丢弃，现在渐进预览帧会输出为单独的 markdown image content chunk（N partial + 1 final）|
 | **v1.7.51-overload-retry** | **8123** | **2026-05-13** | **扩充 capacity 重试 marker：原有 `at capacity` / `try a different model` 只能识别 codex CLI 客户端渲染文案，未命中上游真实载荷。10min 实测样本：886 请求 / 149 `response.failed` = **17% 隐藏故障率**，全部漏出到客户端。新增 markers 覆盖 `Our servers are currently overloaded` (90%) / `An error occurred while processing your request` (10%) / `try again later`，透明重试机制现在能实际拦住这些错误** |
 
-## 8. 不要再做的事
+## 8. 不要再做的事 / 踩过的坑
 
 - ❌ **基于 cooldown 时长推断 plan**：v1.7.29 之前误伤过 plus 被 7d ban 的合法账号
 - ❌ **id_token 解析回滚 plan_type**：用户拒绝，已废弃
 - ❌ **多步骤 bash 命令串成一行**：stdout buffer 误判卡死
 - ❌ **全局改 `/` 的 buffering**：会关掉 new-api UI 静态资源缓冲
 - ❌ **删除跳板 `sub_filter`**：前端暗色主题依赖它
+- ❌ **拿客户端看到的错误文案去定 fix（v1.7.51 教训）**：codex CLI 会把任何 `response.failed` 事件都渲染成 `Selected model is at capacity. Please try a different model.` 这句兜底文案。要验证上游真实错误文案，查 `dialog_logs.response_body → 序列化 type=“response.failed”.response.error.message`（例如 `Our servers are currently overloaded`）
+- ❌ **PG 78GB+ 全表 `::text ILIKE` 扫描**：TOAST jsonb 全量进内存会超时。必须加 `WHERE ts >= now() - interval 'N minutes'` 限定时间窗口
 - ✅ **plan_type 校正的正道**：让 OpenAI 的 429 `error.plan_type` 自动同步（v1.7.29 已实现）
+- ✅ **`isCapacityError` 不要名不副实重命名**：语义已泛化为"上游瞬时可重试错误"，但函数名保留可减少 4 处调用点的变动及测试破坏面
 
-## 9. 常量速查
+## 9. 数据规模快照（2026-05-13 实测）
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| `dialog_logs` 表总体积 | **78 GB** | 6.86 天累积，主表 27 MB + TOAST 77 GB + 索引 9 MB |
+| `dialog_logs` 行数 | 12.86 万 | 平均 636 KB/行 |
+| 月增量预估 | **~341 GB** | 同速率下 30 天 |
+| `request_body` 含 base64 image | 23% 行 / **73% 体积** | 平均 1.7 MB/行（未含图的仅 178 KB）|
+| `/data/codex2api-images` | 4.6 GB / 2715 张 | 20.83 天累积，hash 去重后增长稳定 |
+| 月增图片 | ~6.6 GB | v1.7.50 后partial 帧会提高 ~1.5-2x |
+
+> 优化机会：写入前剥离 `request_body` 中的 data URL base64 可砍 **~60% 表体积**
+> （月省 ~210 GB）。代码 ~30 行 + 1 个测试。
+
+## 10. 常量速查
 
 | 常量 | 值 | 位置 |
 |---|---|---|
@@ -201,7 +219,7 @@ docker exec codex2api-postgres psql -U codex2api -d codex2api -c \
 | MaxRequestBodySize 默认 | 32 MB | `security/validator.go` |
 | CF idle timeout | 100s | Cloudflare 硬限 |
 
-## 10. 关键环境变量
+## 11. 关键环境变量
 
 ```bash
 # /data/codex2api/.env
@@ -212,7 +230,7 @@ CODEX_TRANSPORT_MODE=standard           # TLS 指纹：standard=Go 原生 / utls
 # 其余参数（DB/Redis/image/admin 等）见 `.env` 本体
 ```
 
-## 11. v1.7.48 合并变更要点（2026-05-10）
+## 12. v1.7.48 合并变更要点（2026-05-10）
 
 ### 功能层
 - **Prefer-paid 调度**（admin 运行时开关）：ON 时 plus/pro/team 优先派发，free 兜底；OFF（默认）时 prefer_free 最省额度
