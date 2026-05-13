@@ -2,13 +2,13 @@
 
 > 真值以 `docker ps` 为准，不信文档。文档滞后时以线上状态为准并反向更新本文。
 
-## 1. 线上状态（截至 2026-05-13 11:30）
+## 1. 线上状态（截至 2026-05-13 14:18）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.49-tool-calls-fix`（`latest`）|
+| 镜像 | `codex2api:v1.7.50-partial-images`（`latest`）|
 | 容器 | `codex2api` |
-| 端口 | `8121`（nginx upstream 指向 127.0.0.1:8121）|
+| 端口 | `8122`（nginx upstream 指向 127.0.0.1:8122）|
 | 部署目录 | `/data/codex2api/` |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`, Redis `codex2api-redis`, 网络 `codex2api_codex2api-net` |
@@ -18,7 +18,7 @@
 | 容器 body 上限 | **64 MB**（`CODEX_MAX_REQUEST_BODY_SIZE_MB=64`）|
 | Dialog 采集 | ✅ 启用（默认 true，写入 PG `dialog_logs`）|
 | Prefer-paid 调度 | Admin 面板运行时开关（默认 OFF = prefer_free）|
-| 本地 git HEAD | `5194ab7`（`merge/upstream-2026-05-10`，未 push）|
+| 本地 git HEAD | `bb9d5ec`（`merge/upstream-2026-05-10`，未 push）|
 
 ## 2. SSH 接入
 
@@ -40,10 +40,10 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 ```bash
 SSH='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP='sshpass -p f3t7uCBeTCizT12 scp -P 22222 -o StrictHostKeyChecking=no'
-OLD=8121; NEW=8122; TAG=v1.7.50-xxx
+OLD=8122; NEW=8123; TAG=v1.7.51-xxx
 ```
 
-> **下次端口**：8121 → 8122（或 8123，都空着；切忌选 8120 = sms-relay）
+> **下次端口**：8122 → 8123（或回轮 8121；切忌选 8120 = sms-relay）
 >
 > **起容器前先验空**：`ss -tlnp | grep ":81[12][0-9]"` 确认目标端口无人监听
 
@@ -176,7 +176,8 @@ docker exec codex2api-postgres psql -U codex2api -d codex2api -c \
 | v1.7.45-sse-keepalive | 8122 | 2026-05-04 | SSE/JSON 双路径 keepalive 防 CF 100s idle |
 | v1.7.47-prefer-paid | 8125 | 2026-05-08 | 付费账号优先 Free 兜底（admin 开关）+ Dialog logs 异步采集（⚠️ 代码曾仅在服务器，已合并回本地 9fcd50b）|
 | v1.7.48-upstream-may10-paid | 8123 | 2026-05-10 | upstream port（流式 usage / 5h 紧迫性 / 工具参数剥离 / validation 扩充）+ 合并回 v1.7.47 的 prefer-paid & dialog logs + 413 提到 64MB |
-| **v1.7.49-tool-calls-fix** | **8121** | **2026-05-13** | **修复非流式 ChatCompletions tool_calls 丢失：从 `response.output_item.done` 收 function_call（上游不一定在 `completed.output[]` 回填）**，stream=true 不受影响 |
+| v1.7.49-tool-calls-fix | 8121 | 2026-05-13 | 修复非流式 ChatCompletions tool_calls 丢失：从 `response.output_item.done` 收 function_call（上游不一定在 `completed.output[]` 回填），stream=true 不受影响 |
+| **v1.7.50-partial-images** | **8122** | **2026-05-13** | **修复 `metadata.image_partial_images` 不生效：Translator 在两条路径上都把 `response.image_generation_call.partial_image` 事件静默丢弃，现在渐进预览帧会输出为单独的 markdown image content chunk（N partial + 1 final）**|
 
 ## 8. 不要再做的事
 
@@ -203,7 +204,7 @@ docker exec codex2api-postgres psql -U codex2api -d codex2api -c \
 
 ```bash
 # /data/codex2api/.env
-CODEX_PORT=8121                         # 当前端口（随蓝绿轮换）
+CODEX_PORT=8122                         # 当前端口（随蓝绿轮换）
 CODEX_MAX_REQUEST_BODY_SIZE_MB=64       # 请求体上限，默认 32MB；v1.7.48 起调到 64MB 解决 413
 DIALOG_COLLECTION_ENABLED=true          # 对话采集总开关（默认 true，启动级）；false=不创建实例
 CODEX_TRANSPORT_MODE=standard           # TLS 指纹：standard=Go 原生 / utls_chrome=仿 Chrome
