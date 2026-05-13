@@ -1697,11 +1697,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				case "response.function_call_arguments.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
 				case "response.output_item.done":
-					// Bug 2 修复：image_generation_call 终稿出现在 output_item.done 里，
-					// 非流式模式下把 base64 转成 markdown image URL 拼进 content。
-					if parsed.Get("item.type").String() == "image_generation_call" {
-						if b64 := parsed.Get("item.result").String(); b64 != "" {
+					item := parsed.Get("item")
+					switch item.Get("type").String() {
+					case "image_generation_call":
+						// Bug 2 修复：image_generation_call 终稿出现在 output_item.done 里，
+						// 非流式模式下把 base64 转成 markdown image URL 拼进 content。
+						if b64 := item.Get("result").String(); b64 != "" {
 							fullContent.WriteString(imageMarkdownFromBase64(b64))
+						}
+					case "function_call":
+						// 工具调用终稿：流式分支通过 output_item.added + delta 增量拼装，
+						// 非流式直接从 done 收集即可，比依赖 response.completed.output[] 更鲁棒
+						// （上游有时不会把 function_call 回填进 completed.output）。
+						if tc := ExtractToolCallFromDoneEvent(data); tc != nil {
+							toolCalls = append(toolCalls, *tc)
 						}
 					}
 				case "response.completed":
@@ -1709,8 +1718,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 从 response.output 提取 function_call 项
-					toolCalls = ExtractToolCallsFromOutput(data)
+					// Fallback：兼容仅在 completed.output[] 暴露 function_call 的上游变体
+					if len(toolCalls) == 0 {
+						toolCalls = ExtractToolCallsFromOutput(data)
+					}
 					gotTerminal = true
 					return false
 				case "response.failed":

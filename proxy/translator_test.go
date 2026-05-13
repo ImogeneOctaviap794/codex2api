@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -428,6 +429,77 @@ func TestStreamTranslator_MultipleFunctionCalls(t *testing.T) {
 
 	if st.nextIdx != 2 {
 		t.Fatalf("expected nextIdx 2, got %d", st.nextIdx)
+	}
+}
+
+func TestExtractToolCallFromDoneEvent(t *testing.T) {
+	// 回归用例：非流式 ChatCompletions 必须从 output_item.done 收集 function_call
+	// （上游有时不会把 function_call 回填进 response.completed.output[]，导致 tool_calls 丢失）。
+	tests := []struct {
+		name      string
+		event     string
+		wantNil   bool
+		wantID    string
+		wantName  string
+		wantArgs  string
+	}{
+		{
+			name: "function_call done with full arguments",
+			event: `{"type":"response.output_item.done","item":{
+				"type":"function_call","call_id":"call_CKY3","name":"get_weather",
+				"arguments":"{\"city\":\"北京\",\"unit\":\"celsius\"}","status":"completed"}}`,
+			wantID: "call_CKY3", wantName: "get_weather",
+			wantArgs: `{"city":"北京","unit":"celsius"}`,
+		},
+		{
+			name:    "image_generation_call must return nil",
+			event:   `{"type":"response.output_item.done","item":{"type":"image_generation_call","result":"BASE64..."}}`,
+			wantNil: true,
+		},
+		{
+			name:    "message item must return nil",
+			event:   `{"type":"response.output_item.done","item":{"type":"message","content":[]}}`,
+			wantNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractToolCallFromDoneEvent([]byte(tt.event))
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("expected non-nil tool call")
+			}
+			if got.ID != tt.wantID || got.Name != tt.wantName || got.Arguments != tt.wantArgs {
+				t.Fatalf("mismatch: got %+v want id=%s name=%s args=%s",
+					got, tt.wantID, tt.wantName, tt.wantArgs)
+			}
+		})
+	}
+}
+
+func TestBuildCompactResponseToolCallsLossRegression(t *testing.T) {
+	// 回归 v1.7.48 的 bug：非流式 ChatCompletions 调用工具时返回 content="" + finish_reason="stop"。
+	// 修复后必须输出 finish_reason="tool_calls" + message.tool_calls。
+	tc := []ToolCallResult{{
+		ID: "call_CKY3", Name: "get_weather",
+		Arguments: `{"city":"北京","unit":"celsius"}`,
+	}}
+	usage := &UsageInfo{InputTokens: 67, OutputTokens: 23, TotalTokens: 90}
+	body := BuildCompactResponse("chatcmpl-x", "gpt-5.5", 1778641986, "", tc, usage)
+
+	if !bytes.Contains(body, []byte(`"finish_reason":"tool_calls"`)) {
+		t.Fatalf("expected finish_reason=tool_calls, got: %s", body)
+	}
+	if !bytes.Contains(body, []byte(`"name":"get_weather"`)) {
+		t.Fatalf("expected tool_calls.name=get_weather, got: %s", body)
+	}
+	if !bytes.Contains(body, []byte(`"content":null`)) {
+		t.Fatalf("expected content=null when only tool_calls, got: %s", body)
 	}
 }
 

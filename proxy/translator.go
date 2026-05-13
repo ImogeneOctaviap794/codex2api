@@ -1276,6 +1276,20 @@ func extractUsageFromResult(usage gjson.Result) *UsageInfo {
 	}
 }
 
+// ExtractToolCallFromDoneEvent 从 response.output_item.done 事件提取 function_call。
+// 非 function_call 项返回 nil。OpenAI Responses 规范保证 done 事件 item.arguments 已是完整字符串。
+func ExtractToolCallFromDoneEvent(eventData []byte) *ToolCallResult {
+	item := gjson.GetBytes(eventData, "item")
+	if item.Get("type").String() != "function_call" {
+		return nil
+	}
+	return &ToolCallResult{
+		ID:        item.Get("call_id").String(),
+		Name:      item.Get("name").String(),
+		Arguments: item.Get("arguments").String(),
+	}
+}
+
 // ExtractToolCallsFromOutput 从 response.completed 事件的 output 数组中提取 function_call 项
 func ExtractToolCallsFromOutput(eventData []byte) []ToolCallResult {
 	var toolCalls []ToolCallResult
