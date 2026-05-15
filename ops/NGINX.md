@@ -6,10 +6,13 @@
 客户端 → CF(橙云, 100s idle)
        → 跳板(.23 / .55 CF DNS 轮询)
        → new-api-horizon:30002
-       → cx.wyzai.top
-       → codex2api:8122
+       → cx.wyzai.top                          ← node2 nginx、SSL 终结
+       → http://10.10.0.2:8104                 ← WireGuard 隧道，同 IDC RTT ~0.6ms
+       → codex-node docker codex2api (内 8123)
        → OpenAI
 ```
+
+**2026-05-15 架构调整**：upstream 从 `127.0.0.1:8122/8123` 改为 `10.10.0.2:8104`。node2 仅留 nginx + PG，应用层迁 codex-node。详见 `ARCHITECTURE.md`。
 
 shell.wyzai.top 的 CF DNS 为两条 A 记录负载均衡：
 - 156.238.226.23（SSH 18604）
@@ -57,7 +60,7 @@ location ^~ /v1/ {
 
 **client_max_body_size 500m**（2026-04-27 修，之前继承全局 50m 经常 413）
 
-**关键配置（在 `proxy_pass http://127.0.0.1:8122;` 之后）**：
+**关键配置（在 `proxy_pass http://10.10.0.2:8104;` 之后）**：
 
 ```nginx
 proxy_buffering off;
@@ -80,9 +83,10 @@ send_timeout 86400s;
 ## 5. 如果仍复现 decode error
 
 按优先级排查：
-1. **Cloudflare 100s idle 超时**（橙云硬限）：需要 CF DNS 灰云，或靠 `codex2api` 的 SSE/JSON keepalive ticker（v1.7.45+ 已发 10s 间隔空 chunk）
-2. **new-api-horizon 渠道 timeout**：K8s Pod 默认渠道超时，管理后台把 cx.wyzai.top 渠道 timeout 调到 300s+
-3. **代码层**：v1.7.45 已发 `X-Accel-Buffering: no` 和 keepalive，不必再改
+1. **WireGuard 隧道中断**（2026-05-15+）：`wg show wg0 latest-handshakes` 查握手时间，ping `10.10.0.2`。隧道挂了所有请求会 502
+2. **Cloudflare 100s idle 超时**（橙云硬限）：需要 CF DNS 灰云，或靠 `codex2api` 的 SSE/JSON keepalive ticker（v1.7.45+ 已发 10s 间隔空 chunk）
+3. **new-api-horizon 渠道 timeout**：K8s Pod 默认渠道超时，管理后台把 cx.wyzai.top 渠道 timeout 调到 300s+
+4. **代码层**：v1.7.45 已发 `X-Accel-Buffering: no` 和 keepalive，不必再改
 
 ## 6. 验证 command
 
@@ -90,6 +94,94 @@ send_timeout 86400s;
 # 跳板
 curl https://shell.wyzai.top/v1/models   # 401（缺 key 正常），首字节 0.21-0.30s
 
-# Node2
+# Node2 (公网 → nginx → WG → codex-node)
 curl -s https://cx.wyzai.top/health
+
+# WG 隧道连通性（在 node2 上）
+ping -c 3 10.10.0.2
+curl -s http://10.10.0.2:8104/health
 ```
+
+## 7. WireGuard 隧道透明代理
+
+- **服务端**：node2 (`10.10.0.1:51820/UDP`)，systemd `wg-quick@wg0`
+- **客户端**：codex-node (`10.10.0.2`)，PersistentKeepalive 25s
+- **nginx 在 node2 上只需以普通 HTTP 反代 `10.10.0.2:8104`**，WG 对 nginx 透明，不需额外配置
+- RTT ~0.6ms（同 IDC Manassas），与原 `127.0.0.1` 本机反代的性能几乎一致
+- 详见 `ARCHITECTURE.md`
+
+## 8. 图床 `img.niji.edu.rs`（混合 try_files + WG 反代）
+
+> 2026-05-15 迁移后，图生成由 codex-node 应用层写入；URL 形如 `https://img.niji.edu.rs/<sha256_8B>.png`。
+>
+> 老图 7.8GB 仍在 node2 `/data/codex2api-images/`（不迁，迁了费工无收益）；新图（5/15 19:30 后）在 codex-node `/data/codex2api-images/`，由 `nginx:alpine` 容器 serve。
+
+**文件**：`/www/server/panel/vhost/nginx/img.niji.edu.rs.conf`
+
+```nginx
+server {
+    listen 80;
+    server_name img.niji.edu.rs;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name img.niji.edu.rs;
+
+    ssl_certificate /www/server/panel/vhost/letsencrypt/img.niji.edu.rs/fullchain.pem;
+    ssl_certificate_key /www/server/panel/vhost/letsencrypt/img.niji.edu.rs/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers EECDH+CHACHA20:EECDH+AES128:RSA+AES128:EECDH+AES256:RSA+AES256;
+    ssl_prefer_server_ciphers on;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # 老图本地读，找不到 fallback 走 WG 到 codex-node
+    location ~* \.(png|jpg|jpeg|webp)$ {
+        root /data/codex2api-images;
+        try_files $uri @codex_node;
+        add_header Cache-Control "public, immutable, max-age=2592000";
+        access_log off;
+    }
+
+    location @codex_node {
+        proxy_pass http://10.10.0.2:8888;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        add_header Cache-Control "public, immutable, max-age=2592000";
+        access_log off;
+    }
+
+    location / { return 404; }
+
+    access_log /www/wwwlogs/img.niji.edu.rs.log;
+    error_log /www/wwwlogs/img.niji.edu.rs.error.log;
+}
+```
+
+**codex-node 上游 nginx:alpine 容器配置**（`/tmp/codex-images-nginx.conf`，挂载到容器 `/etc/nginx/conf.d/default.conf`）：
+
+```nginx
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    location ~* \.(png|jpe?g|webp)$ {
+        add_header Cache-Control "public, immutable, max-age=2592000";
+        access_log off;
+        try_files $uri =404;
+    }
+    location = /health { return 200 'ok'; access_log off; }
+    location / { return 404; }
+}
+```
+
+**关键设计**：
+
+- `try_files $uri @codex_node`：老图先尝试 node2 本地（最快 0ms），找不到再 fallback WG 反代（+0.6ms RTT）
+- 文件名是 SHA-256 前 8B hex（16 字符），全局唯一不冲突，老图新图共享同一命名空间无歧义
+- `codex2api` 容器**不**暴露 `/images/`，静态服务整体交给 `codex-images-nginx` 容器（`nginx:alpine`，只读挂盘 `/data/codex2api-images:ro`）
+- 改完 nginx 必须 `nginx -t && nginx -s reload`，宝塔 vhost 改完不要忘 reload
+
+**部署/启停**：见 `DEPLOYMENT.md` §8 图床节。
