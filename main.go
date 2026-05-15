@@ -190,9 +190,11 @@ func main() {
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 
 	// === 对话采集（dialog_logs）：可选、异步、永不影响主链路 ===
-	// 启动级开关：DIALOG_COLLECTION_ENABLED=true（默认 true，明确传 false 关闭）
+	// 启动级开关：DIALOG_COLLECTION_ENABLED=true 显式启用（默认关闭，2026-05-15 事故后调整）
 	// 仅 PostgreSQL 支持；SQLite 路径会自动跳过。
-	dialogEnabled := strings.ToLower(strings.TrimSpace(os.Getenv("DIALOG_COLLECTION_ENABLED"))) != "false"
+	// 关闭原因：image_generation 类请求 response 可达 8 MB，多并发可吃光节点内存；
+	// 已加 IsImageGenDialogEvent 过滤兜底，但默认关闭最安全，需要采集时显式 opt-in。
+	dialogEnabled := strings.ToLower(strings.TrimSpace(os.Getenv("DIALOG_COLLECTION_ENABLED"))) == "true"
 	var dialogCollector *proxy.DialogCollector
 	if dialogEnabled && cfg.Database.Driver == "postgres" {
 		// 1) 建主表 + 索引（idempotent）

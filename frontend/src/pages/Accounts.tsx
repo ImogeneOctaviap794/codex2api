@@ -2253,13 +2253,14 @@ function TestConnectionModal({
   )
 }
 
-// 格式化重置时间为具体时间
-function formatResetAt(resetAt: string | undefined): string | null {
+// 格式化重置时间为具体时间；过期时返回 stale 标记，UI 给出"待刷新"提示
+function formatResetAt(resetAt: string | undefined): { text: string; stale: boolean } | null {
   if (!resetAt) return null
   const d = new Date(resetAt)
-  if (d.getTime() <= Date.now()) return null
+  if (Number.isNaN(d.getTime())) return null
   const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const text = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return { text, stale: d.getTime() <= Date.now() }
 }
 
 // 用量进度条颜色
@@ -2271,7 +2272,8 @@ function usageBarColor(pct: number): string {
 
 // 单行用量进度条
 function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt?: string }) {
-  const resetText = formatResetAt(resetAt)
+  const { t } = useTranslation()
+  const reset = formatResetAt(resetAt)
   return (
     <div>
       <div className="flex items-center gap-1.5">
@@ -2281,7 +2283,14 @@ function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt
         </div>
         <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">{pct.toFixed(1)}%</span>
       </div>
-      {resetText && <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">⏱ {resetText}</div>}
+      {reset && (
+        <div
+          className={`text-[11px] font-medium mt-0.5 pl-[26px] ${reset.stale ? 'text-muted-foreground/60 italic' : 'text-muted-foreground'}`}
+          title={reset.stale ? t('accounts.usageStaleTooltip') : undefined}
+        >
+          {reset.stale ? '⌛' : '⏱'} {reset.text}{reset.stale ? ` · ${t('accounts.usageStale')}` : ''}
+        </div>
+      )}
     </div>
   )
 }

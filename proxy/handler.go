@@ -951,8 +951,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
-				// 采集：raw event 拷贝一份
-				if h.dialogCollector != nil {
+				// 采集：raw event 拷贝一份（跳过 image_generation 系列事件——含 base64 帧，不是训练数据）
+				if h.dialogCollector != nil && !IsImageGenDialogEvent(eventType, data) {
 					dup := make([]byte, len(data))
 					copy(dup, data)
 					dialogRawEvents = append(dialogRawEvents, dup)
@@ -1016,8 +1016,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy）
-				if h.dialogCollector != nil {
+				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy；
+				// 跳过 image_generation 系列事件——含 base64 帧，不是训练数据，
+				// 2026-05-15 事故根因：单张 base64 图 5MB+ × 多并发 → 几 GB 瞬时占用）
+				if h.dialogCollector != nil && !IsImageGenDialogEvent(eventType, data) {
 					dup := make([]byte, len(data))
 					copy(dup, data)
 					dialogRawEvents = append(dialogRawEvents, dup)
@@ -1728,8 +1730,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
-				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy）
-				if h.dialogCollector != nil {
+				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy；
+				// 跳过 image_generation 系列事件——含 base64 帧，不是训练数据，
+				// 2026-05-15 事故根因：单张 base64 图 5MB+ × 多并发 → 几 GB 瞬时占用）
+				if h.dialogCollector != nil && !IsImageGenDialogEvent(eventType, data) {
 					dup := make([]byte, len(data))
 					copy(dup, data)
 					dialogRawEvents = append(dialogRawEvents, dup)
@@ -1800,8 +1804,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy）
-				if h.dialogCollector != nil {
+				// 采集：raw event 拷贝一份（ReadSSEStream 复用 buffer，必须 copy；
+				// 跳过 image_generation 系列事件——含 base64 帧，不是训练数据，
+				// 2026-05-15 事故根因：单张 base64 图 5MB+ × 多并发 → 几 GB 瞬时占用）
+				if h.dialogCollector != nil && !IsImageGenDialogEvent(eventType, data) {
 					dup := make([]byte, len(data))
 					copy(dup, data)
 					dialogRawEvents = append(dialogRawEvents, dup)

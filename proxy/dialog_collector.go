@@ -260,6 +260,30 @@ func ExtractReasoningFromCodexEvents(rawEvents []json.RawMessage) string {
 	return sb.String()
 }
 
+// IsImageGenDialogEvent 判断是否为 image_generation 系列事件 —— 这些事件含 base64 图像帧，
+// 体积可达数 MB（partial_image / output_item.done 的 result 字段），既不是训练数据，
+// 又会让单个 dialog 记录膨胀几百倍。2026-05-15 事故元凶：单 image_generation 请求
+// 的 response_body 可达 8 MB，10+ 并发即可吃光 GB 级内存。
+//
+// 黑名单覆盖：
+//   - response.image_generation_call.partial_image / in_progress / generating / completed
+//   - response.output_item.added / done 当 item.type == "image_generation_call"
+//
+// 调用方应在 dialog 采集 append 前判断；主链路转发完全不受影响。
+func IsImageGenDialogEvent(eventType string, eventData []byte) bool {
+	switch eventType {
+	case "response.image_generation_call.partial_image",
+		"response.image_generation_call.in_progress",
+		"response.image_generation_call.generating",
+		"response.image_generation_call.completed":
+		return true
+	case "response.output_item.added",
+		"response.output_item.done":
+		return gjson.GetBytes(eventData, "item.type").String() == "image_generation_call"
+	}
+	return false
+}
+
 // MergeCodexEventsAsResponseJSON 把 Codex SSE 事件序列拼成单个 JSON 数组，
 // 用于 ResponseBody 字段（保留所有原始事件供后期分析）。
 func MergeCodexEventsAsResponseJSON(rawEvents []json.RawMessage) json.RawMessage {

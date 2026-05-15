@@ -248,6 +248,8 @@
     "usage5h": "5h",
     "usage7d": "7d",
     "resetIn": "重置: {{time}}",
+    "usageStale": "待刷新",
+    "usageStaleTooltip": "该时间戳已过期，下次该账号被调用时会自动刷新",
     "cancelSelection": "取消选择",
     "confirmDelete": "确定删除此账号？",
     "confirmBatchDelete": "确定要删除选中的 {{count}} 个账号吗？此操作不可撤销。",

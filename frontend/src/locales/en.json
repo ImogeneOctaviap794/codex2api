@@ -248,6 +248,8 @@
     "usage5h": "5h",
     "usage7d": "7d",
     "resetIn": "Reset: {{time}}",
+    "usageStale": "stale",
+    "usageStaleTooltip": "Timestamp has expired; will auto-refresh on next account use",
     "cancelSelection": "Clear Selection",
     "confirmDelete": "Are you sure you want to delete this account?",
     "confirmBatchDelete": "Are you sure you want to delete {{count}} selected accounts? This action cannot be undone.",
