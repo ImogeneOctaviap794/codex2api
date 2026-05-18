@@ -4,20 +4,20 @@
 >
 > **2026-05-15 起架构变更**：codex2api 应用层迁到独立 VPS `codex-node` (`152.53.210.32`)，PG/nginx 留 `node2` (`152.53.240.159`)，两机走 **WireGuard** 互连。整体见 `ARCHITECTURE.md`。
 
-## 1. 线上状态（截至 2026-05-15 19:30）
+## 1. 线上状态（截至 2026-05-19 04:00）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.55-image-gen-mem-fix`（`latest`）|
+| 镜像 | `codex2api:v1.7.56-metadata-alias`（`latest`）|
 | 容器 | `codex2api` （在 **codex-node** 上）|
 | 容器内端口 | `8123`（`CODEX_PORT=8123`，固定不变） |
-| 宿主端口 | `10.10.0.2:8104:8123`（**仅监听 WG IP**，公网不可达） |
-| nginx upstream | `proxy_pass http://10.10.0.2:8104;` （在 **node2** 上）|
+| 宿主端口 | `10.10.0.2:8105:8123`（**仅监听 WG IP**，公网不可达） |
+| nginx upstream | `proxy_pass http://10.10.0.2:8105;` （在 **node2** 上）|
 | 部署目录 | `/data/codex2api/`（在 **codex-node** 上） |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`（在 **node2**, 通过 socat 暴露 `10.10.0.1:5432`）|
 | Redis | `codex2api-redis`（在 **codex-node** 本地，cache-only, `--memory=256m`）|
-| 网络 | `codex2api_codex2api-net`（在 **codex-node** 上）|
+| 网络 | `codex2api-net`（在 **codex-node** 上；docker run 时不要加 compose 前缀）|
 | 图像卷 | `/data/codex2api-images:/app/images`（在 **codex-node** 上，独立持久卷）|
 | nginx conf | `/www/server/panel/vhost/nginx/cx.wyzai.top.conf`（**node2**）|
 | nginx body 上限 | `client_max_body_size 500m` |
@@ -44,7 +44,7 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 
 > 容器内 `CODEX_PORT=8123` **始终不变**。蓝绿换的是 codex-node 上对外暴露的 WG 端口（`-p 10.10.0.2:NEW:8123`）。
 >
-> 当前主端口 8104；下次蓝绿候选 `8105 / 8106 / 8107`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
+> 当前主端口 8105；下次蓝绿候选 `8106 / 8107 / 8108`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
 
 **🚨 不要把多步串成一行 bash——stdout buffer 会让你误以为卡死。每步独立跑。**
 
@@ -53,7 +53,7 @@ SSH_CODEX='sshpass -p fmAJ8zmcAKL0ER8 ssh -p 22 -o StrictHostKeyChecking=no root
 SSH_NODE2='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP_CODEX='sshpass -p fmAJ8zmcAKL0ER8 scp -P 22 -o StrictHostKeyChecking=no'
 
-OLD=8104; NEW=8105; TAG=v1.7.56-xxx
+OLD=8105; NEW=8106; TAG=v1.7.57-xxx
 ```
 
 > **起容器前先验空（在 codex-node 上）**：`ss -tlnp | grep ":810[4-9]"` 确认目标端口无人监听
@@ -97,7 +97,7 @@ $SSH_CODEX "cd /data/codex2api-new && time docker build --build-arg BUILD_VERSIO
 ```bash
 $SSH_CODEX "docker rm -f codex2api-new 2>/dev/null || true; \
       docker run -d --name codex2api-new \
-        --network codex2api_codex2api-net \
+        --network codex2api-net \
         -p 10.10.0.2:$NEW:8123 \
         --env-file /data/codex2api-new/.env \
         -e CODEX_PORT=8123 \
@@ -153,7 +153,7 @@ $SSH_CODEX "sleep 30 && time docker stop -t 120 codex2api && \
 
 ```bash
 $SSH_CODEX "docker run -d --name codex2api-rollback \
-  --network codex2api_codex2api-net \
+  --network codex2api-net \
   -p 10.10.0.2:<OLD_PORT>:8123 \
   --env-file /data/codex2api-old-YYYYMMDD-HHMMSS/.env \
   -e CODEX_PORT=8123 \
@@ -228,10 +228,10 @@ $SSH_NODE2 'docker ps --filter name=socat-pg-bridge --format "{{.Names}} {{.Stat
 | v1.7.53-retry-reason | 8122 | 2026-05-13 | 重试拼救成功的 usage_log 行也携带首次重试原因（`firstRetryReasonMsg` 跨 attempt sticky，覆盖 capacity / stream-break 两种 continue 路径）|
 | v1.7.53.1-retry-reason-fix | 8123 | 2026-05-13 | 补 transport-error （dial fail / proxy fail 等）continue 点同样 capture firstRetryReason，现在所有重试拼救行都能看到原因 |
 | v1.7.53.2-proxy-auth | 8121 | 2026-05-13 | 发现上个版本暴露出大量代理 407 Proxy Authentication 错误被错误归类为 `auth` kind。拆出独立 `proxy_auth` kind（优先级高于 auth，避免 "Proxy Authentication" 被 "authentication" 同化）+ UI 橙色 badge 区分 |
-| v1.7.54-trajectory-ids | 8122 | 2026-05-13 | dialog_logs 加 `session_id` + `request_id` 两列（40 万条训练轨迹采购规范必填）。部署后 TRUNCATE 91 GB 老数据重新采集。现在每条 dialog 都能跨会话关联 + 全局唯一 |
 | **v1.7.51-overload-retry** | **8123** | **2026-05-13** | **扩充 capacity 重试 marker：原有 `at capacity` / `try a different model` 只能识别 codex CLI 客户端渲染文案，未命中上游真实载荷。10min 实测样本：886 请求 / 149 `response.failed` = **17% 隐藏故障率**，全部漏出到客户端。新增 markers 覆盖 `Our servers are currently overloaded` (90%) / `An error occurred while processing your request` (10%) / `try again later`，透明重试机制现在能实际拦住这些错误** |
 | **v1.7.55-image-gen-mem-fix** | **8123** | **2026-05-15** | **修复 5/15 内存事故根因 + 固化 cgroup**：(a) `IsImageGenDialogEvent` 过滤 4 处 SSE 采集点的 image_generation 事件（partial_image / output_item.done@image_generation_call 等），单 image 请求 dialog 占用 8MB→~50KB；(b) `DIALOG_COLLECTION_ENABLED` 默认从 true 改为 false（明确 opt-in）；(c) 前端 `formatResetAt` 过期 reset_7d_at 不再隐藏，改为灰色斜体 + tooltip "数据陈旧"；(d) cgroup 多轮调定后定为 `--memory=6g`（热稳态 RSS 3.4-4.2GB，原 2g 启动期OOMKilled / 4g 生产流量后可能触顶）固化进 `ops/DEPLOYMENT.md` Step 5 + 应急回滚 |
 | **v1.7.55-migrated** | **10.10.0.2:8104** | **2026-05-15 19:30** | **架构迁移**：同镜像 v1.7.55-image-gen-mem-fix 从 node2 docker save → scp WG → codex-node docker load，20 分钟零中断完成。应用层迁 codex-node，原 node2 容器保留 `Exited (137)` 作秒级回滚。node2 used 从 30GB 降到 21GB。详见 `ARCHITECTURE.md` |
+| **v1.7.56-metadata-alias** | **10.10.0.2:8105** | **2026-05-19 04:00** | **OpenAI 原生 metadata 键名兼容**：demo 客户传 `metadata: {size, quality}`（无前缀）被透传上游 → `Unsupported parameter: metadata`。修复：translator 加 `imageMetadataAliases` normalize `size→image_size` 等，+ 兜底删 metadata 防未识别字段透传。同时从容器导出重建丢失的 `/data/codex2api/.env`（上次蓝绿后丢了，本次补上）。[2 原子 commit] |
 
 ## 8. 不要再做的事 / 踩过的坑
 
