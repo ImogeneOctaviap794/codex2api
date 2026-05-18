@@ -33,10 +33,10 @@ func firstImageTool(t *testing.T, body []byte) map[string]any {
 func TestMergeImageMetadata_MergesNonEmpty(t *testing.T) {
 	body := map[string]any{
 		"metadata": map[string]any{
-			"image_size":        "1536x1024",
-			"image_quality":     "high",
-			"image_background":  "transparent",
-			"unrelated":         "keep",
+			"image_size":          "1536x1024",
+			"image_quality":       "high",
+			"image_background":    "transparent",
+			"unrelated":           "keep",
 			"image_output_format": "",
 		},
 		"tools": []any{
@@ -60,15 +60,89 @@ func TestMergeImageMetadata_MergesNonEmpty(t *testing.T) {
 		t.Error("empty output_format should be skipped")
 	}
 
-	md, _ := body["metadata"].(map[string]any)
-	if md == nil {
-		t.Fatal("metadata should still exist (unrelated key remains)")
+	// 上游不接受任意 metadata 字段，包括未识别的 `unrelated`，整份 metadata 都该被删除
+	if _, ok := body["metadata"]; ok {
+		t.Error("metadata should be fully dropped (upstream rejects any metadata field)")
 	}
-	if _, ok := md["image_size"]; ok {
-		t.Error("consumed image_size should be removed from metadata")
+}
+
+// alias 兼容：客户端用 OpenAI Images API 风格的无前缀键名 (size/quality/…)，
+// 应被 normalize 成带 image_ 前缀的内部约定键，并合并进 image_generation tool。
+func TestMergeImageMetadata_NormalizesNoPrefixAliases(t *testing.T) {
+	body := map[string]any{
+		"metadata": map[string]any{
+			"size":          "3840x2160",
+			"quality":       "high",
+			"background":    "transparent",
+			"output_format": "webp",
+		},
+		"tools": []any{
+			map[string]any{"type": "image_generation"},
+		},
 	}
-	if md["unrelated"] != "keep" {
-		t.Error("non image_* keys should remain in metadata")
+
+	mergeImageMetadataIntoTools(body)
+
+	tool := body["tools"].([]any)[0].(map[string]any)
+	if tool["size"] != "3840x2160" {
+		t.Errorf("size = %v, want 3840x2160 (from no-prefix alias)", tool["size"])
+	}
+	if tool["quality"] != "high" {
+		t.Errorf("quality = %v, want high (from no-prefix alias)", tool["quality"])
+	}
+	if tool["background"] != "transparent" {
+		t.Errorf("background = %v, want transparent", tool["background"])
+	}
+	if tool["output_format"] != "webp" {
+		t.Errorf("output_format = %v, want webp", tool["output_format"])
+	}
+	if _, ok := body["metadata"]; ok {
+		t.Error("metadata should be dropped after alias normalize + consume")
+	}
+}
+
+// 同请求中同时传带前缀和无前缀键：带前缀优先，无前缀被丢弃。
+func TestMergeImageMetadata_PrefixedKeyWinsOverAlias(t *testing.T) {
+	body := map[string]any{
+		"metadata": map[string]any{
+			"size":       "1024x1024", // alias，应让位
+			"image_size": "3840x2160", // 带前缀，胜出
+			"quality":    "low",       // alias（无对应带前缀键 → 应被 normalize）
+		},
+		"tools": []any{map[string]any{"type": "image_generation"}},
+	}
+
+	mergeImageMetadataIntoTools(body)
+
+	tool := body["tools"].([]any)[0].(map[string]any)
+	if tool["size"] != "3840x2160" {
+		t.Errorf("size = %v, want 3840x2160 (prefixed key takes precedence)", tool["size"])
+	}
+	if tool["quality"] != "low" {
+		t.Errorf("quality = %v, want low (alias normalized when no prefixed twin)", tool["quality"])
+	}
+}
+
+// 仅传未识别字段时，metadata 也应被完全 drop（上游不接受任何 metadata）。
+func TestMergeImageMetadata_UnknownKeysOnly_DropsMetadata(t *testing.T) {
+	body := map[string]any{
+		"metadata": map[string]any{
+			"trace_id":  "abc-123",
+			"user_tag":  "alpha",
+			"timestamp": float64(1700000000),
+		},
+		"tools": []any{map[string]any{"type": "image_generation", "size": "auto"}},
+	}
+
+	mergeImageMetadataIntoTools(body)
+
+	if _, ok := body["metadata"]; ok {
+		t.Error("metadata with only unknown keys should be dropped")
+	}
+	// tools 不应被无关 metadata 影响
+	tool := body["tools"].([]any)[0].(map[string]any)
+	if tool["size"] != "auto" {
+		t.Errorf("tool should be untouched when no image_* metadata, got %+v", tool)
 	}
 }
 

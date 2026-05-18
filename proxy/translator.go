@@ -293,6 +293,37 @@ var imageMetadataToolFields = map[string]string{
 	"image_model":              "model",
 }
 
+// imageMetadataAliases 允许客户端使用 OpenAI Images API 的原生无前缀键名
+// （size / quality / background / …），mergeImageMetadataIntoTools 会在入口处将它们
+// normalize 为带 image_ 前缀的内部约定。同名带前缀的键已存在时，
+// 无前缀键被丢弃（带前缀优先）。详见 docs/gpt-image-web.md。
+var imageMetadataAliases = map[string]string{
+	"size":               "image_size",
+	"quality":            "image_quality",
+	"background":         "image_background",
+	"output_format":      "image_output_format",
+	"output_compression": "image_output_compression",
+	"moderation":         "image_moderation",
+	"input_fidelity":     "image_input_fidelity",
+	"partial_images":     "image_partial_images",
+	"model":              "image_model",
+}
+
+// normalizeImageMetadataAliases 将无前缀别名键迁移到带 image_ 前缀的约定键。
+// 带前缀键已存在时，无前缀键仅被删除（不覆盖，避免同请求中双传导致歧义）。
+func normalizeImageMetadataAliases(md map[string]any) {
+	for alias, canonical := range imageMetadataAliases {
+		v, ok := md[alias]
+		if !ok {
+			continue
+		}
+		delete(md, alias)
+		if _, exists := md[canonical]; !exists {
+			md[canonical] = v
+		}
+	}
+}
+
 // cloneMetadata 浅拷贝一份 metadata，避免修改影响调用者。
 func cloneMetadata(src map[string]any) map[string]any {
 	if len(src) == 0 {
@@ -309,15 +340,20 @@ func cloneMetadata(src map[string]any) map[string]any {
 // 合并到 body["tools"] 第一个 type=="image_generation" 的条目上。
 //
 // 规则：
-//  1. 仅合并白名单内的键（imageMetadataToolFields）；
-//  2. 空字符串忽略（便于客户端用 env 传空値时走 MODEL_OVERRIDES 默认）；
-//  3. 若 tools 中暂无 image_generation 条目，则新增一条；
-//  4. 已消费的键会从 body["metadata"] 中删除，空 metadata 连同字段一并删除。
+//  1. 入口先 normalize：OpenAI Images 原生无前缀键名（size/quality/…）被迁到
+//     带 image_ 前缀的约定名（见 imageMetadataAliases）；
+//  2. 仅合并白名单内的键（imageMetadataToolFields）；
+//  3. 空字符串忽略（便于客户端用 env 传空值时走 MODEL_OVERRIDES 默认）；
+//  4. 若 tools 中暂无 image_generation 条目，则新增一条；
+//  5. 上游 codex backend 不接受任意 metadata 字段（返回 Unsupported parameter:
+//     metadata），所以函数末尾统一 drop 整份 metadata，未识别字段不透传。
 func mergeImageMetadataIntoTools(body map[string]any) {
 	md, ok := body["metadata"].(map[string]any)
 	if !ok || len(md) == 0 {
 		return
 	}
+
+	normalizeImageMetadataAliases(md)
 
 	overrides := make(map[string]any, len(imageMetadataToolFields))
 	for mdKey, toolKey := range imageMetadataToolFields {
@@ -333,11 +369,9 @@ func mergeImageMetadataIntoTools(body map[string]any) {
 		delete(md, mdKey)
 	}
 
-	if len(md) == 0 {
-		delete(body, "metadata")
-	} else {
-		body["metadata"] = md
-	}
+	// 上游不接受任意 metadata 字段（未识别的键也会触发 400），
+	// 消费完 image_* 后统一 drop 整份 metadata。
+	delete(body, "metadata")
 
 	if len(overrides) == 0 {
 		return
