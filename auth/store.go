@@ -637,6 +637,20 @@ const freeUsageRateLimitThresholdPct = 90.0
 // 上游精确 cooldown，避免提前烧死账号。
 const FreeUsageHardLimitPct = 110.0
 
+// rateLimitedProbeBackoff 是 rate_limited cooldown 期间的"低频试探"节奏。
+// 设计目的：解决 cooldown_until 与 7d 滚动窗口的天然脱节 —— 账号被 429 时
+// cooldown_until 钉死到一个 reset 时刻（最长 7d 后），但同期 7d 窗口推进
+// 可能让实际用量已经降到 < 110%，上游不会再 429。如果一直禁探针，账号会
+// 一直被锁到 cooldown_until 自然到期，造成大量浪费。
+//
+// 4h 节奏来自折中：
+//   - 太短（如 30min）会在上游真长期 429 时反复打探针，加重限流
+//   - 太长（如 24h）会让虚惊账号长时间留在 cooldown
+//
+// 失败时 ReportRequestFailure 会把 LastRateLimitedAt 推到当前时间，自然
+// 续上下一个 4h 周期；成功时 ClearCooldown 让账号回归调度，本字段不再生效。
+const rateLimitedProbeBackoff = 4 * time.Hour
+
 // freeUsageRateLimitedLocked 判断 Free 账号 7d 用量是否处于软限速区间
 // [freeUsageRateLimitThresholdPct, FreeUsageHardLimitPct)（需持有 mu 读锁）
 func (a *Account) freeUsageRateLimitedLocked() bool {
@@ -950,7 +964,16 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 		return false
 	}
 	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" {
-		return false // 429 冷却期间不探活，避免加重限流
+		// rate_limited cooldown 默认禁探针避免加重限流；但允许"低频试探"
+		// 让历史误锁账号能自动恢复（cooldown_until 最长 7d，且在此期间 7d 滚动
+		// 窗口可能已让用量降到健康水位，上游不会再 429）。
+		// 试探节奏：距离 LastRateLimitedAt 至少 rateLimitedProbeBackoff（默认 4h）
+		// 才放行 1 次。失败时 ReportRequestFailure 会把 LastRateLimitedAt 重置为
+		// 当前时间，自然回到下个 4h 周期，不会瞬时刷爆上游。
+		// LastRateLimitedAt 为零值（旧数据迁移）也允许试探一次。
+		if !a.LastRateLimitedAt.IsZero() && time.Since(a.LastRateLimitedAt) < rateLimitedProbeBackoff {
+			return false
+		}
 	}
 	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() {
 		return true

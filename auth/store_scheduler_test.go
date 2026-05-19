@@ -117,13 +117,44 @@ func TestAccountBaseConcurrencyOverrideControlsDynamicLimit(t *testing.T) {
 }
 
 func TestNeedsUsageProbeSkipsRateLimited(t *testing.T) {
+	// 刚收到 429 不久（< rateLimitedProbeBackoff = 4h），应禁探针避免加重限流
 	acc := &Account{
-		AccessToken: "token",
-		Status:      StatusCooldown,
-		CooldownReason: "rate_limited",
+		AccessToken:       "token",
+		Status:            StatusCooldown,
+		CooldownReason:    "rate_limited",
+		LastRateLimitedAt: time.Now().Add(-30 * time.Minute),
 	}
 	if acc.NeedsUsageProbe(10 * time.Minute) {
-		t.Fatal("NeedsUsageProbe should return false for rate_limited cooldown")
+		t.Fatal("NeedsUsageProbe should return false for fresh rate_limited cooldown")
+	}
+}
+
+// rate_limited cooldown 已超过 rateLimitedProbeBackoff（4h），允许低频试探，
+// 避免账号在 cooldown_until（最长 7d）内被永久锁死。
+func TestNeedsUsageProbeAllowsRateLimitedAfterBackoff(t *testing.T) {
+	acc := &Account{
+		AccessToken:       "token",
+		Status:            StatusCooldown,
+		CooldownReason:    "rate_limited",
+		CooldownUtil:      time.Now().Add(48 * time.Hour),
+		LastRateLimitedAt: time.Now().Add(-5 * time.Hour),
+	}
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe should return true after rateLimitedProbeBackoff elapsed")
+	}
+}
+
+// LastRateLimitedAt 为零值（老数据迁移）时，允许试探一次。
+func TestNeedsUsageProbeAllowsRateLimitedWithZeroTimestamp(t *testing.T) {
+	acc := &Account{
+		AccessToken:    "token",
+		Status:         StatusCooldown,
+		CooldownReason: "rate_limited",
+		CooldownUtil:   time.Now().Add(24 * time.Hour),
+		// LastRateLimitedAt 显式留零值
+	}
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe should return true when LastRateLimitedAt is zero")
 	}
 }
 
