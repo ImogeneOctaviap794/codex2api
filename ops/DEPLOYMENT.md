@@ -4,15 +4,15 @@
 >
 > **2026-05-15 起架构变更**：codex2api 应用层迁到独立 VPS `codex-node` (`152.53.210.32`)，PG/nginx 留 `node2` (`152.53.240.159`)，两机走 **WireGuard** 互连。整体见 `ARCHITECTURE.md`。
 
-## 1. 线上状态（截至 2026-05-19 04:00）
+## 1. 线上状态（截至 2026-05-19 10:30）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.56-metadata-alias`（`latest`）|
+| 镜像 | `codex2api:v1.7.57-rate-limit-probe`（`latest`）|
 | 容器 | `codex2api` （在 **codex-node** 上）|
 | 容器内端口 | `8123`（`CODEX_PORT=8123`，固定不变） |
-| 宿主端口 | `10.10.0.2:8105:8123`（**仅监听 WG IP**，公网不可达） |
-| nginx upstream | `proxy_pass http://10.10.0.2:8105;` （在 **node2** 上）|
+| 宿主端口 | `10.10.0.2:8106:8123`（**仅监听 WG IP**，公网不可达） |
+| nginx upstream | `proxy_pass http://10.10.0.2:8106;` （在 **node2** 上）|
 | 部署目录 | `/data/codex2api/`（在 **codex-node** 上） |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`（在 **node2**, 通过 socat 暴露 `10.10.0.1:5432`）|
@@ -44,7 +44,7 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 
 > 容器内 `CODEX_PORT=8123` **始终不变**。蓝绿换的是 codex-node 上对外暴露的 WG 端口（`-p 10.10.0.2:NEW:8123`）。
 >
-> 当前主端口 8105；下次蓝绿候选 `8106 / 8107 / 8108`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
+> 当前主端口 8106；下次蓝绿候选 `8107 / 8108 / 8109`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
 
 **🚨 不要把多步串成一行 bash——stdout buffer 会让你误以为卡死。每步独立跑。**
 
@@ -53,7 +53,7 @@ SSH_CODEX='sshpass -p fmAJ8zmcAKL0ER8 ssh -p 22 -o StrictHostKeyChecking=no root
 SSH_NODE2='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP_CODEX='sshpass -p fmAJ8zmcAKL0ER8 scp -P 22 -o StrictHostKeyChecking=no'
 
-OLD=8105; NEW=8106; TAG=v1.7.57-xxx
+OLD=8106; NEW=8107; TAG=v1.7.58-xxx
 ```
 
 > **起容器前先验空（在 codex-node 上）**：`ss -tlnp | grep ":810[4-9]"` 确认目标端口无人监听
@@ -232,6 +232,7 @@ $SSH_NODE2 'docker ps --filter name=socat-pg-bridge --format "{{.Names}} {{.Stat
 | **v1.7.55-image-gen-mem-fix** | **8123** | **2026-05-15** | **修复 5/15 内存事故根因 + 固化 cgroup**：(a) `IsImageGenDialogEvent` 过滤 4 处 SSE 采集点的 image_generation 事件（partial_image / output_item.done@image_generation_call 等），单 image 请求 dialog 占用 8MB→~50KB；(b) `DIALOG_COLLECTION_ENABLED` 默认从 true 改为 false（明确 opt-in）；(c) 前端 `formatResetAt` 过期 reset_7d_at 不再隐藏，改为灰色斜体 + tooltip "数据陈旧"；(d) cgroup 多轮调定后定为 `--memory=6g`（热稳态 RSS 3.4-4.2GB，原 2g 启动期OOMKilled / 4g 生产流量后可能触顶）固化进 `ops/DEPLOYMENT.md` Step 5 + 应急回滚 |
 | **v1.7.55-migrated** | **10.10.0.2:8104** | **2026-05-15 19:30** | **架构迁移**：同镜像 v1.7.55-image-gen-mem-fix 从 node2 docker save → scp WG → codex-node docker load，20 分钟零中断完成。应用层迁 codex-node，原 node2 容器保留 `Exited (137)` 作秒级回滚。node2 used 从 30GB 降到 21GB。详见 `ARCHITECTURE.md` |
 | **v1.7.56-metadata-alias** | **10.10.0.2:8105** | **2026-05-19 04:00** | **OpenAI 原生 metadata 键名兼容**：demo 客户传 `metadata: {size, quality}`（无前缀）被透传上游 → `Unsupported parameter: metadata`。修复：translator 加 `imageMetadataAliases` normalize `size→image_size` 等，+ 兜底删 metadata 防未识别字段透传。同时从容器导出重建丢失的 `/data/codex2api/.env`（上次蓝绿后丢了，本次补上）。[2 原子 commit] |
+| **v1.7.57-rate-limit-probe** | **10.10.0.2:8106** | **2026-05-19 10:30** | **修复 rate_limited cooldown 死锁**：账号被一次 429 后设 `cooldown_until=reset_7d_at`（最长 7d），但 7d 滑动窗口推进后实际用量可能已降到 <110%。原逻辑 `NeedsUsageProbe` 在 rate_limited cooldown 全程禁探针，导致 ClearCooldown 永远调不到 → 632 个账号被锁死。修复加 4h escape hatch：距离 `LastRateLimitedAt > 4h` 时放行试探。一次性脚本差量复活 240 个误锁账号（46/596 是真 429 保留）。[3 文件变更] |
 
 ## 8. 不要再做的事 / 踩过的坑
 
