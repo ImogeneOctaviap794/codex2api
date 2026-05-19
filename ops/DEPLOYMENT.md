@@ -4,15 +4,15 @@
 >
 > **2026-05-15 起架构变更**：codex2api 应用层迁到独立 VPS `codex-node` (`152.53.210.32`)，PG/nginx 留 `node2` (`152.53.240.159`)，两机走 **WireGuard** 互连。整体见 `ARCHITECTURE.md`。
 
-## 1. 线上状态（截至 2026-05-19 10:30）
+## 1. 线上状态（截至 2026-05-19 11:15）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.57-rate-limit-probe`（`latest`）|
+| 镜像 | `codex2api:v1.7.58-batch-refresh-ui`（`latest`）|
 | 容器 | `codex2api` （在 **codex-node** 上）|
 | 容器内端口 | `8123`（`CODEX_PORT=8123`，固定不变） |
-| 宿主端口 | `10.10.0.2:8106:8123`（**仅监听 WG IP**，公网不可达） |
-| nginx upstream | `proxy_pass http://10.10.0.2:8106;` （在 **node2** 上）|
+| 宿主端口 | `10.10.0.2:8107:8123`（**仅监听 WG IP**，公网不可达） |
+| nginx upstream | `proxy_pass http://10.10.0.2:8107;` （在 **node2** 上）|
 | 部署目录 | `/data/codex2api/`（在 **codex-node** 上） |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`（在 **node2**, 通过 socat 暴露 `10.10.0.1:5432`）|
@@ -44,7 +44,7 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 
 > 容器内 `CODEX_PORT=8123` **始终不变**。蓝绿换的是 codex-node 上对外暴露的 WG 端口（`-p 10.10.0.2:NEW:8123`）。
 >
-> 当前主端口 8106；下次蓝绿候选 `8107 / 8108 / 8109`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
+> 当前主端口 8107；下次蓝绿候选 `8108 / 8109 / 8104`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
 
 **🚨 不要把多步串成一行 bash——stdout buffer 会让你误以为卡死。每步独立跑。**
 
@@ -53,7 +53,7 @@ SSH_CODEX='sshpass -p fmAJ8zmcAKL0ER8 ssh -p 22 -o StrictHostKeyChecking=no root
 SSH_NODE2='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP_CODEX='sshpass -p fmAJ8zmcAKL0ER8 scp -P 22 -o StrictHostKeyChecking=no'
 
-OLD=8106; NEW=8107; TAG=v1.7.58-xxx
+OLD=8107; NEW=8108; TAG=v1.7.59-xxx
 ```
 
 > **起容器前先验空（在 codex-node 上）**：`ss -tlnp | grep ":810[4-9]"` 确认目标端口无人监听
@@ -233,6 +233,7 @@ $SSH_NODE2 'docker ps --filter name=socat-pg-bridge --format "{{.Names}} {{.Stat
 | **v1.7.55-migrated** | **10.10.0.2:8104** | **2026-05-15 19:30** | **架构迁移**：同镜像 v1.7.55-image-gen-mem-fix 从 node2 docker save → scp WG → codex-node docker load，20 分钟零中断完成。应用层迁 codex-node，原 node2 容器保留 `Exited (137)` 作秒级回滚。node2 used 从 30GB 降到 21GB。详见 `ARCHITECTURE.md` |
 | **v1.7.56-metadata-alias** | **10.10.0.2:8105** | **2026-05-19 04:00** | **OpenAI 原生 metadata 键名兼容**：demo 客户传 `metadata: {size, quality}`（无前缀）被透传上游 → `Unsupported parameter: metadata`。修复：translator 加 `imageMetadataAliases` normalize `size→image_size` 等，+ 兜底删 metadata 防未识别字段透传。同时从容器导出重建丢失的 `/data/codex2api/.env`（上次蓝绿后丢了，本次补上）。[2 原子 commit] |
 | **v1.7.57-rate-limit-probe** | **10.10.0.2:8106** | **2026-05-19 10:30** | **修复 rate_limited cooldown 死锁**：账号被一次 429 后设 `cooldown_until=reset_7d_at`（最长 7d），但 7d 滑动窗口推进后实际用量可能已降到 <110%。原逻辑 `NeedsUsageProbe` 在 rate_limited cooldown 全程禁探针，导致 ClearCooldown 永远调不到 → 632 个账号被锁死。修复加 4h escape hatch：距离 `LastRateLimitedAt > 4h` 时放行试探。一次性脚本差量复活 240 个误锁账号（46/596 是真 429 保留）。[3 文件变更] |
+| **v1.7.58-batch-refresh-ui** | **10.10.0.2:8107** | **2026-05-19 11:15** | **前端：批量刷新并发 + 实时进度**：`handleBatchRefresh` 串行 for-await → 4 worker pool（与后端 usage_probe / batch_test 节奏一致）。按钮 label 实时变 `刷新中… 24/100`。任何账号失败 → toast 红标显示前 3 条 error（按品诊能马上看到 AT-only 上 rt-manager 未启动等问题）。100 个账号耗时从 8-16min 降到 2-4min。[3 文件 / 后端零改动] |
 
 ## 8. 不要再做的事 / 踩过的坑
 
