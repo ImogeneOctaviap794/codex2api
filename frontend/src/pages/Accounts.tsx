@@ -49,6 +49,7 @@ export default function Accounts() {
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set())
   const [batchLoading, setBatchLoading] = useState(false)
+  const [batchRefreshProgress, setBatchRefreshProgress] = useState<{ done: number; total: number } | null>(null)
   const [batchTesting, setBatchTesting] = useState(false)
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
@@ -635,19 +636,45 @@ export default function Accounts() {
 
   const handleBatchRefresh = async () => {
     if (selected.size === 0) return
+    const ids = Array.from(selected)
+    const total = ids.length
     setBatchLoading(true)
+    setBatchRefreshProgress({ done: 0, total })
+
+    // 并发 worker pool：与后端 usage_probe / batch_test 节奏一致（4），避免瞬时打爆上游
+    const concurrency = Math.min(4, total)
+    let cursor = 0
     let success = 0
     let fail = 0
-    for (const id of selected) {
-      try {
-        await api.refreshAccount(id)
-        success++
-      } catch {
-        fail++
+    const errSamples: string[] = []
+
+    const worker = async () => {
+      while (true) {
+        const i = cursor++
+        if (i >= total) return
+        try {
+          await api.refreshAccount(ids[i])
+          success++
+        } catch (error) {
+          fail++
+          if (errSamples.length < 3) {
+            errSamples.push(getErrorMessage(error))
+          }
+        }
+        setBatchRefreshProgress({ done: success + fail, total })
       }
     }
-    showToast(t('accounts.batchRefreshDone', { success, fail }))
+
+    await Promise.all(Array.from({ length: concurrency }, worker))
+
+    const summary = t('accounts.batchRefreshDone', { success, fail })
+    if (fail > 0 && errSamples.length > 0) {
+      showToast(`${summary} · ${errSamples.join(' / ')}`, 'error')
+    } else {
+      showToast(summary)
+    }
     setBatchLoading(false)
+    setBatchRefreshProgress(null)
     void reload()
   }
 
@@ -1003,7 +1030,9 @@ export default function Accounts() {
             <span>{t('common.selected', { count: selected.size })}</span>
             <div className="flex items-center gap-1.5">
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
-                {t('accounts.batchRefresh')}
+                {batchRefreshProgress
+                  ? t('accounts.batchRefreshProgress', { done: batchRefreshProgress.done, total: batchRefreshProgress.total })
+                  : t('accounts.batchRefresh')}
               </Button>
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(true)}>
                 <Lock className="size-3 mr-1" />{t('accounts.lock')}
