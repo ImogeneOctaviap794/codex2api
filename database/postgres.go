@@ -772,6 +772,78 @@ type UsageLog struct {
 	UpstreamErrorMsg  string `json:"upstream_error_msg"`
 	RetryCount        int    `json:"retry_count"`
 	FinalOutcome      string `json:"final_outcome"`
+	// v1.7.60 账号计费金额（美元）。由 InsertUsageLog 内部 calculateCost 写入。
+	AccountBilled float64 `json:"account_billed"`
+	// v1.7.60 UI 展示用的 cost breakdown（调用 populateBillingBreakdown 后填入）。
+	InputCost      float64 `json:"input_cost"`
+	OutputCost     float64 `json:"output_cost"`
+	CacheReadCost  float64 `json:"cache_read_cost"`
+	TotalCost      float64 `json:"total_cost"`
+	InputPrice     float64 `json:"input_price_per_mtoken"`
+	OutputPrice    float64 `json:"output_price_per_mtoken"`
+	CacheReadPrice float64 `json:"cache_read_price_per_mtoken"`
+	RateMultiplier float64 `json:"rate_multiplier"`
+}
+
+// populateBillingBreakdown 用 calculateCostBreakdown 填充 InputCost/OutputCost/CacheReadCost/TotalCost +
+// price 与 RateMultiplier。若 AccountBilled 跟计算出的 TotalCost 不一致，会按比例缩放到
+// AccountBilled 的金额作为显示值（以持久化实际的计费为准）。
+func (l *UsageLog) populateBillingBreakdown() {
+	if l == nil {
+		return
+	}
+	breakdown := calculateCostBreakdown(l.InputTokens, l.OutputTokens, l.CachedTokens, l.Model, l.ServiceTier)
+	l.InputCost = breakdown.InputCost
+	l.OutputCost = breakdown.OutputCost
+	l.CacheReadCost = breakdown.CacheReadCost
+	l.TotalCost = breakdown.TotalCost
+	l.InputPrice = breakdown.InputPricePerMToken
+	l.OutputPrice = breakdown.OutputPricePerMToken
+	l.CacheReadPrice = breakdown.CacheReadPricePerMToken
+	l.RateMultiplier = breakdown.ServiceTierCostMultiplier
+
+	// 以 AccountBilled（持久化值）为准。若 breakdown.TotalCost 与之偏离（例如上下文 calculator 版本
+	// 变更后重算升级），按比例缩放让显示金额跨 input/output/cache 反映真实账单。
+	if l.AccountBilled > 0 && breakdown.TotalCost > 0 && l.AccountBilled != breakdown.TotalCost {
+		scale := l.AccountBilled / breakdown.TotalCost
+		l.InputCost *= scale
+		l.OutputCost *= scale
+		l.CacheReadCost *= scale
+		l.TotalCost = l.AccountBilled
+		l.InputPrice *= scale
+		l.OutputPrice *= scale
+		l.CacheReadPrice *= scale
+	}
+}
+
+// GetAccountsBilledMap 一次查出所有账号在该时间点之后的总计费（美元）。
+//
+// 用于 ListAccounts 推送 5h/7d 成本列：在循环前调一次拿 map，避免按账号循环调 N 次 SUM。
+// status_code = 499 代表 client 提前取消，不计入账单。
+func (db *DB) GetAccountsBilledMap(ctx context.Context, since time.Time) (map[int64]float64, error) {
+	result := make(map[int64]float64)
+	if db == nil {
+		return result, nil
+	}
+	rows, err := db.conn.QueryContext(ctx,
+		`SELECT account_id, COALESCE(SUM(account_billed), 0)
+		 FROM usage_logs
+		 WHERE created_at >= $1 AND status_code <> 499
+		 GROUP BY account_id`,
+		since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var billed float64
+		if err := rows.Scan(&id, &billed); err != nil {
+			continue
+		}
+		result[id] = billed
+	}
+	return result, rows.Err()
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）

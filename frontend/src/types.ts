@@ -67,6 +67,10 @@ export interface AccountRow {
   success_requests?: number
   error_requests?: number
   estimated_cost_7d?: number
+  // v1.7.60 真实账单：billed_5h = 过去 5 小时累计美元、billed_7d = 过去 7 天累计美元。
+  // 来源 usage_logs.account_billed 聚合，是 v2.1.6 计费表实录（区别于 estimated_cost_7d 本地估算）。
+  billed_5h?: number
+  billed_7d?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   reset_5h_at?: ISODateString

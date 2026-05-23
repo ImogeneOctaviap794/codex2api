@@ -1157,6 +1157,18 @@ export default function Accounts() {
                               {formatCostUSD(account.estimated_cost_7d)}
                             </div>
                           )}
+                          {((typeof account.billed_5h === 'number' && account.billed_5h > 0) ||
+                            (typeof account.billed_7d === 'number' && account.billed_7d > 0)) && (
+                            <div
+                              className="mt-0.5 text-[11px] font-medium tabular-nums text-amber-600 dark:text-amber-400 flex items-center gap-1"
+                              title="真实账单 (v2.1.6 计费表实录) · 区别于上面的本地估算"
+                            >
+                              <span className="text-amber-700/70 dark:text-amber-300/70">$</span>
+                              <span>5h:{formatCostUSD(account.billed_5h ?? 0)}</span>
+                              <span className="text-muted-foreground/60">·</span>
+                              <span>7d:{formatCostUSD(account.billed_7d ?? 0)}</span>
+                            </div>
+                          )}
                         </TableCell>
                         <TableCell>
                           <UsageCell account={account} />

@@ -488,6 +488,11 @@ type accountResponse struct {
 	Locked                   bool                       `json:"locked"`
 	// 近 7 天成本估算（USD，按 gpt-5 价目表：输入 $2.5、缓存读取 $0.25、输出 $15 / 1M tokens）
 	EstimatedCost7d float64 `json:"estimated_cost_7d"`
+	// v1.7.60 真实账单：从 usage_logs.account_billed 聚合。
+	// Billed5h = 过去 5 小时累计美元、Billed7d = 过去 7 天累计美元。
+	// 与 EstimatedCost7d 的区别：Estimated 用本地 token 估算表，Billed 是上游 v2.1.6 计费实录。
+	Billed5h float64 `json:"billed_5h"`
+	Billed7d float64 `json:"billed_7d"`
 }
 
 // GPT-5 家族价目表（USD per 1M tokens）
@@ -555,6 +560,22 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
 	reqCounts := h.getCachedRequestCounts()
+
+	// v1.7.60 一次查出所有账号过去 5h / 7d 的真实计费金额（避免按账号循环调 N 次 SUM）。
+	// 查失败不阻断主流程，记日志后用空 map 退化（前端会看到 0）。
+	billedCtx, billedCancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer billedCancel()
+	now := time.Now()
+	billed5hMap, err5h := h.db.GetAccountsBilledMap(billedCtx, now.Add(-5*time.Hour))
+	if err5h != nil {
+		log.Printf("[ListAccounts] GetAccountsBilledMap 5h 失败: %v", err5h)
+		billed5hMap = map[int64]float64{}
+	}
+	billed7dMap, err7d := h.db.GetAccountsBilledMap(billedCtx, now.AddDate(0, 0, -7))
+	if err7d != nil {
+		log.Printf("[ListAccounts] GetAccountsBilledMap 7d 失败: %v", err7d)
+		billed7dMap = map[int64]float64{}
+	}
 
 	all := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -641,6 +662,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.ErrorRequests = rc.ErrorCount
 			resp.EstimatedCost7d = estimateCostUSD(rc.InputTokens, rc.OutputTokens, rc.CachedTokens)
 		}
+		// v1.7.60 真实账单（从 usage_logs.account_billed 聚合）
+		resp.Billed5h = billed5hMap[row.ID]
+		resp.Billed7d = billed7dMap[row.ID]
 		all = append(all, resp)
 	}
 

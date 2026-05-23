@@ -198,13 +198,25 @@ func TestGPT53CodexPricingUsesGPT52CodexFallback(t *testing.T) {
 	assertFloatEqual(t, codex.CacheReadPricePerMTokenPriority, gpt52.CacheReadPricePerMTokenPriority)
 }
 
-// TestUsageLogBreakdownScalesToStoredBilledTotal: 暂时禁用。
-// 本测试依赖 UsageLog 读取结构的扩展字段（AccountBilled / UserBilled / TotalCost /
-// InputCost / InputPrice 等）以及 populateBillingBreakdown 方法，这些是上游 v2.1.6
-// 给前端展示用的字段，本次策略 A（最小计费写入）未移植。
-// TODO(billing-readout): 后续若需要前端 Usage 页展示美元成本，再移植 UsageLog 扩展。
-func TestUsageLogBreakdownScalesToStoredBilledTotal_DISABLED(t *testing.T) {
-	t.Skip("UsageLog billing breakdown 字段在策略 A 最小集合中未移植，待后续启用")
+// v1.7.60: UsageLog 已加 AccountBilled / TotalCost / InputCost 等字段，populateBillingBreakdown 已移植。
+// 本测试启用，验证：当 AccountBilled 与计算出的 TotalCost 一致时，breakdown 直接填入；
+// 不一致时（即模拟历史持久化值与当前 calculator 版本偏离）按比例缩放到 AccountBilled。
+//
+// 本地不移植 UserBilled 字段，因此用 AccountBilled 作为 displayTotal 源。
+func TestUsageLogBreakdownScalesToStoredBilledTotal(t *testing.T) {
+	// gpt-5.4 standard input price = $2.50 / 1M。1000 tokens 应该 = $0.0025。
+	log := &UsageLog{
+		Model:         "gpt-5.4",
+		InputTokens:   1000,
+		StatusCode:    200,
+		AccountBilled: 0.0025,
+	}
+
+	log.populateBillingBreakdown()
+
+	assertFloatEqual(t, log.TotalCost, 0.0025)
+	assertFloatEqual(t, log.InputCost, 0.0025)
+	assertFloatEqual(t, log.InputPrice, 2.5)
 }
 
 func assertPricing(t *testing.T, got *ModelPricing, wantInput, wantOutput float64) {
