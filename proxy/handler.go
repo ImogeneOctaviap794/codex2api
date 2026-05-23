@@ -2686,8 +2686,15 @@ func (h *Handler) sendFinalUpstreamErrorKA(c *gin.Context, sseW *SSEWriter, json
 }
 
 // SupportedModels 支持的模型列表（全局共享）
+//
+// v1.7.60 同步上游 v2.1.6 的 pro 变种：
+//   - gpt-5.5-pro / gpt-5.4-pro 是 Codex 系列高推理预算变种，独立计费档（$30/$180 per 1M），
+//     长上下文（>272K input）时再叠加 input 2x / output 1.5x 溢价。
+//   - codex-auto-review 是 ChatGPT 内部审查模型，**只在 ChatGPT backend API 暴露**（不通过
+//     公开 Responses API），故不加到这里；其计费已在 database/billing.go 内通过
+//     normalizeCodexBillingModel 映射到 gpt-5.4 档（覆盖大小写）。
 var SupportedModels = []string{
-	"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
+	"gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
 	"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
 	"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
 }

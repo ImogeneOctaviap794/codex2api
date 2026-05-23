@@ -148,6 +148,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "upstream_error_msg", "TEXT DEFAULT ''"},
 		{"usage_logs", "retry_count", "INTEGER DEFAULT 0"},
 		{"usage_logs", "final_outcome", "TEXT DEFAULT ''"},
+		// v1.7.60 账号计费金额（美元）。由 InsertUsageLog 内部根据 model + tokens + service_tier 调用 calculateCost 计算后写入。
+		{"usage_logs", "account_billed", "REAL DEFAULT 0"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},

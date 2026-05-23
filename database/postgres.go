@@ -94,6 +94,8 @@ type usageLogEntry struct {
 	UpstreamErrorMsg  string
 	RetryCount        int
 	FinalOutcome      string
+	// v1.7.60 账号计费金额（美元）。由 InsertUsageLog 内部调用 calculateCost 计算后填入。
+	AccountBilled float64
 }
 
 // New 创建数据库连接并自动建表。
@@ -269,6 +271,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_error_msg TEXT DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS final_outcome VARCHAR(20) DEFAULT '';
+
+	-- v1.7.60 账号计费金额（美元）。InsertUsageLog 内部根据 model + tokens + service_tier 调用
+	-- database.calculateCost 计算后写入。取 0 表示该请求未产生费用（如 client 断开、状态码 499）。
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS account_billed DOUBLE PRECISION DEFAULT 0;
 
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
 	-- 部分索引：只索引有上游错误的行，帮助 /usage/error-breakdown 等聚合查询
@@ -770,6 +776,11 @@ type UsageLog struct {
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
 func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
+	// v1.7.60 计算账号计费：依赖 database/billing.go 的 calculateCost。
+	// 不在调用方传入，避免 proxy 层全员改动。
+	// status_code=499 或 client 断开场景 tokens 为 0，计出来也是 0。
+	accountBilled := calculateCost(log.InputTokens, log.OutputTokens, log.CachedTokens, log.Model, log.ServiceTier)
+
 	db.logMu.Lock()
 	db.logBuf = append(db.logBuf, usageLogEntry{
 		AccountID:         log.AccountID,
@@ -797,6 +808,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 		UpstreamErrorMsg:  log.UpstreamErrorMsg,
 		RetryCount:        log.RetryCount,
 		FinalOutcome:      log.FinalOutcome,
+		AccountBilled:     accountBilled,
 	})
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
@@ -894,8 +906,9 @@ func (db *DB) flushLogs() {
 		`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
 		  api_key_id, api_key_name, api_key_masked,
-		  upstream_error_kind, upstream_error_msg, retry_count, final_outcome)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`)
+		  upstream_error_kind, upstream_error_msg, retry_count, final_outcome,
+		  account_billed)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("批量写入日志失败（准备语句）: %v", err)
@@ -907,7 +920,8 @@ func (db *DB) flushLogs() {
 		if _, err := stmt.ExecContext(ctx, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked,
-			e.UpstreamErrorKind, e.UpstreamErrorMsg, e.RetryCount, e.FinalOutcome); err != nil {
+			e.UpstreamErrorKind, e.UpstreamErrorMsg, e.RetryCount, e.FinalOutcome,
+			e.AccountBilled); err != nil {
 			tx.Rollback()
 			log.Printf("批量写入日志失败（执行）: %v", err)
 			return
@@ -925,13 +939,13 @@ func (db *DB) flushLogs() {
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行 21 个参数，每批最多 3120 行）
+// 分批处理以避免 PostgreSQL 65535 参数限制
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
-	const maxRowsPerBatch = 2500 // 安全阈值：25 params/row * 2500 = 62500 < 65535 PG 参数上限
+	const maxRowsPerBatch = 2400 // 安全阈值：26 params/row * 2400 = 62400 < 65535 PG 参数上限
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -955,28 +969,31 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) e
 	}
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
-	const paramsPerRow = 25
+	// v1.7.60: paramsPerRow 25 -> 26（新增 account_billed）
+	const paramsPerRow = 26
 	valueStrings := make([]string, 0, len(batch))
 	valueArgs := make([]interface{}, 0, len(batch)*paramsPerRow)
 	argIdx := 1
 
 	for _, e := range batch {
 		valueStrings = append(valueStrings, fmt.Sprintf(
-			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
 			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
 			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19, argIdx+20,
-			argIdx+21, argIdx+22, argIdx+23, argIdx+24))
+			argIdx+21, argIdx+22, argIdx+23, argIdx+24, argIdx+25))
 		valueArgs = append(valueArgs, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked,
-			e.UpstreamErrorKind, e.UpstreamErrorMsg, e.RetryCount, e.FinalOutcome)
+			e.UpstreamErrorKind, e.UpstreamErrorMsg, e.RetryCount, e.FinalOutcome,
+			e.AccountBilled)
 		argIdx += paramsPerRow
 	}
 
 	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
 		api_key_id, api_key_name, api_key_masked,
-		upstream_error_kind, upstream_error_msg, retry_count, final_outcome)
+		upstream_error_kind, upstream_error_msg, retry_count, final_outcome,
+		account_billed)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
