@@ -51,10 +51,52 @@ func TestScoreAccount_RuleBreakdown(t *testing.T) {
 			100 + 50 + 30 + 10 + 5, // 195
 		},
 		{
-			"AT only banned",
+			"AT only banned (history status string)",
 			mkAccount(3, "c@x.com", "openai", "banned", "free", "", "at111", false, now),
 			time.Time{},
-			0,
+			-10000, // unhealthy 硬扣分
+		},
+		{
+			"unauthorized + RT (死号误保留修复场景)",
+			mkAccount(7, "g@x.com", "openai", "unauthorized", "free", "rt-stale", "", false, now),
+			time.Time{},
+			-10000 + 100, // -10000 + has_rt(+100) = -9900
+		},
+		{
+			"error status + pro + locked + RT (仍是负分)",
+			mkAccount(8, "h@x.com", "openai", "error", "pro", "rt", "", true, now),
+			time.Time{},
+			-10000 + 100 + 50 + 30, // -9820
+		},
+		{
+			"cooldown_reason=unauthorized + status=active + RT (生产真实场景)",
+			func() *database.AccountRow {
+				a := mkAccount(9, "i@x.com", "openai", "active", "free", "rt", "", false, now)
+				a.CooldownReason = "unauthorized"
+				return a
+			}(),
+			time.Time{},
+			-10000 + 100 + 10, // unhealthy + has_rt + active = -9890
+		},
+		{
+			"cooldown_reason=deactivated_workspace + pro + RT",
+			func() *database.AccountRow {
+				a := mkAccount(10, "j@x.com", "openai", "active", "pro", "rt", "", false, now)
+				a.CooldownReason = "deactivated_workspace"
+				return a
+			}(),
+			time.Time{},
+			-10000 + 100 + 50 + 10, // -9840
+		},
+		{
+			"cooldown_reason=rate_limited 不算不健康（可恢复）",
+			func() *database.AccountRow {
+				a := mkAccount(11, "k@x.com", "openai", "active", "free", "rt", "", false, now)
+				a.CooldownReason = "rate_limited"
+				return a
+			}(),
+			time.Time{},
+			100 + 10, // 无扣分：has_rt + active = 110
 		},
 		{
 			"free but active locked",
@@ -154,6 +196,126 @@ func TestComputeDuplicateGroups_WinnerSelection_ProBeatsFree(t *testing.T) {
 	groups := computeDuplicateGroups(rows, nil)
 	if groups[0].Winner.ID != 2 {
 		t.Fatalf("pro tier must win over free, got winner id=%d", groups[0].Winner.ID)
+	}
+}
+
+// Bug regression: 邮箱去重时，上游 401 封禁但未清 RT 的死号，
+// 不应该赢过同邮箱的 active AT-only 可用账号。
+// 旧逻辑下：status=unauthorized+RT score=100，active+AT-only score=10，死号赢。
+// 修复后：unhealthy -10000+100=-9900，active+AT-only=10，可用号赢。
+//
+// 注意：这个 case 走的是 Status 列兼容分支；生产真实场景看
+// TestComputeDuplicateGroups_CooldownReasonUnauthorized_NeverBeatsActive。
+func TestComputeDuplicateGroups_UnauthorizedNeverBeatsActive(t *testing.T) {
+	now := time.Now()
+	rows := []*database.AccountRow{
+		// unauthorized + RT（被 OpenAI 封但数据库还存旧 RT）
+		mkAccount(100, "dup@x.com", "openai", "unauthorized", "free", "rt-stale", "", false, now),
+		// active + AT-only
+		mkAccount(200, "dup@x.com", "openai", "active", "free", "", "at-good", false, now),
+	}
+	groups := computeDuplicateGroups(rows, nil)
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+	g := groups[0]
+	if g.Winner.ID != 200 {
+		t.Fatalf("active AT-only must win over unauthorized+RT, got winner=%d (score=%d)", g.Winner.ID, g.Winner.Score)
+	}
+	if len(g.Losers) != 1 || g.Losers[0].ID != 100 {
+		t.Fatalf("loser should be unauthorized id=100, got %+v", g.Losers)
+	}
+}
+
+// Bug regression: 即便 unhealthy 号集齐了 RT+pro+locked（原本总加分 180），
+// 也不应该赢过完全无特征的 active AT-only 号。
+func TestComputeDuplicateGroups_ErrorNeverBeatsActive(t *testing.T) {
+	now := time.Now()
+	rows := []*database.AccountRow{
+		// error + RT + pro + locked：旧逻辑 score=100+50+30=180
+		mkAccount(100, "e@x.com", "openai", "error", "pro", "rt", "", true, now),
+		// active + AT-only：score=10
+		mkAccount(200, "e@x.com", "openai", "active", "free", "", "at", false, now),
+	}
+	groups := computeDuplicateGroups(rows, nil)
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+	g := groups[0]
+	if g.Winner.ID != 200 {
+		t.Fatalf("active must beat error even when error has RT+pro+locked, got winner=%d (score=%d)", g.Winner.ID, g.Winner.Score)
+	}
+}
+
+// Bug regression: 生产真实场景 —— status='active' + cooldown_reason='unauthorized'。
+// 2026-05-23 生产调研发现持久化 status 列只取 active/deleted，
+// 封禁信号实际写在 cooldown_reason 上（59 万账号中 647 条处于此状态）。
+func TestComputeDuplicateGroups_CooldownReasonUnauthorized_NeverBeatsActive(t *testing.T) {
+	now := time.Now()
+	banned := mkAccount(100, "dup@x.com", "openai", "active", "free", "rt-stale", "", false, now)
+	banned.CooldownReason = "unauthorized" // 生产表达封禁的真实方式
+
+	good := mkAccount(200, "dup@x.com", "openai", "active", "free", "", "at-good", false, now)
+
+	groups := computeDuplicateGroups([]*database.AccountRow{banned, good}, nil)
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+	g := groups[0]
+	if g.Winner.ID != 200 {
+		t.Fatalf("active AT-only must win over cooldown=unauthorized+RT, got winner=%d (score=%d)", g.Winner.ID, g.Winner.Score)
+	}
+	if len(g.Losers) != 1 || g.Losers[0].ID != 100 {
+		t.Fatalf("loser should be banned id=100, got %+v", g.Losers)
+	}
+}
+
+// Bug regression: workspace 被 OpenAI 停用的账号（402 deactivated_workspace）同样不可恢复。
+func TestComputeDuplicateGroups_DeactivatedWorkspace_NeverBeatsActive(t *testing.T) {
+	now := time.Now()
+	dead := mkAccount(100, "dup@x.com", "openai", "active", "pro", "rt", "", true, now) // pro + locked + RT
+	dead.CooldownReason = "deactivated_workspace"
+
+	good := mkAccount(200, "dup@x.com", "openai", "active", "free", "", "at", false, now)
+
+	groups := computeDuplicateGroups([]*database.AccountRow{dead, good}, nil)
+	if g := groups[0]; g.Winner.ID != 200 {
+		t.Fatalf("active must beat deactivated_workspace even with pro+locked+RT, got winner=%d", g.Winner.ID)
+	}
+}
+
+// cooldown_reason=rate_limited 是可恢复状态，不当作 unhealthy。
+// 避免误伤临时限流但仍有价值的主号。
+func TestComputeDuplicateGroups_RateLimited_StillUsable(t *testing.T) {
+	now := time.Now()
+	rateLimited := mkAccount(100, "dup@x.com", "openai", "active", "pro", "rt", "", false, now)
+	rateLimited.CooldownReason = "rate_limited"
+
+	atOnly := mkAccount(200, "dup@x.com", "openai", "active", "free", "", "at", false, now)
+
+	groups := computeDuplicateGroups([]*database.AccountRow{rateLimited, atOnly}, nil)
+	// rate_limited+pro+RT (160) 仍赢 active+AT-only (10)
+	if g := groups[0]; g.Winner.ID != 100 {
+		t.Fatalf("rate_limited pro+RT must still beat active AT-only (it is recoverable), got winner=%d", g.Winner.ID)
+	}
+}
+
+// 两个都是 unhealthy 时，应按原有规则比（均 -10000 扣完之后看剩余分项）。
+func TestComputeDuplicateGroups_BothUnhealthy_StillRanks(t *testing.T) {
+	now := time.Now()
+	rows := []*database.AccountRow{
+		// unauthorized + RT：score=-10000+100=-9900
+		mkAccount(1, "u@x.com", "openai", "unauthorized", "free", "rt", "", false, now),
+		// error、无 RT：score=-10000
+		mkAccount(2, "u@x.com", "openai", "error", "free", "", "at", false, now),
+	}
+	groups := computeDuplicateGroups(rows, nil)
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+	g := groups[0]
+	if g.Winner.ID != 1 {
+		t.Fatalf("when both unhealthy, higher residual score must win, got %d", g.Winner.ID)
 	}
 }
 

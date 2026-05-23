@@ -23,11 +23,14 @@ import (
 //   3. 跨 platform 不算重复：同 email 但 platform 不同（openai/anthropic）保留全部。
 //   4. 忽略空 email：无法识别的账号不参与去重。
 //   5. Winner 规则（从高到低打分）：
-//        - has_rt      +100  有 refresh_token（能续命）
-//        - is_pro_tier  +50  plan_type != free
-//        - locked       +30  已手动锁定（珍贵账号）
-//        - active       +10  status=active（非 banned/error）
-//        - recent_used   +5  last_used_at 在 7 天内
+//        - unhealthy   -10000  不可恢复账号，详见 isAccountUnhealthy。
+//                              确保封禁/workspace 停用账号永远输给可用账号，
+//                              即便它仍持有 RT / pro / locked。
+//        - has_rt        +100  有 refresh_token（能续命）
+//        - is_pro_tier    +50  plan_type != free
+//        - locked         +30  已手动锁定（珍贵账号）
+//        - active         +10  status=active（非 banned/error）
+//        - recent_used     +5  last_used_at 在 7 天内
 //        - 最终平局按 id ASC（最早导入优先）
 //
 // 路由：
@@ -60,10 +63,39 @@ type duplicateGroup struct {
 	TotalInGroup int                    `json:"total_in_group"` // 含 winner 的总数
 }
 
+// isAccountUnhealthy 识别“不可恢复”账号，去重时须永远输给可用账号。
+//
+// 生产现状事实（SELECT status, cooldown_reason, COUNT(*) FROM accounts ...）：
+//   status='active'  + cooldown_reason='unauthorized'         → 封禁死号
+//   status='active'  + cooldown_reason='deactivated_workspace'→ workspace 停用
+//   status='active'  + cooldown_reason='rate_limited'         → 可恢复，不算不健康
+//   status='deleted' → 已被 dedupe 排除
+//
+// 持久化 status 列实际只取 'active'/'deleted'（不会出现 'unauthorized'/'error'/'banned'），
+// 但同时保留对 Status 的识别，以兼容历史/未来可能的持久化改写。
+func isAccountUnhealthy(row *database.AccountRow) bool {
+	switch strings.ToLower(strings.TrimSpace(row.CooldownReason)) {
+	case "unauthorized", "deactivated_workspace":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(row.Status)) {
+	case "unauthorized", "error", "banned":
+		return true
+	}
+	return false
+}
+
 // scoreAccount 按 Winner 规则计算账号得分，用于组内排序挑 winner。
 // 得分越高越应该被保留。
 func scoreAccount(row *database.AccountRow, lastUsedAt time.Time) int {
 	score := 0
+	// 不可用状态硬扣分：远超所有正分上限（195），确保即便账号
+	// 仍持有 RT、pro、locked 也永远输给任何可用账号。
+	// 修复场景：被上游 401 封禁但 RT 未清的死号 vs AT-only 的可用账号，
+	//          旧逻辑下死号(+100) 会赢可用号(+10)，把可用号误删。
+	if isAccountUnhealthy(row) {
+		score -= 10000
+	}
 	if row.GetCredential("refresh_token") != "" {
 		score += 100
 	}
@@ -221,7 +253,7 @@ func (h *Handler) ListDuplicateAccounts(c *gin.Context) {
 		"total_groups":      len(groups),
 		"total_losers":      totalLosers,
 		"scanned_accounts":  len(rows),
-		"winner_rule":       "has_rt(+100) > plan!=free(+50) > locked(+30) > active(+10) > recent_used(+5) > id ASC",
+		"winner_rule":       "unhealthy(cooldown_reason=unauthorized|deactivated_workspace or status=unauthorized|error|banned -> -10000) > has_rt(+100) > plan!=free(+50) > locked(+30) > active(+10) > recent_used(+5) > id ASC",
 	})
 }
 
