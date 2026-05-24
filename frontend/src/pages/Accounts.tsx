@@ -2387,21 +2387,27 @@ function ATExpiryBadge({ expiresAt }: { expiresAt?: string }) {
 }
 
 // 用量列组件
+//
+// 显示策略不再单独依赖 plan_type：
+// 当 plan_type 还停留在按 RT 刷新出来的旧值（例如 "free"）但账号实际已订阅、
+// 后端已经返回 5h 窗口数据时，只看 plan_type 会把 5h 吞掉。
+// 因此这里以"是否真的存在 5h / 7d 数据（含 reset 时间）"作为主判据，
+// plan_type 仅作为 5h 数据缺位时的辅助占位提示（避免订阅型账号布局抖动）。
 function UsageCell({ account }: { account: AccountRow }) {
   const plan = (account.plan_type || '').toLowerCase()
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
+  const has5hReset = !!account.reset_5h_at
+  const has7dReset = !!account.reset_7d_at
 
-  if (plan === 'free') {
-    if (!has7d) return <span className="text-[12px] text-muted-foreground">-</span>
-    return (
-      <div className="w-40">
-        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
-      </div>
-    )
-  }
+  const fiveHourPresent = has5h || has5hReset
+  const sevenDayPresent = has7d || has7dReset
 
-  if (plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus') {
+  // plan 表明是订阅型时，即使数据暂未拉到也按订阅布局占位，避免页面抖动
+  const planSuggestsPremium = plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus'
+  const showFiveHour = fiveHourPresent || planSuggestsPremium
+
+  if (showFiveHour) {
     if (!has5h && !has7d) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
       <div className="w-48 space-y-1.5">
@@ -2411,13 +2417,14 @@ function UsageCell({ account }: { account: AccountRow }) {
     )
   }
 
-  if (has7d) {
+  if (sevenDayPresent && has7d) {
     return (
       <div className="w-40">
         <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
       </div>
     )
   }
+
   return <span className="text-[13px] text-muted-foreground">-</span>
 }
 
