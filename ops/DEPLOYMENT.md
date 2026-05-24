@@ -4,15 +4,15 @@
 >
 > **2026-05-15 起架构变更**：codex2api 应用层迁到独立 VPS `codex-node` (`152.53.210.32`)，PG/nginx 留 `node2` (`152.53.240.159`)，两机走 **WireGuard** 互连。整体见 `ARCHITECTURE.md`。
 
-## 1. 线上状态（截至 2026-05-24 01:40）
+## 1. 线上状态（截至 2026-05-24 09:50）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.60.1-billing-ui`（`latest`）|
+| 镜像 | `codex2api:v1.7.60.2-usagecell-window`（`latest`）|
 | 容器 | `codex2api` （在 **codex-node** 上）|
 | 容器内端口 | `8123`（`CODEX_PORT=8123`，固定不变） |
-| 宿主端口 | `10.10.0.2:8104:8123`（**仅监听 WG IP**，公网不可达） |
-| nginx upstream | `proxy_pass http://10.10.0.2:8104;` （在 **node2** 上）|
+| 宿主端口 | `10.10.0.2:8105:8123`（**仅监听 WG IP**，公网不可达） |
+| nginx upstream | `proxy_pass http://10.10.0.2:8105;` （在 **node2** 上）|
 | 部署目录 | `/data/codex2api/`（在 **codex-node** 上） |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`（在 **node2**, 通过 socat 暴露 `10.10.0.1:5432`）|
@@ -44,7 +44,7 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 
 > 容器内 `CODEX_PORT=8123` **始终不变**。蓝绿换的是 codex-node 上对外暴露的 WG 端口（`-p 10.10.0.2:NEW:8123`）。
 >
-> 当前主端口 8104；下次蓝绿候选 `8105 / 8106 / 8107`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
+> 当前主端口 8105；下次蓝绿候选 `8106 / 8107 / 8104`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
 
 **🚨 不要把多步串成一行 bash——stdout buffer 会让你误以为卡死。每步独立跑。**
 
@@ -53,7 +53,7 @@ SSH_CODEX='sshpass -p fmAJ8zmcAKL0ER8 ssh -p 22 -o StrictHostKeyChecking=no root
 SSH_NODE2='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP_CODEX='sshpass -p fmAJ8zmcAKL0ER8 scp -P 22 -o StrictHostKeyChecking=no'
 
-OLD=8104; NEW=8105; TAG=v1.7.61-xxx
+OLD=8105; NEW=8106; TAG=v1.7.61-xxx
 ```
 
 > **起容器前先验空（在 codex-node 上）**：`ss -tlnp | grep ":810[4-9]"` 确认目标端口无人监听
@@ -237,6 +237,7 @@ $SSH_NODE2 'docker ps --filter name=socat-pg-bridge --format "{{.Names}} {{.Stat
 | **v1.7.59-dedupe-banned-fix** | **10.10.0.2:8108** | **2026-05-24 00:05** | **修复邮箱去重误删可用账号**：`scoreAccount` 原逻辑下封禁但 RT 未清的死号（+100）会赢同邮箱的 active AT-only 可用号（+10），把可用号误删。生产调研发现持久化 `status` 列只取 `active`/`deleted`，封禁信号实际写在 `cooldown_reason` 上（`unauthorized` 647 条 / `deactivated_workspace`）。抽 `isAccountUnhealthy` 同时识别 `cooldown_reason ∈ {unauthorized, deactivated_workspace}` 和 `status ∈ {unauthorized, error, banned}`（后者历史兼容），unhealthy 账号 -10000，远超所有正分上限（195）。`rate_limited` 是可恢复状态不被误伤。[2 文件 / 14 个测试全过 / 后端逻辑 only] |
 | **v1.7.60-billing-pro-deps** | **10.10.0.2:8109** | **2026-05-24 01:15** | **同步上游 v2.1.6 计费系统 + Pro 模型注册 + 安全依赖升级**。计费侧：cherry-pick `database/billing.go`（358 行，含 ModelPricing/CalculateCost/normalizeCodexBillingModel/长上下文 272K 溢价），`usage_logs` 表加 `account_billed DOUBLE PRECISION DEFAULT 0` 列，`InsertUsageLog` 内部调用 `calculateCost(model, tokens, service_tier)` 计出并写入——调用方零改动。模型侧：`SupportedModels` 加 `gpt-5.5-pro` / `gpt-5.4-pro`（Codex 高推理预算变种，独立计费档 $30/$180 per 1M）；codex-auto-review 不加入 SupportedModels（ChatGPT backend API only）但计费已映射到 gpt-5.4 档。依赖侧：golang.org/x/{net,crypto,sys,text} 全部升到最新安全补丁版本。[8 文件 / +764/-32 / 17 个 billing 测试全过] |
 | **v1.7.60.1-billing-ui** | **10.10.0.2:8104** | **2026-05-24 01:40** | **计费系统读取侧 + UI**。`UsageLog` 加 9 个美元/价格字段（AccountBilled/TotalCost/InputCost/OutputCost/CacheReadCost + 3 个 price + RateMultiplier），移植 `populateBillingBreakdown` 方法（按 AccountBilled 持久化值缩放 breakdown）。新增 `GetAccountsBilledMap(ctx, since)` 一次 SQL 拿所有账号成本 map。`accountResponse` 加 `billed_5h` / `billed_7d`，`ListAccounts` 在循环外调 2 次聚合，序化到列表响应。前端 `Accounts.tsx` 在帐号行下加琰珀色的 `5h:$X · 7d:$Y`（区别于上面绿色的本地估算 estimated_cost_7d）。验证：PG SUM 7.2747 vs API billed_5h 7.274658 一致。原之前被 _DISABLED 的 TestUsageLogBreakdownScalesToStoredBilledTotal 启用并通过。[5 文件 / +131/-7 / 18 个 billing 测试全过] |
+| **v1.7.60.2-usagecell-window** | **10.10.0.2:8105** | **2026-05-24 09:50** | **UsageCell 改用实际 window 数据驱动 5h/7d 显示**（cherry-pick 上游 `d2a6b72` 的 UsageCell 部分）。之前逻辑是 `plan === 'free'` 强制只显示 7d，导致 plan_type 还是 free 但 OpenAI 已返 reset_5h_at 的升级账号看不到 5h 条（plan_type 仅在 RT 刷新时重算，有明显滑后）。现以 `has5h ∨ reset_5h_at` / `has7d ∨ reset_7d_at` 作为主判据，plan_type 仅作占位辅助（订阅型账号数据未拉到时避免布局抖动）。上游同步的 sub2api / json_at / chatgpt_account_id 去重 所有未需需求未合。[1 文件 / +17/-10 / TS 检查通过] |
 
 ## 8. 不要再做的事 / 踩过的坑
 
