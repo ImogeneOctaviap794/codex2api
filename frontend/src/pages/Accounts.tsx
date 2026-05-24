@@ -2388,11 +2388,12 @@ function ATExpiryBadge({ expiresAt }: { expiresAt?: string }) {
 
 // 用量列组件
 //
-// 显示策略不再单独依赖 plan_type：
-// 当 plan_type 还停留在按 RT 刷新出来的旧值（例如 "free"）但账号实际已订阅、
-// 后端已经返回 5h 窗口数据时，只看 plan_type 会把 5h 吞掉。
-// 因此这里以"是否真的存在 5h / 7d 数据（含 reset 时间）"作为主判据，
-// plan_type 仅作为 5h 数据缺位时的辅助占位提示（避免订阅型账号布局抖动）。
+// 显示策略：以"是否真的存在 5h / 7d 数据"作为主判据，plan_type 仅作占位辅助。
+//
+// 反噪声特例：OpenAI 给 free 账号下发的 5h 字段恒为 0%（实测 1623/1626 free 账号 5h 都是 0）——
+// 这是 OpenAI 业务事实：free 没有真正的 5h 速率限制，只有 7d 限制；5h 字段是占位无信息量。
+// 因此 free 账号要求 5h 用量 > 0 才显示 5h 条；这同时也能正确捕获 plan_type 滞后到 free
+// 但实际已升级 plus 的账号——它们的真实 5h 用量会 > 0。
 function UsageCell({ account }: { account: AccountRow }) {
   const plan = (account.plan_type || '').toLowerCase()
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
@@ -2400,18 +2401,22 @@ function UsageCell({ account }: { account: AccountRow }) {
   const has5hReset = !!account.reset_5h_at
   const has7dReset = !!account.reset_7d_at
 
-  const fiveHourPresent = has5h || has5hReset
+  // free 账号 5h 字段恒为 0 占位 → 仅在 pct > 0 时认为真有 5h 数据
+  // 其他 plan：has5h 或 has5hReset 任一存在即视为有数据
+  const has5hMeaningful = plan === 'free'
+    ? (has5h && (account.usage_percent_5h ?? 0) > 0)
+    : (has5h || has5hReset)
   const sevenDayPresent = has7d || has7dReset
 
   // plan 表明是订阅型时，即使数据暂未拉到也按订阅布局占位，避免页面抖动
   const planSuggestsPremium = plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus'
-  const showFiveHour = fiveHourPresent || planSuggestsPremium
+  const showFiveHour = has5hMeaningful || planSuggestsPremium
 
   if (showFiveHour) {
     if (!has5h && !has7d) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
       <div className="w-48 space-y-1.5">
-        {has5h && <UsageBar label="5h" pct={account.usage_percent_5h!} resetAt={account.reset_5h_at} />}
+        {has5hMeaningful && <UsageBar label="5h" pct={account.usage_percent_5h!} resetAt={account.reset_5h_at} />}
         {has7d && <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />}
       </div>
     )
