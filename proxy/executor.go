@@ -281,12 +281,19 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
 
 	// 3. 注入 prompt_cache_key（如果请求体中没有，且 sessionID 不为空）
+	//    身份混淆开启时，cacheKey 先按选中账号确定性重映射，避免脏会话跨账号污染；
+	//    identityState 记录 {原值→混淆值}，供响应回写还原（turn_id 等）
+	identityState := NewCodexIdentityConfuseState()
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
 	if sessionID != "" {
 		cacheKey = sessionID
+	}
+	cacheKey = ConfuseCodexSessionForAccount(account, cacheKey, identityState)
+	if cacheKey != "" {
 		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
 	}
+	requestBody = ApplyCodexIdentityConfuseBody(account, requestBody, cacheKey, identityState)
 
 	endpoint := CodexBaseURL + "/responses"
 
@@ -305,7 +312,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 
 	// ==================== 请求头（伪装 Codex CLI） ====================
-	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers, identityState)
 
 	// Resin 反代：注入账号身份头
 	if IsResinEnabled() {
@@ -320,6 +327,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		}
 		return nil, ErrUpstream(0, "请求上游失败", err)
 	}
+
+	// 身份混淆：把上游回显的混淆值在响应里还原成客户端原值（confused→original）
+	resp.Body = WrapCodexIdentityResponseBody(resp.Body, identityState)
 
 	return resp, nil
 }
@@ -352,12 +362,17 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
 
+	identityState := NewCodexIdentityConfuseState()
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
 	if sessionID != "" {
 		cacheKey = sessionID
+	}
+	cacheKey = ConfuseCodexSessionForAccount(account, cacheKey, identityState)
+	if cacheKey != "" {
 		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
 	}
+	requestBody = ApplyCodexIdentityConfuseBody(account, requestBody, cacheKey, identityState)
 
 	// compact 端点
 	endpoint := CodexBaseURL + "/responses/compact"
@@ -376,7 +391,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 		return nil, ErrInternalError("创建请求失败", err)
 	}
 
-	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers, identityState)
 
 	if IsResinEnabled() {
 		req.Header.Set("X-Resin-Account", ResinAccountID(account))
@@ -390,6 +405,8 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 		}
 		return nil, ErrUpstream(0, "请求上游失败", err)
 	}
+
+	resp.Body = WrapCodexIdentityResponseBody(resp.Body, identityState)
 
 	return resp, nil
 }
@@ -419,7 +436,7 @@ func applyCodexAllowedForwardHeaders(req *http.Request, downstreamHeaders http.H
 	}
 }
 
-func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessToken, cacheKey, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) {
+func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessToken, cacheKey, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header, identityState *CodexIdentityConfuseState) {
 	if req == nil {
 		return
 	}
@@ -474,6 +491,8 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Set("Session_id", cacheKey)
 		req.Header.Del("Conversation_id")
 	}
+	// 身份混淆：补充处理转发头里残留的会话标识（cacheKey 已是混淆值），并登记 turn_id 回写映射
+	ApplyCodexIdentityConfuseHeaders(account, req.Header, cacheKey, identityState)
 }
 
 // ResolveSessionID 从下游请求提取或生成 session ID

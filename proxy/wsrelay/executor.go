@@ -86,8 +86,14 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		return nil, fmt.Errorf("无可用 access_token")
 	}
 
+	// 身份混淆：按选中账号确定性重映射会话标识，避免脏会话跨账号污染。
+	// 连接池 key 仍用原 sessionID（内部命名空间），仅发往上游的 body/header 用混淆值。
+	// 传 nil state：WS 路径不做响应回写，故不混淆 turn_id（避免多轮漂移）。
+	confusedSession := proxy.ConfuseCodexSessionForAccount(account, sessionID, nil)
+
 	// 准备请求体
-	wsBody := e.prepareWebsocketBody(requestBody, sessionID)
+	wsBody := e.prepareWebsocketBody(requestBody, confusedSession)
+	wsBody = proxy.ApplyCodexIdentityConfuseBody(account, wsBody, confusedSession, nil)
 
 	// 构建 WebSocket URL
 	httpURL := proxy.CodexBaseURL + CodexWsEndpoint
@@ -101,8 +107,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		wsURL = proxy.BuildWebSocketURL(wsURL)
 	}
 
-	// 准备请求头
-	headers := e.prepareWebsocketHeaders(accessToken, accountIDStr, sessionID, apiKey, deviceCfg, ginHeaders)
+	// 准备请求头（Session_id / Conversation_id 使用混淆后的会话标识）
+	headers := e.prepareWebsocketHeaders(accessToken, accountIDStr, confusedSession, apiKey, deviceCfg, ginHeaders)
+	proxy.ApplyCodexIdentityConfuseHeaders(account, headers, confusedSession, nil)
 
 	// Resin 反代：注入账号身份头
 	if proxy.IsResinEnabled() {

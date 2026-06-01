@@ -4,15 +4,15 @@
 >
 > **2026-05-15 起架构变更**：codex2api 应用层迁到独立 VPS `codex-node` (`152.53.210.32`)，PG/nginx 留 `node2` (`152.53.240.159`)，两机走 **WireGuard** 互连。整体见 `ARCHITECTURE.md`。
 
-## 1. 线上状态（截至 2026-05-28 13:02）
+## 1. 线上状态（截至 2026-06-02 03:18）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.65-fast-model-aliases`（`latest`）|
+| 镜像 | `codex2api:v1.7.66-identity-confuse`（`latest`）|
 | 容器 | `codex2api` （在 **codex-node** 上）|
 | 容器内端口 | `8123`（`CODEX_PORT=8123`，固定不变） |
-| 宿主端口 | `10.10.0.2:8106:8123`（**仅监听 WG IP**，公网不可达） |
-| nginx upstream | `proxy_pass http://10.10.0.2:8106;` （在 **node2** 上）|
+| 宿主端口 | `10.10.0.2:8107:8123`（**仅监听 WG IP**，公网不可达） |
+| nginx upstream | `proxy_pass http://10.10.0.2:8107;` （在 **node2** 上）|
 | 部署目录 | `/data/codex2api/`（在 **codex-node** 上） |
 | Admin | https://cx.wyzai.top/admin/　secret = `65187777` |
 | 数据库 | PG `codex2api-postgres`（在 **node2**, 通过 socat 暴露 `10.10.0.1:5432`）|
@@ -24,6 +24,7 @@
 | 容器 body 上限 | **64 MB**（`CODEX_MAX_REQUEST_BODY_SIZE_MB=64`）|
 | Dialog 采集 | ❌ 默认关闭（v1.7.55+ 起 `DIALOG_COLLECTION_ENABLED` 默认 false，需显式 opt-in）|
 | Prefer-paid 调度 | Admin 面板运行时开关（默认 OFF = prefer_free）|
+| 身份混淆 | ✅ 已启用（`CODEX_IDENTITY_CONFUSE=true`，v1.7.66+）：按账号重映射会话身份标识防跨账号污染 |
 | 图床 `img.niji.edu.rs` | DNS→node2; node2 nginx `try_files → fallback @codex_node` 反代到 `10.10.0.2:8888` （`codex-images-nginx` 容器）|
 
 ## 2. SSH 接入
@@ -44,7 +45,7 @@ sshpass -p '2R18UapfDNoT'   ssh -p 24598 root@156.238.226.55
 
 > 容器内 `CODEX_PORT=8123` **始终不变**。蓝绿换的是 codex-node 上对外暴露的 WG 端口（`-p 10.10.0.2:NEW:8123`）。
 >
-> 当前主端口 8106；下次蓝绿候选 `8107 / 8104 / 8105`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
+> 当前主端口 8107；下次蓝绿候选 `8104 / 8105 / 8106`（在 codex-node 上 +1 轮换，便于 nginx 平滑切换）。
 
 **🚨 不要把多步串成一行 bash——stdout buffer 会让你误以为卡死。每步独立跑。**
 
@@ -53,7 +54,7 @@ SSH_CODEX='sshpass -p fmAJ8zmcAKL0ER8 ssh -p 22 -o StrictHostKeyChecking=no root
 SSH_NODE2='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP_CODEX='sshpass -p fmAJ8zmcAKL0ER8 scp -P 22 -o StrictHostKeyChecking=no'
 
-OLD=8106; NEW=8107; TAG=v1.7.66-xxx
+OLD=8107; NEW=8104; TAG=v1.7.67-xxx
 ```
 
 > **起容器前先验空（在 codex-node 上）**：`ss -tlnp | grep ":810[4-9]"` 确认目标端口无人监听
@@ -244,6 +245,7 @@ $SSH_NODE2 'docker ps --filter name=socat-pg-bridge --format "{{.Names}} {{.Stat
 | **v1.7.63-gpt54-premium-toggle** | **未独立切流** | **2026-05-28 03:45** | **新增 gpt-5.4 仅付费账号可调度开关**：`system_settings.gpt54_premium_only_enabled`（默认 false）+ Store atomic 热开关 + admin settings API + 前端 Settings 下拉按钮与中英文文案。开启后仅对精确 `gpt-5.4` 生效，`planDispatch` 通过 `IsEffectivePremiumOnly` 排除 free，只让 plus/pro/team 候选；不影响 `gpt-5.4-mini` / `gpt-5.4-pro`，生图 `image_generation` 仍沿用付费账号规则。补 `TestIsEffectivePremiumOnlyGPT54RuntimeToggle` 锁定行为；顺手给 `Store.AddAccount` 加零值 `accountIndex` 保护，修复 admin 单测直接构造 `&auth.Store{}` 时 nil map panic。该版本代码随 v1.7.64 一并上线。 |
 | **v1.7.64-gpt54-to-gpt55-alias-preset** | **10.10.0.2:8105** | **2026-05-28 04:02** | **合并上线 v1.7.63 + 新增虚拟模型别名预设按钮**：在 Settings → 虚拟模型别名（Payload 注入）中增加“5.4→5.5，响应保留 5.4”合并预设，生成 `gpt-5.4: { base_model: "gpt-5.5", response_alias: "gpt-5.4" }`，让客户端仍请求/看到 `gpt-5.4`，上游实际走 `gpt-5.5`。同步中英文文案；保留原 `5.5→5.4，xhigh 保留 5.5` 预设不变。验证：`go test ./...`、`go vet ./...`、`go build ./...`、`npm run typecheck`、`npm run build`、公网 `/health`、公网前端 JS 文案 grep 全过。 |
 | **v1.7.65-fast-model-aliases** | **10.10.0.2:8106** | **2026-05-28 13:02** | **新增内置 fast 模型别名**：`gpt-5.5-fast` → `base_model=gpt-5.5`、`gpt-5.4-fast` → `base_model=gpt-5.4`，自动注入 `service_tier:"fast"` 并保留响应 model 为 fast 别名；出上游前沿用现有逻辑将 `fast` 映射为上游接受的 `priority`，且受 Admin `fast_alias_enabled` 开关控制（关闭时剥离 fast、走 default）。内置别名出现在 `/v1/models` 和 Admin 模型策略列表，管理员同名 `model_payload_overrides` 仍可覆盖内置默认。验证：`go test ./...`、`go vet ./...`、`go build ./...`、`npm run typecheck`、`npm run build` 全过。 |
+| **v1.7.66-identity-confuse** | **10.10.0.2:8107** | **2026-06-02 03:18** | **Codex 身份混淆（对齐 CLIProxyAPI 完全体）**：解决 OpenAI 风控「被封会话污染下一个账号」——填充优先/会话粘性下同一会话身份标识跨账号流转，脏会话牵连新账号。新增 `proxy/identity_confuse.go`：账号选定后、发上游前，用 `SHA1(accountSalt + 原值)` 把会话身份标识确定性重映射成绑定当前账号的新 UUID（salt 取 `AccountID`，回退 `DBID`），同账号同原值幂等（会话连续性/缓存不变）、不同账号永不共享标识。覆盖字段：body `prompt_cache_key` / `client_metadata.x-codex-installation-id` / `x-codex-window-id` / `x-codex-turn-metadata`(内嵌 prompt_cache_key/window_id/turn_id)，headers `Session_id` / `X-Codex-Window-Id` / `X-Codex-Turn-Metadata`。**turn_id 完全体**：请求侧混淆 + `CodexIdentityConfuseState` 记 {原值→混淆值}，响应侧 `WrapCodexIdentityResponseBody` 流式把上游回显的混淆值还原成客户端原值（confused→original），多轮闭环不漂移；回写 reader 按最后换行切分（UUID 不跨 SSE 行），完整行立即输出、零额外延迟。仅 HTTP 路径做 turn_id+回写；WS 路径传 nil state（不碰 turn_id，避免无回写漂移）。开关 env `CODEX_IDENTITY_CONFUSE`（默认 false，本次部署设为 true）。接入 `ExecuteRequest`/`ExecuteCompactRequest`/`applyCodexRequestHeaders`/wsrelay，handler 零改动（包装 resp.Body）。验证：`go build ./...`、`go vet ./...`、`go test ./...` 全过（新增 11 测试含跨 chunk 边界）。[4 文件改动 + 1 新文件 + .env.example] |
 
 ## 8. 不要再做的事 / 踩过的坑
 
@@ -294,6 +296,7 @@ CODEX_PORT=8123                         # 容器内固定，外部端口由 dock
 CODEX_MAX_REQUEST_BODY_SIZE_MB=64       # 请求体上限，默认 32MB；v1.7.48 起调到 64MB 解决 413
 DIALOG_COLLECTION_ENABLED=false         # v1.7.55+ 默认 false；需采集时显式 opt-in
 CODEX_TRANSPORT_MODE=standard           # TLS 指纹：standard=Go 原生 / utls_chrome=仿 Chrome
+CODEX_IDENTITY_CONFUSE=true             # v1.7.66+：身份混淆，按账号重映射会话标识防跨账号污染（含 turn_id 完全体 + HTTP 响应回写）
 # PG 走 WG 到 node2
 DB_HOST=10.10.0.1                       # node2 上的 socat 桥接
 DB_PORT=5432

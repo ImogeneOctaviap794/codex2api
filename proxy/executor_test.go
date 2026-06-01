@@ -166,7 +166,7 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 		"Originator": []string{"custom-originator"},
 	}
 
-	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", cfg, downstreamHeaders)
+	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", cfg, downstreamHeaders, nil)
 
 	if got := req.Header.Get("Authorization"); got != "Bearer token-123" {
 		t.Fatalf("Authorization = %q", got)
@@ -207,7 +207,7 @@ func TestApplyCodexRequestHeadersUsesMinimalFallbackByDefault(t *testing.T) {
 		AccountID: "acct-42",
 	}
 
-	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, http.Header{})
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, http.Header{}, nil)
 
 	if got := req.Header.Get("User-Agent"); got != latestCodexCLIUserAgentPrefix {
 		t.Fatalf("User-Agent = %q, want minimal Codex CLI %q", got, latestCodexCLIUserAgentPrefix)
@@ -232,7 +232,7 @@ func TestApplyCodexRequestHeadersPreservesOfficialClientHeaders(t *testing.T) {
 		"X-Client-Request-Id":   []string{"req-123"},
 	}
 
-	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", nil, downstreamHeaders)
+	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", nil, downstreamHeaders, nil)
 
 	if got := req.Header.Get("User-Agent"); got != "codex_vscode/1.2.3" {
 		t.Fatalf("User-Agent = %q", got)
@@ -261,7 +261,7 @@ func TestApplyCodexRequestHeadersFallsBackForNonOfficialClient(t *testing.T) {
 		"Originator": []string{"opencode"},
 	}
 
-	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders, nil)
 
 	if got := req.Header.Get("User-Agent"); got != latestCodexCLIUserAgentPrefix {
 		t.Fatalf("User-Agent = %q, want %q", got, latestCodexCLIUserAgentPrefix)
