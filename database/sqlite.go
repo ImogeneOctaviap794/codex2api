@@ -175,6 +175,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "rt_manager_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "free_gpt55_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "prefer_paid_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "gpt54_premium_only_enabled", "INTEGER DEFAULT 0"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},

@@ -66,6 +66,42 @@ type ModelOverride struct {
 // ModelOverrideMap 虚拟模型名 → 配置的映射。
 type ModelOverrideMap map[string]ModelOverride
 
+// BuiltInModelOverrides 返回无需管理员手动配置即可使用的内置虚拟模型。
+func BuiltInModelOverrides() ModelOverrideMap {
+	return ModelOverrideMap{
+		"gpt-5.5-fast": {
+			BaseModel:     "gpt-5.5",
+			ResponseAlias: "gpt-5.5-fast",
+			Inject: map[string]json.RawMessage{
+				"service_tier": json.RawMessage(`"fast"`),
+			},
+			Description: "gpt-5.5 with service_tier=fast",
+		},
+		"gpt-5.4-fast": {
+			BaseModel:     "gpt-5.4",
+			ResponseAlias: "gpt-5.4-fast",
+			Inject: map[string]json.RawMessage{
+				"service_tier": json.RawMessage(`"fast"`),
+			},
+			Description: "gpt-5.4 with service_tier=fast",
+		},
+	}
+}
+
+// MergeModelOverrides 合并多个虚拟模型配置，后者覆盖前者。
+func MergeModelOverrides(overrides ...ModelOverrideMap) ModelOverrideMap {
+	merged := ModelOverrideMap{}
+	for _, current := range overrides {
+		for name, cfg := range current {
+			merged[name] = cfg
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
 // ParseModelOverrides 解析 JSON 字符串。空字符串或非法 JSON 返回空 map（不报错），
 // 符合"配置错误时静默退化为无别名"的容错策略。
 func ParseModelOverrides(jsonStr string) ModelOverrideMap {

@@ -83,6 +83,7 @@ func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool
 // nextAccountForSessionWithPreference 按 plan 偏好的两阶段选号：
 //  1. 先把 preferPlan 以外的账号全部视作 exclude，只在偏好池中选；
 //  2. 偏好池空/全忙时，回退到普通 exclude 选号。
+//
 // preferPlan 为空则退化为普通选号。
 // 支持多 plan CSV（如 "plus,pro,team"），用于 prefer_paid 模式：付费账号优先，free 兜底。
 func (h *Handler) nextAccountForSessionWithPreference(sessionID string, exclude map[int64]bool, preferPlan string) (*auth.Account, string) {
@@ -579,7 +580,11 @@ const drawingResponseModelAlias = "gpt-5.4"
 // 未命中或未配置时返回原 body。
 // 第二个返回值是 hit 的虚拟模型配置（nil 表示未命中），供调用者判断是否是画图请求。
 func (h *Handler) applyVirtualModel(rawBody []byte) ([]byte, *ModelOverride) {
-	overrides := ParseModelOverrides(h.store.GetModelPayloadOverrides())
+	var configured ModelOverrideMap
+	if h != nil && h.store != nil {
+		configured = ParseModelOverrides(h.store.GetModelPayloadOverrides())
+	}
+	overrides := MergeModelOverrides(BuiltInModelOverrides(), configured)
 	if len(overrides) == 0 {
 		return rawBody, nil
 	}
@@ -936,7 +941,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var responseJSON []byte
-		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
+		var capacityErrMsg string   // 上游 response.failed 携带的容量错误，用于触发透明重试
 		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
 		// 对话采集：累积上游 Codex SSE 原始事件（用于训练数据落盘）
@@ -1712,7 +1717,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var compactResult []byte
-		var capacityErrMsg string // 上游 response.failed 携带的容量错误，用于触发透明重试
+		var capacityErrMsg string   // 上游 response.failed 携带的容量错误，用于触发透明重试
 		var lastFailedErrMsg string // 上游 response.failed 的 error.message（debug 用，不论是否 capacity）
 
 		// 对话采集：累积上游 Codex SSE 原始事件（用于训练数据落盘）
@@ -1722,6 +1727,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if isStream {
 			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
+			// 仅画图虚拟模型命中时挂 usage hook：用本地 tokenizer 重算用户
+			// 视角的输入 tokens，仅影响对外响应；入库（logInput）走原 usage 不变。
+			// 其他所有请求路径不挂 hook → translator 内部行为完全不变。
+			if virtualHit != nil && virtualHit.InjectsImageGeneration() {
+				streamTranslator.UsageHook = func(u *UsageInfo) *UsageInfo {
+					return AdjustUsageForVirtualImage(u, virtualHit, rawBody)
+				}
+			}
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -1863,7 +1876,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), toolCalls, usage)
+			// 仅画图虚拟模型命中时重算用户视角 input tokens，仅影响对外响应；
+			// 原 usage 变量保持上游原值，下方 logInput 入库依然按原值算成本。
+			// 其他所有请求路径走原 usage（responseUsage == usage 指针）。
+			responseUsage := usage
+			if virtualHit != nil && virtualHit.InjectsImageGeneration() {
+				responseUsage = AdjustUsageForVirtualImage(usage, virtualHit, rawBody)
+			}
+			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), toolCalls, responseUsage)
 		}
 
 		// 容量错误透明重试：首包前上游报 "at capacity" → 换账号重试，不冷却原账号。
@@ -2112,6 +2132,7 @@ func parseRetryAfter(body []byte) time.Duration {
 // Codex 对已停用的 team/enterprise workspace 返回:
 //   - {"detail":{"code":"deactivated_workspace"}}
 //   - {"error":{"code":"deactivated_workspace"}}
+//
 // 该账号对任何 API 请求都不可恢复，应永久禁用并换号重试。
 func IsDeactivatedWorkspace(body []byte) bool {
 	return isDeactivatedWorkspace(body)
@@ -2702,6 +2723,9 @@ var SupportedModels = []string{
 // premiumOnlyModels 仅对 Plus/Pro/Team 账号开放的模型。
 // 上游 Codex 后端对 Free 账号直接 HTTP 400 "model is not supported"。
 // 为避免浪费重试与健康分惩罚，调度时从候选池中排除 free 账号。
+//
+// 运行时还可通过 PremiumOnlyGating.GetGPT54PremiumOnlyEnabled() 临时把
+// gpt-5.4 加入本名单。默认 OFF，取动画面仅限 admin 手动开启。
 var premiumOnlyModels = map[string]struct{}{
 	"gpt-5.5": {},
 }
@@ -2717,6 +2741,9 @@ func IsPremiumOnlyModel(model string) bool {
 type PremiumOnlyGating interface {
 	// GetFreeGPT55Enabled 返回 true 时允许 free 账号承接 gpt-5.5。
 	GetFreeGPT55Enabled() bool
+	// GetGPT54PremiumOnlyEnabled 返回 true 时把 gpt-5.4 加入 premium-only，
+	// free 账号被排除，仅 plus/pro/team 可调度。
+	GetGPT54PremiumOnlyEnabled() bool
 }
 
 // DispatchModeGating 调度模式开关接口：prefer_free vs prefer_paid。
@@ -2727,16 +2754,24 @@ type DispatchModeGating interface {
 }
 
 // IsEffectivePremiumOnly 结合运行时开关判断模型是否仍对 free 封闭。
-// gpt-5.5：若 gating.GetFreeGPT55Enabled()==true，放开限制，让 5.5 走 prefer_free 路径。
+//
+// gpt-5.5：静态 premium-only。若 gating.GetFreeGPT55Enabled()==true 则放开限制，
+// 让 5.5 走 prefer_free 路径。
+//
+// gpt-5.4：默认开放。若 gating.GetGPT54PremiumOnlyEnabled()==true 则临时锁为
+// premium-only，free 被排除出候选池，仅 plus/pro/team 可调度。
 func IsEffectivePremiumOnly(gating PremiumOnlyGating, model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
-	if _, ok := premiumOnlyModels[m]; !ok {
-		return false
+	if _, ok := premiumOnlyModels[m]; ok {
+		if m == "gpt-5.5" && gating != nil && gating.GetFreeGPT55Enabled() {
+			return false
+		}
+		return true
 	}
-	if m == "gpt-5.5" && gating != nil && gating.GetFreeGPT55Enabled() {
-		return false
+	if m == "gpt-5.4" && gating != nil && gating.GetGPT54PremiumOnlyEnabled() {
+		return true
 	}
-	return true
+	return false
 }
 
 // bodyRequiresPaidAccount 判断请求体是否必须由付费账号承接。
@@ -2771,8 +2806,8 @@ func bodyRequiresPaidAccount(rawBody []byte) bool {
 //     → 把所有 Free 账号加入 exclude，preferPlan = ""（只调度付费）
 //   - 其他请求（含只 inject reasoning effort 的虚拟模型如 gpt-5.4-high）
 //     → 根据 DispatchModeGating.GetPreferPaidEnabled() 返回：
-//       · false（默认）：preferPlan = "free"（优先 Free，池空回退付费）
-//       · true：preferPlan = "plus,pro,team"（付费优先，Free 兜底）
+//     · false（默认）：preferPlan = "free"（优先 Free，池空回退付费）
+//     · true：preferPlan = "plus,pro,team"（付费优先，Free 兜底）
 //
 // 注意：bodyRequiresPaidAccount 只能识别用户已显式传入的 image_generation 工具；
 // /v1/images/generations 内部转发到 chat/completions 时 rawBody 还没合并 tools，
@@ -2843,7 +2878,11 @@ func PolicyForModelWithGating(gating PremiumOnlyGating, model string) ModelPlanP
 
 // ListModels 列出可用模型（含虚拟模型别名）
 func (h *Handler) ListModels(c *gin.Context) {
-	virtualNames := ParseModelOverrides(h.store.GetModelPayloadOverrides()).VirtualModelNames()
+	var configured ModelOverrideMap
+	if h != nil && h.store != nil {
+		configured = ParseModelOverrides(h.store.GetModelPayloadOverrides())
+	}
+	virtualNames := MergeModelOverrides(BuiltInModelOverrides(), configured).VirtualModelNames()
 	models := make([]api.Model, 0, len(SupportedModels)+len(virtualNames))
 	now := time.Now().Unix()
 	for _, id := range SupportedModels {

@@ -64,11 +64,11 @@ type Handler struct {
 	reqCountExpiresAt time.Time
 
 	// GetUsageStats 缓存（10秒 TTL）
-	usageStatsCache   atomic.Pointer[usageStatsCacheEntry]
+	usageStatsCache atomic.Pointer[usageStatsCacheEntry]
 	// GetOpsOverview 整包缓存（5秒 TTL）
-	opsOverviewCache  atomic.Pointer[opsOverviewCacheEntry]
+	opsOverviewCache atomic.Pointer[opsOverviewCacheEntry]
 	// ListActive 缓存（5秒 TTL，减少分页请求重复 DB 查询）
-	listActiveCache   atomic.Pointer[listActiveCacheEntry]
+	listActiveCache atomic.Pointer[listActiveCacheEntry]
 }
 
 type chartCacheEntry struct {
@@ -2450,6 +2450,7 @@ type settingsResponse struct {
 	RTManagerPasswordSet             bool   `json:"rt_manager_password_set"`
 	FreeGPT55Enabled                 bool   `json:"free_gpt55_enabled"`
 	PreferPaidEnabled                bool   `json:"prefer_paid_enabled"`
+	Gpt54PremiumOnlyEnabled          bool   `json:"gpt54_premium_only_enabled"`
 }
 
 type updateSettingsReq struct {
@@ -2483,6 +2484,7 @@ type updateSettingsReq struct {
 	RTManagerEnabled                 *bool   `json:"rt_manager_enabled"`
 	FreeGPT55Enabled                 *bool   `json:"free_gpt55_enabled"`
 	PreferPaidEnabled                *bool   `json:"prefer_paid_enabled"`
+	Gpt54PremiumOnlyEnabled          *bool   `json:"gpt54_premium_only_enabled"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2541,6 +2543,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		RTManagerPasswordSet:             rtManagerPasswordSet,
 		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
 		PreferPaidEnabled:                h.store.GetPreferPaidEnabled(),
+		Gpt54PremiumOnlyEnabled:          h.store.GetGPT54PremiumOnlyEnabled(),
 	})
 }
 
@@ -2828,6 +2831,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: prefer_paid_enabled = %t", *req.PreferPaidEnabled)
 	}
 
+	// gpt54_premium_only_enabled：全局开关，ON 时把 gpt-5.4 临时锁为 premium-only，free 排除
+	if req.Gpt54PremiumOnlyEnabled != nil {
+		h.store.SetGPT54PremiumOnlyEnabled(*req.Gpt54PremiumOnlyEnabled)
+		log.Printf("设置已更新: gpt54_premium_only_enabled = %t", *req.Gpt54PremiumOnlyEnabled)
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2860,6 +2869,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RTManagerEnabled:                 rtManagerEnabled,
 		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
 		PreferPaidEnabled:                h.store.GetPreferPaidEnabled(),
+		Gpt54PremiumOnlyEnabled:          h.store.GetGPT54PremiumOnlyEnabled(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2916,6 +2926,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RTManagerPasswordSet:             strings.TrimSpace(rtManagerPassword) != "",
 		FreeGPT55Enabled:                 h.store.GetFreeGPT55Enabled(),
 		PreferPaidEnabled:                h.store.GetPreferPaidEnabled(),
+		Gpt54PremiumOnlyEnabled:          h.store.GetGPT54PremiumOnlyEnabled(),
 	})
 }
 
@@ -3117,7 +3128,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 
 	// 虚拟模型：只有 inject image_generation 的（画图系）才是 premium_only，
 	// 其他（如 gpt-5.4-high 仅 inject reasoning effort）继承 base_model 策略（prefer_free）。
-	overrides := proxy.ParseModelOverrides(h.store.GetModelPayloadOverrides())
+	overrides := proxy.MergeModelOverrides(proxy.BuiltInModelOverrides(), proxy.ParseModelOverrides(h.store.GetModelPayloadOverrides()))
 	for _, v := range overrides.VirtualModelNames() {
 		models = append(models, v)
 		ov := overrides[v]

@@ -4,11 +4,11 @@
 >
 > **2026-05-15 起架构变更**：codex2api 应用层迁到独立 VPS `codex-node` (`152.53.210.32`)，PG/nginx 留 `node2` (`152.53.240.159`)，两机走 **WireGuard** 互连。整体见 `ARCHITECTURE.md`。
 
-## 1. 线上状态（截至 2026-05-24 10:50）
+## 1. 线上状态（截至 2026-05-28 13:02）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `codex2api:v1.7.60.3-free-5h-suppress`（`latest`）|
+| 镜像 | `codex2api:v1.7.65-fast-model-aliases`（`latest`）|
 | 容器 | `codex2api` （在 **codex-node** 上）|
 | 容器内端口 | `8123`（`CODEX_PORT=8123`，固定不变） |
 | 宿主端口 | `10.10.0.2:8106:8123`（**仅监听 WG IP**，公网不可达） |
@@ -53,7 +53,7 @@ SSH_CODEX='sshpass -p fmAJ8zmcAKL0ER8 ssh -p 22 -o StrictHostKeyChecking=no root
 SSH_NODE2='sshpass -p f3t7uCBeTCizT12 ssh -p 22222 -o StrictHostKeyChecking=no root@152.53.240.159'
 SCP_CODEX='sshpass -p fmAJ8zmcAKL0ER8 scp -P 22 -o StrictHostKeyChecking=no'
 
-OLD=8106; NEW=8107; TAG=v1.7.61-xxx
+OLD=8106; NEW=8107; TAG=v1.7.66-xxx
 ```
 
 > **起容器前先验空（在 codex-node 上）**：`ss -tlnp | grep ":810[4-9]"` 确认目标端口无人监听
@@ -90,7 +90,7 @@ $SSH_CODEX "cd /data/codex2api-new && time docker build --build-arg BUILD_VERSIO
 
 ### Step 5 · 启 codex2api-new
 
-> ⚠️ **`--memory=6g --memory-swap=6g` 必须保留**：2026-05-15 事故后多轮实测调定。冷启动仅探针 ~2.4 GB；**热稳态（生产流量灌入后）RSS 3.4-4.2 GB 波动**（token cache + clientPool + 2360 账号探针 + in-flight SSE buffers + 大请求突发），4g 会在产流下触顶 OOMKilled。6g 留 ~2GB 突发余量。详见 `KUBESPHERE_NODE2_SETUP.md` 故障记录。
+> ⚠️ **`--memory=14g --memory-swap=14g` 必须保留**：2026-05-27 为 300 RPM 生图长连接容量预留调高。冷启动仅探针 ~2.4 GB；历史热稳态（生产流量灌入后）RSS 3.4-4.2 GB 波动（token cache + clientPool + 2360 账号探针 + in-flight SSE buffers + 大请求突发），4g 会在产流下触顶 OOMKilled。14g 留足生图高并发突发余量。详见 `KUBESPHERE_NODE2_SETUP.md` 故障记录。
 >
 > ⚠️ **`-p 10.10.0.2:NEW:8123` 必须监听 WG IP**：不要写成 `-p NEW:8123`（会暴露公网），不要写成 `-p 127.0.0.1:NEW:8123`（node2 nginx 反代不到）。
 
@@ -101,7 +101,7 @@ $SSH_CODEX "docker rm -f codex2api-new 2>/dev/null || true; \
         -p 10.10.0.2:$NEW:8123 \
         --env-file /data/codex2api-new/.env \
         -e CODEX_PORT=8123 \
-        --memory=6g --memory-swap=6g \
+        --memory=14g --memory-swap=14g \
         -v /data/codex2api-new/logs:/app/logs \
         -v /data/codex2api-images:/app/images \
         --restart unless-stopped \
@@ -138,7 +138,7 @@ $SSH_CODEX "sleep 30 && time docker stop -t 120 codex2api && \
 
 ## 4. 关键提醒
 
-- **`--memory=6g --memory-swap=6g` 必须**：兜底内存越限。热稳态 RSS 3.4-4.2GB（6GB 留 ~2GB 突发余量），小于 5GB 会在生产流量下触顶 OOMKilled
+- **`--memory=14g --memory-swap=14g` 必须**：兜底内存越限。热稳态 RSS 3.4-4.2GB，14GB 为 300 RPM 生图长连接预留突发余量，小于 5GB 会在生产流量下触顶 OOMKilled
 - **`-p 10.10.0.2:NEW:8123` 必须绑 WG IP**：避免公网暴露，且 node2 nginx 反代要打到 WG IP 才通
 - **每次必传 `--build-arg BUILD_VERSION`**：否则前端徽章显示 `dev`
 - **`docker stop -t 120` 必须**：默认 10s 会强 kill 长 SSE 连接
@@ -157,7 +157,7 @@ $SSH_CODEX "docker run -d --name codex2api-rollback \
   -p 10.10.0.2:<OLD_PORT>:8123 \
   --env-file /data/codex2api-old-YYYYMMDD-HHMMSS/.env \
   -e CODEX_PORT=8123 \
-  --memory=6g --memory-swap=6g \
+  --memory=14g --memory-swap=14g \
   -v /data/codex2api-images:/app/images \
   -v /data/codex2api-old-YYYYMMDD-HHMMSS/logs:/app/logs \
   --restart unless-stopped \
@@ -239,6 +239,11 @@ $SSH_NODE2 'docker ps --filter name=socat-pg-bridge --format "{{.Names}} {{.Stat
 | **v1.7.60.1-billing-ui** | **10.10.0.2:8104** | **2026-05-24 01:40** | **计费系统读取侧 + UI**。`UsageLog` 加 9 个美元/价格字段（AccountBilled/TotalCost/InputCost/OutputCost/CacheReadCost + 3 个 price + RateMultiplier），移植 `populateBillingBreakdown` 方法（按 AccountBilled 持久化值缩放 breakdown）。新增 `GetAccountsBilledMap(ctx, since)` 一次 SQL 拿所有账号成本 map。`accountResponse` 加 `billed_5h` / `billed_7d`，`ListAccounts` 在循环外调 2 次聚合，序化到列表响应。前端 `Accounts.tsx` 在帐号行下加琰珀色的 `5h:$X · 7d:$Y`（区别于上面绿色的本地估算 estimated_cost_7d）。验证：PG SUM 7.2747 vs API billed_5h 7.274658 一致。原之前被 _DISABLED 的 TestUsageLogBreakdownScalesToStoredBilledTotal 启用并通过。[5 文件 / +131/-7 / 18 个 billing 测试全过] |
 | **v1.7.60.2-usagecell-window** | **10.10.0.2:8105** | **2026-05-24 09:50** | **UsageCell 改用实际 window 数据驱动 5h/7d 显示**（cherry-pick 上游 `d2a6b72` 的 UsageCell 部分）。之前逻辑是 `plan === 'free'` 强制只显示 7d，导致 plan_type 还是 free 但 OpenAI 已返 reset_5h_at 的升级账号看不到 5h 条（plan_type 仅在 RT 刷新时重算，有明显滑后）。现以 `has5h ∨ reset_5h_at` / `has7d ∨ reset_7d_at` 作为主判据，plan_type 仅作占位辅助（订阅型账号数据未拉到时避免布局抖动）。上游同步的 sub2api / json_at / chatgpt_account_id 去重 所有未需需求未合。[1 文件 / +17/-10 / TS 检查通过] |
 | **v1.7.60.3-free-5h-suppress** | **10.10.0.2:8106** | **2026-05-24 10:50** | **反噪声：free 账号 5h pct 为 0 时不显示 5h 条**。生产调研：1623/1626 free 账号都有 reset_5h_at（OpenAI 业务事实：free 也下发 5h 窗口字段），但 5h pct 恒为 0%（换句话说 free 没有真正的 5h 速率限制，只有 7d，5h 是占位无信息）。v1.7.60.2 让这 1607 个 free 账号多了一条恒 0% 的 5h 进度条 → UI 拥挤。修复：free 账号要求 `pct_5h > 0` 才显示 5h 条。这个条件同时保留 v1.7.60.2 原本意图：plan_type 滑后到 free 但实际 plus 的账号会有真实 5h 用量 > 0，仍会展示 5h 条。其他 plan（plus/team/pro/teamplus/unknown）保持 v1.7.60.2 数据驱动逻辑。[1 文件 / +13/-8 / TS 检查通过] |
+| v1.7.61-image-token-trim | 10.10.0.2:8107 | 2026-05-25 09:51 | **画图模式 prompt_tokens 框架税剥离（仅响应层）**。背景：codex2api 把画图走 ChatCompletions 通道，codex backend 注入大段 system prompt + image_generation tool schema，导致画图请求 `prompt_tokens` 含约 1625 框架税（用户根本看不见），客户端误以为成本高。修复（仅画图虚拟模型命中即 `virtualHit.InjectsImageGeneration()=true` 时生效）：集成 `pkoukk/tiktoken-go` + `tiktoken-go-loader`（`o200k_base` BPE 离线 embed，避免运行时下载）做 lazy init wrapper；在 ChatCompletions 流式 / 非流式 两路 `BuildCompactResponse` / `newFinalChunk` 序列化前 hook，深拷贝 UsageInfo 用本地 tokenizer 重算 `prompt_tokens=input_tokens=newInput`、`total_tokens=newInput+output_tokens`，其他字段（output/cached/reasoning）一字不动。**入库 `usage_logs` / `account_billed` 走原 usage 不变**（line 1965-1971 read 原指针），所以成本面板和 OpenAI 后台账单仍一致。失败安全：tokenizer 报错 / messages 为空 / 估算 ≥ 上游原值 → 透传原 usage 指针。实测：`画一个女孩跳舞` prompt_tokens 1628→10（-99.4%），total 1680→65（-96.1%），图片 URL 正常。`StreamTranslator` 加 `UsageHook func(*UsageInfo) *UsageInfo` 字段，仅画图路径设置，其他请求路径零变更。[3 文件新增 + 2 文件改动 / 10 单测全过 / 框架税从 1625 降到 ~4*N+content tokens] **⚠️ 已被 v1.7.62 取代（BPE 实现漏算 vision tokens，含图请求 vision 部分会被错误剃掉）** |
+| **v1.7.62-image-token-trim-vision-safe** | **10.10.0.2:8104** | **2026-05-26 00:23** | **画图模式 prompt_tokens 框架税剥离 v2：丢掉 BPE 走固定减法**。v1.7.61 BPE 策略下 `CountUserInputTokens` 只覆盖文本 part，image_url / input_image / file 多模态部分被跳过 → 含图请求（图起图 / 含 base64 / 图片链接多轮）的 vision tokens 也被错误地从上游 prompt_tokens 里一并剃掉，客户端看到的成本异常偏低。v1.7.62 重构：不再估算 user input，直接从上游 `input_tokens` 里减掉 `ChatCompletionsImageFrameworkTax = 1618`（v1.7.61 实测推导：upstream 1628 - BPE 算出来的 user input 10 = 1618）。减后的 `input_tokens` 自动保留：用户文本 messages、vision tokens、历史对话、用户传的 tools schema。Fail-safe：上游 `input_tokens ≤ framework_tax` 透传原指针（避免减负）。零 BPE 依赖、零 image 解析、零词表 drift 风险。移除 `pkoukk/tiktoken-go` + `pkoukk/tiktoken-go-loader` + `dlclark/regexp2` 依赖（go mod tidy 后 go.mod 反转回 v1.7.60 状态）。入库 `usage_logs` / `account_billed` 仍走原 usage，计费面板不变。实测：`画一个女孩跳舞` prompt_tokens=27（上游返 1645，差 1618；framework_tax 在不同 codex backend 注入时刻 ±1% 浮动属正常）；含 1×1 base64 PNG 请求 prompt_tokens=25（上游返 1643，codex backend 画图通道目前不消费 image_url，vision=0，但极端上游未来发布图起图能力后 v1.7.62 能 graceful 保留）。[2 文件重写（+98/-149） / 9 单测全过 / vet 干净 / build 净] |
+| **v1.7.63-gpt54-premium-toggle** | **未独立切流** | **2026-05-28 03:45** | **新增 gpt-5.4 仅付费账号可调度开关**：`system_settings.gpt54_premium_only_enabled`（默认 false）+ Store atomic 热开关 + admin settings API + 前端 Settings 下拉按钮与中英文文案。开启后仅对精确 `gpt-5.4` 生效，`planDispatch` 通过 `IsEffectivePremiumOnly` 排除 free，只让 plus/pro/team 候选；不影响 `gpt-5.4-mini` / `gpt-5.4-pro`，生图 `image_generation` 仍沿用付费账号规则。补 `TestIsEffectivePremiumOnlyGPT54RuntimeToggle` 锁定行为；顺手给 `Store.AddAccount` 加零值 `accountIndex` 保护，修复 admin 单测直接构造 `&auth.Store{}` 时 nil map panic。该版本代码随 v1.7.64 一并上线。 |
+| **v1.7.64-gpt54-to-gpt55-alias-preset** | **10.10.0.2:8105** | **2026-05-28 04:02** | **合并上线 v1.7.63 + 新增虚拟模型别名预设按钮**：在 Settings → 虚拟模型别名（Payload 注入）中增加“5.4→5.5，响应保留 5.4”合并预设，生成 `gpt-5.4: { base_model: "gpt-5.5", response_alias: "gpt-5.4" }`，让客户端仍请求/看到 `gpt-5.4`，上游实际走 `gpt-5.5`。同步中英文文案；保留原 `5.5→5.4，xhigh 保留 5.5` 预设不变。验证：`go test ./...`、`go vet ./...`、`go build ./...`、`npm run typecheck`、`npm run build`、公网 `/health`、公网前端 JS 文案 grep 全过。 |
+| **v1.7.65-fast-model-aliases** | **10.10.0.2:8106** | **2026-05-28 13:02** | **新增内置 fast 模型别名**：`gpt-5.5-fast` → `base_model=gpt-5.5`、`gpt-5.4-fast` → `base_model=gpt-5.4`，自动注入 `service_tier:"fast"` 并保留响应 model 为 fast 别名；出上游前沿用现有逻辑将 `fast` 映射为上游接受的 `priority`，且受 Admin `fast_alias_enabled` 开关控制（关闭时剥离 fast、走 default）。内置别名出现在 `/v1/models` 和 Admin 模型策略列表，管理员同名 `model_payload_overrides` 仍可覆盖内置默认。验证：`go test ./...`、`go vet ./...`、`go build ./...`、`npm run typecheck`、`npm run build` 全过。 |
 
 ## 8. 不要再做的事 / 踩过的坑
 

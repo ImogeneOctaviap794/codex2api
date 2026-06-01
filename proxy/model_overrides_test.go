@@ -163,6 +163,68 @@ func TestApplyModelOverride_InvalidJSONReturnsOriginal(t *testing.T) {
 	}
 }
 
+func TestBuiltInFastModelOverridesInjectServiceTier(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5-fast","messages":[{"role":"user","content":"hi"}]}`)
+
+	out, hit := ApplyModelOverride(body, BuiltInModelOverrides())
+	if hit == nil {
+		t.Fatal("expected built-in gpt-5.5-fast override hit")
+	}
+	if hit.BaseModel != "gpt-5.5" {
+		t.Fatalf("BaseModel = %q, want gpt-5.5", hit.BaseModel)
+	}
+	if hit.ResponseAlias != "gpt-5.5-fast" {
+		t.Fatalf("ResponseAlias = %q, want gpt-5.5-fast", hit.ResponseAlias)
+	}
+	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("model = %q, want gpt-5.5", got)
+	}
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "fast" {
+		t.Fatalf("service_tier = %q, want fast", got)
+	}
+}
+
+func TestBuiltInFastModelOverridesTranslateFastToPriority(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4-fast","messages":[{"role":"user","content":"hi"}]}`)
+
+	out, hit := ApplyModelOverride(body, BuiltInModelOverrides())
+	if hit == nil {
+		t.Fatal("expected built-in gpt-5.4-fast override hit")
+	}
+	codexBody, err := TranslateRequest(out)
+	if err != nil {
+		t.Fatalf("TranslateRequest error: %v", err)
+	}
+	if got := gjson.GetBytes(codexBody, "model").String(); got != "gpt-5.4" {
+		t.Fatalf("translated model = %q, want gpt-5.4", got)
+	}
+	if got := gjson.GetBytes(codexBody, "service_tier").String(); got != "priority" {
+		t.Fatalf("translated service_tier = %q, want priority", got)
+	}
+}
+
+func TestMergeModelOverridesConfiguredOverridesBuiltIn(t *testing.T) {
+	configured := ParseModelOverrides(`{
+		"gpt-5.4-fast": {
+			"base_model": "gpt-5.5",
+			"response_alias": "gpt-5.4-fast",
+			"inject": {"service_tier": "default"}
+		}
+	}`)
+	merged := MergeModelOverrides(BuiltInModelOverrides(), configured)
+
+	out, hit := ApplyModelOverride([]byte(`{"model":"gpt-5.4-fast","messages":[{"role":"user","content":"hi"}]}`), merged)
+	if hit == nil {
+		t.Fatal("expected configured override hit")
+	}
+	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("model = %q, want configured base gpt-5.5", got)
+	}
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "default" {
+		t.Fatalf("service_tier = %q, want configured default", got)
+	}
+}
+
 // 验证 Chat Completions 流式翻译层收到 image_generation_call 终稿事件时
 // 会把 base64 PNG 包成 markdown image 注入到 assistant content 中。
 // 这样 OpenAI Chat Completions 格式的客户端也能直接显示生成的图像。

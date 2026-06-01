@@ -1115,6 +1115,11 @@ type StreamTranslator struct {
 	HasToolCalls bool
 	toolCallMap  map[string]int // Codex item.id → OpenAI tool_calls index
 	nextIdx      int
+	// UsageHook 可选回调：response.completed 事件提取到的 *UsageInfo 在
+	// 写入最终 stream chunk 之前会过这一道。返回值会替换原值。
+	// nil 时不调用，保持上游原始 usage。
+	// 用途：画图虚拟模型场景下用本地 tokenizer 重算"用户视角"的输入 tokens。
+	UsageHook func(*UsageInfo) *UsageInfo
 }
 
 // NewStreamTranslator 创建流式翻译器实例
@@ -1179,6 +1184,11 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 
 	case "response.completed":
 		usage := extractUsage(eventData)
+		if st.UsageHook != nil {
+			// 画图虚拟模型场景下，让 handler 注入的 hook 重算"用户视角"
+			// 输入 tokens；其他字段保持上游原值。详见 usage_adjust.go。
+			usage = st.UsageHook(usage)
+		}
 		finishReason := "stop"
 		if st.HasToolCalls {
 			finishReason = "tool_calls"

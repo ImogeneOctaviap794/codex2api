@@ -96,6 +96,14 @@ const DEFAULT_ALIAS_OVERRIDES = {
   },
 }
 
+const DEFAULT_54_TO_55_ALIAS_OVERRIDES = {
+  'gpt-5.4': {
+    base_model: 'gpt-5.5',
+    response_alias: 'gpt-5.4',
+    description: '客户端发 gpt-5.4 → 上游用 gpt-5.5，响应保持 gpt-5.4',
+  },
+}
+
 // 虚拟模型条目（与后端 ModelOverride 同构）
 type VirtualModelEntry = {
   alias: string
@@ -299,6 +307,13 @@ function VirtualModelsEditor({ value, onChange }: { value: string; onChange: (v:
         >
           <Plus className="size-3.5 mr-1" />{t('settings2.virtualModelsAliasExample')}
         </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => mergeOverrides(DEFAULT_54_TO_55_ALIAS_OVERRIDES as never)}
+        >
+          <Plus className="size-3.5 mr-1" />{t('settings2.virtualModels54To55AliasExample')}
+        </Button>
       </div>
 
       <button
@@ -444,6 +459,7 @@ export default function Settings() {
     rt_manager_password_set: false,
     free_gpt55_enabled: true,
     prefer_paid_enabled: false,
+    gpt54_premium_only_enabled: false,
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
@@ -941,6 +957,15 @@ export default function Settings() {
                   options={booleanOptions}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.preferPaidEnabledDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.gpt54PremiumOnlyEnabled')}</label>
+                <Select
+                  value={settingsForm.gpt54_premium_only_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, gpt54_premium_only_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.gpt54PremiumOnlyEnabledDesc')}</p>
               </div>
             </div>
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.display')}</h3>

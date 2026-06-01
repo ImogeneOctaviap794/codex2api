@@ -1081,10 +1081,11 @@ type Store struct {
 	fastAliasEnabled          atomic.Bool // 是否把客户端的 service_tier=fast 映射为上游 priority
 	freeGPT55Enabled          atomic.Bool // 是否允许 free 账号承接 gpt-5.5（默认 ON；OFF 时 5.5 走 premium-only）
 	preferPaidEnabled         atomic.Bool // 是否切换为「付费优先 free 兜底」调度（默认 OFF；ON 时 prefer plus/pro/team）
-	maxRetries                int64 // 请求失败最大重试次数（换号重试）
-	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
-	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
-	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
+	gpt54PremiumOnlyEnabled   atomic.Bool // 是否将 gpt-5.4 锁定为 premium-only（默认 OFF；ON 时 5.4 仅 plus/pro/team 可调度）
+	maxRetries                int64       // 请求失败最大重试次数（换号重试）
+	backgroundRefreshInterval int64       // 后台刷新/探针巡检间隔（ns）
+	usageProbeMaxAge          int64       // 用量探针快照最大缓存时长（ns）
+	recoveryProbeInterval     int64       // 恢复探测最小间隔（ns）
 	backgroundRefreshWakeCh   chan struct{}
 	stopCh                    chan struct{}
 	wg                        sync.WaitGroup
@@ -1104,8 +1105,8 @@ type Store struct {
 	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping          atomic.Value // 模型映射 JSON 字符串
 	modelPayloadOverrides atomic.Value // 虚拟模型 payload 覆盖 JSON 字符串
-	sessionMu            sync.RWMutex
-	sessionBindings      map[string]sessionAffinity
+	sessionMu             sync.RWMutex
+	sessionBindings       map[string]sessionAffinity
 
 	// AT-only 账号通过外部 rt-manager（ChatGPT App scope RT）刷新的客户端，
 	// 配置由 admin/SystemSettings 注入；nil 或未启用时退化为原有跳过逻辑。
@@ -1181,6 +1182,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.fastAliasEnabled.Store(settings.FastAliasEnabled)
 	s.freeGPT55Enabled.Store(settings.FreeGPT55Enabled)
 	s.preferPaidEnabled.Store(settings.PreferPaidEnabled)
+	s.gpt54PremiumOnlyEnabled.Store(settings.Gpt54PremiumOnlyEnabled)
 
 	// rt-manager 客户端：始终初始化（持久化设置注入），是否真生效由 Enabled() 决定
 	s.rtManager = NewRTManager()
@@ -1501,6 +1503,24 @@ func (s *Store) SetPreferPaidEnabled(enabled bool) {
 		return
 	}
 	s.preferPaidEnabled.Store(enabled)
+}
+
+// GetGPT54PremiumOnlyEnabled 是否将 gpt-5.4 锁定为 premium-only。
+// false（默认）：gpt-5.4 走默认 prefer_free/prefer_paid 调度，free 也可承接。
+// true：gpt-5.4 加入 premium-only，free 账号被排除出候选池，仅 plus/pro/team 可调度。
+func (s *Store) GetGPT54PremiumOnlyEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.gpt54PremiumOnlyEnabled.Load()
+}
+
+// SetGPT54PremiumOnlyEnabled 设置是否将 gpt-5.4 锁定为 premium-only。
+func (s *Store) SetGPT54PremiumOnlyEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.gpt54PremiumOnlyEnabled.Store(enabled)
 }
 
 // RTManager 返回外部 rt-manager 联动客户端（启动时一定非 nil，是否启用看 Enabled()）。
@@ -2166,6 +2186,9 @@ func (s *Store) AddAccount(acc *Account) {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
+	if s.accountIndex == nil {
+		s.accountIndex = make(map[int64]*Account)
+	}
 	s.accountIndex[acc.DBID] = acc
 	s.fastSchedulerUpdate(acc)
 }

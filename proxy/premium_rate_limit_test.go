@@ -9,6 +9,19 @@ import (
 	"github.com/codex2api/database"
 )
 
+type premiumPolicyTestGating struct {
+	freeGPT55Enabled        bool
+	gpt54PremiumOnlyEnabled bool
+}
+
+func (g premiumPolicyTestGating) GetFreeGPT55Enabled() bool {
+	return g.freeGPT55Enabled
+}
+
+func (g premiumPolicyTestGating) GetGPT54PremiumOnlyEnabled() bool {
+	return g.gpt54PremiumOnlyEnabled
+}
+
 func newProxyPremiumTestStore() *auth.Store {
 	return auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:                   4,
@@ -104,5 +117,23 @@ func TestSyncCodexUsageStatePremium5hOnlyHeadersMarksRateLimited(t *testing.T) {
 	}
 	if !acc.IsPremium5hRateLimited() {
 		t.Fatal("account should enter premium 5h rate_limited state from headers alone")
+	}
+}
+
+func TestIsEffectivePremiumOnlyGPT54RuntimeToggle(t *testing.T) {
+	if IsEffectivePremiumOnly(nil, "gpt-5.4") {
+		t.Fatal("gpt-5.4 should not be premium-only by default")
+	}
+	if !IsEffectivePremiumOnly(premiumPolicyTestGating{gpt54PremiumOnlyEnabled: true}, "gpt-5.4") {
+		t.Fatal("gpt-5.4 should be premium-only when runtime toggle is enabled")
+	}
+	if IsEffectivePremiumOnly(premiumPolicyTestGating{gpt54PremiumOnlyEnabled: true}, "gpt-5.4-mini") {
+		t.Fatal("gpt-5.4-mini should not be affected by gpt-5.4 premium-only toggle")
+	}
+	if !IsEffectivePremiumOnly(premiumPolicyTestGating{}, "gpt-5.5") {
+		t.Fatal("gpt-5.5 should remain premium-only when free toggle is disabled")
+	}
+	if IsEffectivePremiumOnly(premiumPolicyTestGating{freeGPT55Enabled: true}, "gpt-5.5") {
+		t.Fatal("gpt-5.5 should allow free accounts when free toggle is enabled")
 	}
 }

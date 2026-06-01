@@ -329,6 +329,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS rt_manager_enabled BOOLEAN DEFAULT FALSE;
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS free_gpt55_enabled BOOLEAN DEFAULT TRUE;
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prefer_paid_enabled BOOLEAN DEFAULT FALSE;
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS gpt54_premium_only_enabled BOOLEAN DEFAULT FALSE;
 
 		CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -461,6 +462,7 @@ type SystemSettings struct {
 	RTManagerEnabled                 bool   // 是否启用 rt-manager 联动刷新 AT-only 账号
 	FreeGPT55Enabled                 bool   // 是否允许 free 账号承接 gpt-5.5（关闭则走 premium-only 旧行为）
 	PreferPaidEnabled                bool   // 是否启用「付费优先 free 兜底」调度（默认 false；false=prefer_free / true=prefer_paid）
+	Gpt54PremiumOnlyEnabled          bool   // 是否将 gpt-5.4 锁定为 premium-only（关闭=默认行为，free 也可调度；开启=仅 plus/pro/team 可调度）
 }
 
 // GetSystemSettings 加载全局设置
@@ -487,7 +489,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(rt_manager_password, ''),
 		       COALESCE(rt_manager_enabled, false),
 		       COALESCE(free_gpt55_enabled, true),
-		       COALESCE(prefer_paid_enabled, false)
+		       COALESCE(prefer_paid_enabled, false),
+		       COALESCE(gpt54_premium_only_enabled, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
@@ -499,6 +502,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.RTManagerURL, &s.RTManagerPassword, &s.RTManagerEnabled,
 		&s.FreeGPT55Enabled,
 		&s.PreferPaidEnabled,
+		&s.Gpt54PremiumOnlyEnabled,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -518,9 +522,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				resin_url, resin_platform_name, fast_alias_enabled,
 				rt_manager_url, rt_manager_password, rt_manager_enabled,
 				free_gpt55_enabled,
-				prefer_paid_enabled
+				prefer_paid_enabled,
+				gpt54_premium_only_enabled
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 			ON CONFLICT (id) DO UPDATE SET
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
@@ -551,7 +556,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				rt_manager_password     = EXCLUDED.rt_manager_password,
 				rt_manager_enabled      = EXCLUDED.rt_manager_enabled,
 				free_gpt55_enabled      = EXCLUDED.free_gpt55_enabled,
-				prefer_paid_enabled     = EXCLUDED.prefer_paid_enabled
+				prefer_paid_enabled     = EXCLUDED.prefer_paid_enabled,
+				gpt54_premium_only_enabled = EXCLUDED.gpt54_premium_only_enabled
 		`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
@@ -560,7 +566,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.ResinURL, s.ResinPlatformName, s.FastAliasEnabled,
 		s.RTManagerURL, s.RTManagerPassword, s.RTManagerEnabled,
 		s.FreeGPT55Enabled,
-		s.PreferPaidEnabled)
+		s.PreferPaidEnabled,
+		s.Gpt54PremiumOnlyEnabled)
 	return err
 }
 

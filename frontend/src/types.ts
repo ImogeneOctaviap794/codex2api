@@ -291,6 +291,7 @@ export interface SystemSettings {
   rt_manager_password?: string
   free_gpt55_enabled: boolean
   prefer_paid_enabled: boolean
+  gpt54_premium_only_enabled: boolean
 }
 
 export interface CPAExportEntry {
