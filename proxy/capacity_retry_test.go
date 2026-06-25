@@ -23,6 +23,8 @@ func TestIsCapacityError(t *testing.T) {
 		{"generic upstream error (10% 样本)",
 			"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists.", true},
 		{"only 'try again later' tail", "Service unavailable. Try again later.", true},
+		{"curl TLS wrong version is transient",
+			"Failed to perform, curl: (35) TLS connect error: error:100000f7:SSL routines:OPENSSL_internal:WRONG_VERSION_NUMBER. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.", true},
 		// 反向防误伤
 		{"auth error must NOT retry", "Invalid authentication credentials", false},
 		{"context length must NOT retry", "This model's maximum context length is 128000 tokens", false},
@@ -55,6 +57,9 @@ func TestClassifyUpstreamError(t *testing.T) {
 		{"content filter", "Your request was blocked by content policy", ErrKindContentFilter},
 		{"auth", "Invalid authentication credentials", ErrKindAuth},
 		{"timeout", "Request timed out", ErrKindTimeout},
+		{"curl TLS wrong version",
+			"Failed to perform, curl: (35) TLS connect error: error:100000f7:SSL routines:OPENSSL_internal:WRONG_VERSION_NUMBER. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.",
+			ErrKindTLS},
 		{"try again later tail → overloaded", "Service unavailable. Try again later.", ErrKindOverloaded},
 		{"unknown garbage", "something exploded server-side", ErrKindUnknown},
 		// 优先级测试：overloaded 优先于 try again later
@@ -138,6 +143,36 @@ func TestExtractResponseFailedErrMsg(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := extractResponseFailedErrMsg([]byte(c.payload)); got != c.want {
 				t.Errorf("extractResponseFailedErrMsg = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsPreContentEvent(t *testing.T) {
+	cases := []struct {
+		eventType string
+		want      bool
+	}{
+		// 内容前控制事件：应缓冲
+		{"response.created", true},
+		{"response.in_progress", true},
+		{"response.queued", true},
+		// 真正的内容/终止事件：不能缓冲
+		{"response.output_text.delta", false},
+		{"response.function_call_arguments.delta", false},
+		{"response.reasoning_text.delta", false},
+		{"response.output_item.added", false},
+		{"response.content_part.added", false},
+		{"response.completed", false},
+		{"response.failed", false},
+		// 边界
+		{"", false},
+		{"unknown.event", false},
+	}
+	for _, c := range cases {
+		t.Run(c.eventType, func(t *testing.T) {
+			if got := isPreContentEvent(c.eventType); got != c.want {
+				t.Errorf("isPreContentEvent(%q) = %v, want %v", c.eventType, got, c.want)
 			}
 		})
 	}

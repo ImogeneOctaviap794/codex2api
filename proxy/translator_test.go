@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -525,5 +526,39 @@ func TestExtractToolCallsFromOutput(t *testing.T) {
 	}
 	if tcs[1].ID != "call_2" || tcs[1].Name != "get_time" {
 		t.Fatalf("second tool call mismatch: %+v", tcs[1])
+	}
+}
+
+// StreamTranslator 在 response.failed 翻译里，必须把 errMsg 中的 base_model
+// 名替换为 ResponseAlias，否则客户端会通过错误文案察觉到上游真实模型。
+func TestStreamTranslator_FailedScrubsUpstreamModelName(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-x", "gpt-5.5", 0)
+	st.VirtualHit = &ModelOverride{BaseModel: "gpt-5.4", ResponseAlias: "gpt-5.5"}
+
+	failed := []byte(`{"type":"response.failed","response":{"error":{"message":"The model gpt-5.4 is at capacity. Please try a different model."}}}`)
+	chunk, done := st.Translate(failed)
+	if !done {
+		t.Fatal("response.failed should mark done=true")
+	}
+	got := gjson.GetBytes(chunk, "error.message").String()
+	want := "The model gpt-5.5 is at capacity. Please try a different model."
+	if got != want {
+		t.Errorf("error.message = %q, want %q", got, want)
+	}
+	// 进一步确认：chunk 里完全没有"gpt-5.4"字符串泄露
+	if strings.Contains(string(chunk), "gpt-5.4") {
+		t.Errorf("chunk should not contain upstream base_model name, got %q", string(chunk))
+	}
+}
+
+// 未挂 VirtualHit 时（绝大多数请求路径），response.failed 原样透传 errMsg。
+func TestStreamTranslator_FailedWithoutVirtualHitPassthrough(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-x", "gpt-5.4", 0)
+
+	failed := []byte(`{"type":"response.failed","response":{"error":{"message":"Our servers are currently overloaded."}}}`)
+	chunk, _ := st.Translate(failed)
+	got := gjson.GetBytes(chunk, "error.message").String()
+	if got != "Our servers are currently overloaded." {
+		t.Errorf("error.message = %q, expected passthrough", got)
 	}
 }

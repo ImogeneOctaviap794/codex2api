@@ -119,3 +119,51 @@ func TestParseModelOverrides_ResponseAlias(t *testing.T) {
 		t.Errorf("ResponseAlias = %q, want gpt-5.5", cfg.ResponseAlias)
 	}
 }
+
+// scrubUpstreamModelMentions 应在 5.5→5.4 别名命中场景下，把 response.failed 事件
+// error.message 里出现的 base_model 名替换成 response_alias，避免泄露上游真实模型。
+func TestScrubUpstreamModelMentions_RewritesErrorMessage(t *testing.T) {
+	hit := &ModelOverride{BaseModel: "gpt-5.4", ResponseAlias: "gpt-5.5"}
+	data := []byte(`{"type":"response.failed","response":{"error":{"message":"The model gpt-5.4 is at capacity. Please try a different model."}}}`)
+	out := scrubUpstreamModelMentions(data, hit, "response.error.message")
+	got := gjson.GetBytes(out, "response.error.message").String()
+	want := "The model gpt-5.5 is at capacity. Please try a different model."
+	if got != want {
+		t.Errorf("error.message = %q, want %q", got, want)
+	}
+}
+
+// 错误文案不含 base_model 时应原样返回。
+func TestScrubUpstreamModelMentions_NoOpWhenMessageDoesNotContainBaseModel(t *testing.T) {
+	hit := &ModelOverride{BaseModel: "gpt-5.4", ResponseAlias: "gpt-5.5"}
+	data := []byte(`{"type":"response.failed","response":{"error":{"message":"Our servers are currently overloaded. Please try again later."}}}`)
+	out := scrubUpstreamModelMentions(data, hit, "response.error.message")
+	if string(out) != string(data) {
+		t.Errorf("expected no-op, got %q", string(out))
+	}
+}
+
+// hit=nil / BaseModel 空 / alias==BaseModel 时都应是 no-op。
+func TestScrubUpstreamModelMentions_NoOpGuards(t *testing.T) {
+	data := []byte(`{"response":{"error":{"message":"gpt-5.4 is at capacity"}}}`)
+
+	if out := scrubUpstreamModelMentions(data, nil, "response.error.message"); string(out) != string(data) {
+		t.Error("nil hit should be no-op")
+	}
+	if out := scrubUpstreamModelMentions(data, &ModelOverride{ResponseAlias: "gpt-5.5"}, "response.error.message"); string(out) != string(data) {
+		t.Error("empty BaseModel should be no-op")
+	}
+	hitSame := &ModelOverride{BaseModel: "gpt-5.4", ResponseAlias: "gpt-5.4"}
+	if out := scrubUpstreamModelMentions(data, hitSame, "response.error.message"); string(out) != string(data) {
+		t.Error("alias == BaseModel should be no-op")
+	}
+}
+
+// path 不存在或非字符串时应原样返回。
+func TestScrubUpstreamModelMentions_NoOpWhenPathMissing(t *testing.T) {
+	hit := &ModelOverride{BaseModel: "gpt-5.4", ResponseAlias: "gpt-5.5"}
+	data := []byte(`{"response":{"output":[]}}`)
+	if out := scrubUpstreamModelMentions(data, hit, "response.error.message"); string(out) != string(data) {
+		t.Errorf("missing path should be no-op, got %q", string(out))
+	}
+}

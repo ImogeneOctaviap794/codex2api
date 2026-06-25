@@ -46,6 +46,9 @@ func isCapacityError(errMsg string) bool {
 	if errMsg == "" {
 		return false
 	}
+	if isTLSWrongVersionError(errMsg) {
+		return true
+	}
 	lower := strings.ToLower(errMsg)
 	for _, m := range capacityErrorMarkers {
 		if strings.Contains(lower, m) {
@@ -53,6 +56,18 @@ func isCapacityError(errMsg string) bool {
 		}
 	}
 	return false
+}
+
+// isTLSWrongVersionError 判断 curl/OpenSSL TLS 建连阶段的协议版本错误。
+// 这类错误通常发生在上游还没产生任何 token 之前，适合按瞬时传输错误透明重试。
+func isTLSWrongVersionError(errMsg string) bool {
+	if errMsg == "" {
+		return false
+	}
+	lower := strings.ToLower(errMsg)
+	return strings.Contains(lower, "wrong_version_number") ||
+		(strings.Contains(lower, "tls connect error") && strings.Contains(lower, "curl: (35)")) ||
+		(strings.Contains(lower, "openssl_internal") && strings.Contains(lower, "wrong version number"))
 }
 
 // Upstream error kind 常量。用作 usage_logs.upstream_error_kind 字段值，
@@ -67,6 +82,7 @@ const (
 	ErrKindContextLength    = "context_length"    // context length exceeded
 	ErrKindContentFilter    = "content_filter"    // content policy / safety
 	ErrKindTimeout          = "timeout"           // 上游超时
+	ErrKindTLS              = "tls"               // curl/OpenSSL TLS 握手错误
 	ErrKindClientDisconnect = "client_disconnect" // 客户端断开
 	ErrKindUpstream5xx      = "upstream_5xx"      // 其他 5xx
 	ErrKindUpstream4xx      = "upstream_4xx"      // 其他 4xx
@@ -85,6 +101,8 @@ func ClassifyUpstreamError(errMsg string) string {
 	lower := strings.ToLower(errMsg)
 
 	switch {
+	case isTLSWrongVersionError(errMsg):
+		return ErrKindTLS
 	case strings.Contains(lower, "currently overloaded") ||
 		strings.Contains(lower, "servers are currently"):
 		return ErrKindOverloaded
@@ -141,6 +159,30 @@ func TruncateErrMsg(errMsg string, maxBytes int) string {
 // 事件体里提取 error.message 字段。若字段缺失返回空字符串。
 func extractResponseFailedErrMsg(eventData []byte) string {
 	return gjson.GetBytes(eventData, "response.error.message").String()
+}
+
+// isPreContentEvent 判断 Codex Responses SSE 事件是否属于"内容产出前的纯控制事件"。
+//
+// 这些事件不携带任何 token / 文本 / 函数调用 / 推理内容，仅是流式握手或状态通告：
+//
+//	response.created       会话建立（仅含 response.id / response.model 等元信息）
+//	response.in_progress   生成进行中（紧跟 created，无实质数据）
+//	response.queued        排队中（少见）
+//
+// 透明重试容量错误（"overloaded" / "at capacity"）时，希望对客户端"无感切号"。
+// 但上游通常会先发 created / in_progress 占位事件，再隔几秒才推 response.failed。
+// 如果这些控制事件被立即下发，wroteAnyBody 就被提前置 true，重试窗口关闭，
+// 用户会看到 overloaded 报错。
+//
+// 解决：透传层把"内容前控制事件"先缓冲不写，直到首个真正的内容事件（delta /
+// completed / 非容量错误的 failed）到达再 flush；命中容量错误则直接丢 buffer，
+// 走重试分支，客户端完全没看见过这次失败的 response.id。
+func isPreContentEvent(eventType string) bool {
+	switch eventType {
+	case "response.created", "response.in_progress", "response.queued":
+		return true
+	}
+	return false
 }
 
 // truncateForLog 截断字符串到指定长度，用于日志输出时避免过长。

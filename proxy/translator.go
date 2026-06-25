@@ -1120,6 +1120,10 @@ type StreamTranslator struct {
 	// nil 时不调用，保持上游原始 usage。
 	// 用途：画图虚拟模型场景下用本地 tokenizer 重算"用户视角"的输入 tokens。
 	UsageHook func(*UsageInfo) *UsageInfo
+	// VirtualHit 命中虚拟模型别名时（如 gpt-5.5→gpt-5.4），用于 response.failed
+	// 错误文案中遮蔽上游 base_model 名，避免客户端看见真实的上游模型。
+	// nil 时不做替换，保持上游原始 errMsg。
+	VirtualHit *ModelOverride
 }
 
 // NewStreamTranslator 创建流式翻译器实例
@@ -1199,6 +1203,17 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		errMsg := gjson.GetBytes(eventData, "response.error.message").String()
 		if errMsg == "" {
 			errMsg = "Codex upstream error"
+		}
+		// 虚拟模型别名命中时，把错误文案里的 base_model 字符串替换成 response_alias，
+		// 避免客户端通过错误信息察觉到上游真实使用了哪个模型（如 gpt-5.5→gpt-5.4）。
+		if st.VirtualHit != nil && st.VirtualHit.BaseModel != "" {
+			alias := st.VirtualHit.ResponseAlias
+			if alias == "" {
+				alias = st.Model
+			}
+			if alias != "" && alias != st.VirtualHit.BaseModel {
+				errMsg = strings.ReplaceAll(errMsg, st.VirtualHit.BaseModel, alias)
+			}
 		}
 		return newErrorResponse(errMsg), true
 

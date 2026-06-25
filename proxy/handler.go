@@ -413,6 +413,9 @@ func classifyTransportFailure(err error) string {
 	}
 
 	msg := strings.ToLower(err.Error())
+	if isTLSWrongVersionError(msg) {
+		return ErrKindTLS
+	}
 	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
 		return "timeout"
 	}
@@ -628,6 +631,39 @@ func rewriteResponseModelIfDrawing(data []byte, hit *ModelOverride, path string)
 	return data
 }
 
+// scrubUpstreamModelMentions 在虚拟模型别名命中时，把指定 path 的字符串字段里
+// 出现的 hit.BaseModel 名字全部替换为 ResponseAlias。
+// 用途：避免 response.failed / error.message 等错误文案泄露上游真实模型名。
+//
+// 例：客户端发 gpt-5.5，配置 base_model=gpt-5.4 → response_alias=gpt-5.5。
+// 上游 overloaded 时错误文案可能含 "Selected model `gpt-5.4` is at capacity"，
+// 直接透传会让客户端看到 "gpt-5.4"，本函数把它改回 "gpt-5.5"。
+//
+// 仅当 hit 配置了 ResponseAlias 且 alias != BaseModel 时执行；其他情况是 no-op。
+// path 支持 sjson 语法，如 "response.error.message"、"error.message"。
+func scrubUpstreamModelMentions(data []byte, hit *ModelOverride, path string) []byte {
+	if hit == nil || hit.BaseModel == "" || len(data) == 0 {
+		return data
+	}
+	alias := resolveResponseAlias(hit)
+	if alias == "" || alias == hit.BaseModel {
+		return data
+	}
+	got := gjson.GetBytes(data, path)
+	if !got.Exists() || got.Type != gjson.String {
+		return data
+	}
+	s := got.String()
+	if !strings.Contains(s, hit.BaseModel) {
+		return data
+	}
+	replaced := strings.ReplaceAll(s, hit.BaseModel, alias)
+	if rewritten, err := sjson.SetBytes(data, path, replaced); err == nil {
+		return rewritten
+	}
+	return data
+}
+
 // applyUpstreamModelOverride 隐藏参数：如果 body 中 metadata.upstream_model 非空，
 // 就把 body.model 直接覆盖为该值，并从 metadata 里删除此字段。用于客户端单次临时
 // 切换上游模型名，绕过虚拟模型的 base_model 绑定（高级用户功能）。
@@ -812,8 +848,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
-			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			// 排队削峰：等一个 200ms 窗口后仅再调度一次，拿不到立即快速失败
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 200*time.Millisecond, excludeAccounts)
 			if account == nil {
 				cancelHB()
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -951,6 +987,42 @@ func (h *Handler) Responses(c *gin.Context) {
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
+
+			// 内容前控制事件缓冲：created / in_progress / queued 这些不带内容
+			// 的事件先 buffer 起来不写客户端，直到首个真正内容事件 / 非容量错误
+			// 失败 / completed 到达再 flush。命中容量错误时直接丢 buffer，走
+			// 透明重试，客户端完全感知不到此次失败。详见 isPreContentEvent 注释。
+			var pendingPreContentEvents [][]byte
+			bufferFlushed := false
+			const maxPendingPreContentEvents = 8 // 防御上游异常情况
+			// scrubEvent 在透传前做两层改写：画图场景的 response.model 别名 +
+			// response.failed 错误文案里的上游 base_model 名 scrub。
+			scrubEvent := func(ev []byte) []byte {
+				ev = rewriteResponseModelIfDrawing(ev, virtualHit, "response.model")
+				ev = scrubUpstreamModelMentions(ev, virtualHit, "response.error.message")
+				return ev
+			}
+			// flushPending 把缓冲的 pre-content 事件按原顺序写客户端。
+			// 调用方在写"首个内容事件 / 非容量错误失败 / completed"之前调用一次。
+			flushPending := func() {
+				if bufferFlushed {
+					return
+				}
+				bufferFlushed = true
+				for _, ev := range pendingPreContentEvents {
+					if clientGone {
+						break
+					}
+					if err := sseW.WriteEvent(scrubEvent(ev)); err != nil {
+						writeErr = err
+						clientGone = true
+						break
+					}
+					wroteAnyBody = true
+				}
+				pendingPreContentEvents = nil
+			}
+
 			// 流式透传 + TTFT 跟踪（headers 已在 SetupKeepalive 里设置）
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -963,12 +1035,15 @@ func (h *Handler) Responses(c *gin.Context) {
 					dialogRawEvents = append(dialogRawEvents, dup)
 				}
 
-				// 容量错误透明重试：首包前上游报 "at capacity"，吞掉该事件不转发
+				// 容量错误透明重试：buffer 未 flush（即未对客户端写过任何内容）时，
+				// 命中容量错误则丢 buffer 并触发重试。bufferFlushed=false 等价于
+				// !wroteAnyBody，但更明确表达"客户端从未感知本次 response"。
 				if eventType == "response.failed" {
 					lastFailedErrMsg = extractResponseFailedErrMsg(data)
-					if !wroteAnyBody && isCapacityError(lastFailedErrMsg) {
+					if !bufferFlushed && isCapacityError(lastFailedErrMsg) {
 						capacityErrMsg = lastFailedErrMsg
 						gotTerminal = true
+						pendingPreContentEvents = nil // 丢弃缓冲，客户端完全无感
 						return false
 					}
 				}
@@ -998,19 +1073,32 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				// 画图场景下将 SSE 事件里的 response.model 改为 gpt-5.4
-				dataToWrite := rewriteResponseModelIfDrawing(data, virtualHit, "response.model")
-				if !clientGone {
-					if err := sseW.WriteEvent(dataToWrite); err != nil {
-						writeErr = err
-						clientGone = true
-					} else {
-						wroteAnyBody = true
+				// 决定 buffer or flush：pre-content 控制事件且 buffer 未满则入队不写；
+				// 否则先 flush buffer 再写当前事件，正式开启对客户端的写入。
+				if !bufferFlushed && isPreContentEvent(eventType) && len(pendingPreContentEvents) < maxPendingPreContentEvents {
+					dup := make([]byte, len(data))
+					copy(dup, data)
+					pendingPreContentEvents = append(pendingPreContentEvents, dup)
+				} else {
+					flushPending()
+					if !clientGone {
+						if err := sseW.WriteEvent(scrubEvent(data)); err != nil {
+							writeErr = err
+							clientGone = true
+						} else {
+							wroteAnyBody = true
+						}
 					}
 				}
 				// 客户端断开后仍继续读上游直到 terminal 事件，确保拿到 usage
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
+
+			// 流读完后若 buffer 还未 flush（极少见：纯 pre-content 事件后流断开），
+			// 把缓冲事件 flush 出去，避免客户端只收 keepalive 心跳无响应。
+			if !bufferFlushed && capacityErrMsg == "" {
+				flushPending()
+			}
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
@@ -1307,7 +1395,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 200*time.Millisecond, excludeAccounts)
 			if account == nil {
 				cancelHB()
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -1588,8 +1676,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithPreference(sessionID, excludeAccounts, preferPlan)
 		if account == nil {
-			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			// 排队削峰：等一个 200ms 窗口后仅再调度一次，拿不到立即快速失败
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 200*time.Millisecond, excludeAccounts)
 			if account == nil {
 				cancelHB()
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -1727,6 +1815,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if isStream {
 			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
+			// 虚拟模型别名命中时把 hit 挂上，让 translator 在 response.failed
+			// 翻译里 scrub 错误文案中的上游 base_model 名，避免客户端察觉。
+			streamTranslator.VirtualHit = virtualHit
 			// 仅画图虚拟模型命中时挂 usage hook：用本地 tokenizer 重算用户
 			// 视角的输入 tokens，仅影响对外响应；入库（logInput）走原 usage 不变。
 			// 其他所有请求路径不挂 hook → translator 内部行为完全不变。
@@ -2883,22 +2974,23 @@ func (h *Handler) ListModels(c *gin.Context) {
 		configured = ParseModelOverrides(h.store.GetModelPayloadOverrides())
 	}
 	virtualNames := MergeModelOverrides(BuiltInModelOverrides(), configured).VirtualModelNames()
-	models := make([]api.Model, 0, len(SupportedModels)+len(virtualNames))
-	now := time.Now().Unix()
+	modelNames := UniqueModelNames(SupportedModels, virtualNames)
+	supported := make(map[string]struct{}, len(SupportedModels))
 	for _, id := range SupportedModels {
-		models = append(models, api.Model{
-			ID:      id,
-			Object:  "model",
-			Created: now,
-			OwnedBy: "openai",
-		})
+		supported[id] = struct{}{}
 	}
-	for _, id := range virtualNames {
+	models := make([]api.Model, 0, len(modelNames))
+	now := time.Now().Unix()
+	for _, id := range modelNames {
+		ownedBy := "codex2api-virtual"
+		if _, ok := supported[id]; ok {
+			ownedBy = "openai"
+		}
 		models = append(models, api.Model{
 			ID:      id,
 			Object:  "model",
 			Created: now,
-			OwnedBy: "codex2api-virtual",
+			OwnedBy: ownedBy,
 		})
 	}
 	api.SendList(c, "list", models)
