@@ -153,16 +153,21 @@ func TestIsPreContentEvent(t *testing.T) {
 		eventType string
 		want      bool
 	}{
-		// 内容前控制事件：应缓冲
+		// 内容前控制事件（含结构宣告 *.added）：应缓冲
 		{"response.created", true},
 		{"response.in_progress", true},
 		{"response.queued", true},
+		{"response.output_item.added", true},
+		{"response.content_part.added", true},
+		{"response.reasoning_summary_part.added", true},
 		// 真正的内容/终止事件：不能缓冲
 		{"response.output_text.delta", false},
 		{"response.function_call_arguments.delta", false},
 		{"response.reasoning_text.delta", false},
-		{"response.output_item.added", false},
-		{"response.content_part.added", false},
+		{"response.reasoning_summary_text.delta", false},
+		{"response.output_item.done", false},
+		{"response.content_part.done", false},
+		{"response.image_generation_call.partial_image", false},
 		{"response.completed", false},
 		{"response.failed", false},
 		// 边界

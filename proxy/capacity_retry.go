@@ -163,23 +163,37 @@ func extractResponseFailedErrMsg(eventData []byte) string {
 
 // isPreContentEvent 判断 Codex Responses SSE 事件是否属于"内容产出前的纯控制事件"。
 //
-// 这些事件不携带任何 token / 文本 / 函数调用 / 推理内容，仅是流式握手或状态通告：
+// 这些事件不携带任何 token / 文本 / 函数调用参数 / 推理内容，仅是流式握手、
+// 状态通告或"结构宣告"（announce 一个尚未填充的 item / content part）：
 //
-//	response.created       会话建立（仅含 response.id / response.model 等元信息）
-//	response.in_progress   生成进行中（紧跟 created，无实质数据）
-//	response.queued        排队中（少见）
+//	response.created                       会话建立（仅含 response.id / model 等元信息）
+//	response.in_progress                   生成进行中（紧跟 created，无实质数据）
+//	response.queued                        排队中（少见）
+//	response.output_item.added             宣告一个 output item（reasoning/message/
+//	                                       function_call 外壳，arguments/文本尚未产出）
+//	response.content_part.added            宣告一个 content part（尚无文本）
+//	response.reasoning_summary_part.added  宣告一个 reasoning summary part（尚无文本）
 //
-// 透明重试容量错误（"overloaded" / "at capacity"）时，希望对客户端"无感切号"。
-// 但上游通常会先发 created / in_progress 占位事件，再隔几秒才推 response.failed。
-// 如果这些控制事件被立即下发，wroteAnyBody 就被提前置 true，重试窗口关闭，
-// 用户会看到 overloaded 报错。
+// 真正的内容事件（*.delta / *.done / image partial / completed）不在此列：
+// 它们一旦写出就不可重放，到达即视为"已对客户端产出内容"，关闭重试窗口。
 //
-// 解决：透传层把"内容前控制事件"先缓冲不写，直到首个真正的内容事件（delta /
-// completed / 非容量错误的 failed）到达再 flush；命中容量错误则直接丢 buffer，
-// 走重试分支，客户端完全没看见过这次失败的 response.id。
+// 背景：透明重试容量错误（"overloaded" / "at capacity"）时要对客户端"无感切号"。
+// 上游 overloaded 的典型时序是先推一串占位控制事件
+// （created → in_progress → output_item.added → content_part.added …），全是空壳，
+// 几秒后才推 response.failed。早期版本只把 created/in_progress/queued 当控制事件，
+// 漏了 output_item.added / content_part.added —— 它们一来就触发 flush，wroteAnyBody
+// 被提前置 true，等 failed 到达时重试窗口已关，overloaded 漏给客户端（retry_count=0）。
+//
+// 解决：透传层把所有"内容前控制事件"先缓冲不写，直到首个真正内容事件到达再 flush；
+// 命中容量错误则直接丢 buffer 走重试，客户端完全没看见过这次失败的 response.id。
 func isPreContentEvent(eventType string) bool {
 	switch eventType {
-	case "response.created", "response.in_progress", "response.queued":
+	case "response.created",
+		"response.in_progress",
+		"response.queued",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.reasoning_summary_part.added":
 		return true
 	}
 	return false

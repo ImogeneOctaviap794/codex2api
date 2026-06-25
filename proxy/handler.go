@@ -994,7 +994,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 透明重试，客户端完全感知不到此次失败。详见 isPreContentEvent 注释。
 			var pendingPreContentEvents [][]byte
 			bufferFlushed := false
-			const maxPendingPreContentEvents = 8 // 防御上游异常情况
+			const maxPendingPreContentEvents = 32 // 防御上游异常情况（正常 created/in_progress/added 占位事件 < 10 个）
 			// scrubEvent 在透传前做两层改写：画图场景的 response.model 别名 +
 			// response.failed 错误文案里的上游 base_model 名 scrub。
 			scrubEvent := func(ev []byte) []byte {
