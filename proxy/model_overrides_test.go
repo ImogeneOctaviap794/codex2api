@@ -69,6 +69,17 @@ func TestVirtualModelNames_Sorted(t *testing.T) {
 	}
 }
 
+func TestUniqueModelNamesPreservesFirstOccurrence(t *testing.T) {
+	got := UniqueModelNames(
+		[]string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"},
+		[]string{"gpt-5.4", "gpt-5.4-fast"},
+	)
+	want := []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-fast"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("UniqueModelNames = %v, want %v", got, want)
+	}
+}
+
 func TestApplyModelOverride_HitInjectsToolsAndReplacesModel(t *testing.T) {
 	overrides := ParseModelOverrides(`{
 		"gpt-draw-1024x1024": {
@@ -160,6 +171,40 @@ func TestApplyModelOverride_InvalidJSONReturnsOriginal(t *testing.T) {
 	}
 	if string(out) != string(body) {
 		t.Fatal("invalid json should passthrough")
+	}
+}
+
+func TestBuiltInGPT54AliasPassthrough(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)
+
+	out, hit := ApplyModelOverride(body, BuiltInModelOverrides())
+	if hit != nil {
+		t.Fatal("gpt-5.4 should not hit built-in override")
+	}
+	if string(out) != string(body) {
+		t.Fatal("gpt-5.4 should passthrough without configured override")
+	}
+}
+
+func TestConfiguredGPT54AliasRoutesUpstreamToGPT55(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)
+	overrides := ParseModelOverrides(`{"gpt-5.4":{"base_model":"gpt-5.5","response_alias":"gpt-5.4"}}`)
+
+	out, hit := ApplyModelOverride(body, overrides)
+	if hit == nil {
+		t.Fatal("expected configured gpt-5.4 override hit")
+	}
+	if hit.BaseModel != "gpt-5.5" {
+		t.Fatalf("BaseModel = %q, want gpt-5.5", hit.BaseModel)
+	}
+	if hit.ResponseAlias != "gpt-5.4" {
+		t.Fatalf("ResponseAlias = %q, want gpt-5.4", hit.ResponseAlias)
+	}
+	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("model = %q, want gpt-5.5", got)
+	}
+	if got := responseModelFor("gpt-5.5", hit); got != "gpt-5.4" {
+		t.Fatalf("response model = %q, want gpt-5.4", got)
 	}
 }
 

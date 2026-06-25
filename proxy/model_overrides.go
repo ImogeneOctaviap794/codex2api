@@ -36,8 +36,8 @@ type ModelOverride struct {
 	//   - 空：保持旧行为——画图场景退化为 drawingResponseModelAlias
 	//     ("gpt-5.4")，非画图场景由调用方决定
 	//
-	// 典型用法：客户端请求 gpt-5.5，本字段填 "gpt-5.5"，
-	// 配合 base_model="gpt-5.4" 实现"上游用 5.4，响应保持 5.5"。
+	// 典型用法：客户端请求 gpt-5.4，本字段填 "gpt-5.4"，
+	// 配合 base_model="gpt-5.5" 实现"上游用 5.5，响应保持 5.4"。
 	ResponseAlias string `json:"response_alias,omitempty"`
 
 	// Description 可选的人类可读描述，仅用于 UI 展示。
@@ -86,6 +86,25 @@ func BuiltInModelOverrides() ModelOverrideMap {
 			Description: "gpt-5.4 with service_tier=fast",
 		},
 	}
+}
+
+// UniqueModelNames 合并多组模型名并去重，保留第一次出现的顺序。
+func UniqueModelNames(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, group := range groups {
+		for _, name := range group {
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // MergeModelOverrides 合并多个虚拟模型配置，后者覆盖前者。
