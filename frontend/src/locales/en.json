@@ -281,6 +281,7 @@
     "noDataDesc": "Import refresh tokens to populate the account pool",
     "selectTxtFile": "Please select a .txt file",
     "addSuccess": "Account added successfully",
+    "addATSuccessWithIds": "AT account added successfully. IDs: {{ids}}",
     "addFailed": "Failed to add account: {{error}}",
     "importFailed": "Import failed",
     "importFailedWithReason": "Import failed: {{error}}",
@@ -314,6 +315,13 @@
     "cleanErrorSuccess": "Error accounts cleared",
     "cleanErrorFailed": "Failed to clear error accounts: {{error}}",
     "healthSummary": "{{health}} · Score {{score}} · Concurrency {{concurrency}}",
+    "editEmail": "Edit Email",
+    "emailEditTitle": "Edit Account Email",
+    "emailEditDesc": "Manually update the email shown and used for local account matching.",
+    "emailPlaceholder": "Enter a new email",
+    "emailRequired": "Email is required.",
+    "emailSaveSuccess": "Email saved",
+    "emailSaveFailed": "Failed to save email: {{error}}",
     "editScheduler": "Edit Scheduler",
     "schedulerEditTitle": "Edit Account Scheduler",
     "schedulerEditDesc": "Adjust dispatch score bias and base concurrency override for this account. Current plan: {{plan}}",
@@ -860,6 +868,10 @@
     "deleteAccount": {
       "title": "Delete Account",
       "desc": "Delete account by ID and remove from the pool."
+    },
+    "updateAccountEmail": {
+      "title": "Update Account Email",
+      "desc": "Update credentials.email for the specified account and sync the runtime pool email."
     },
     "listAccounts": {
       "title": "List Accounts",

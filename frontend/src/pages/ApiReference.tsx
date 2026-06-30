@@ -400,6 +400,7 @@ export default function ApiReference() {
     { id: 'add-account-at', label: t('apiRef.addATAccount.title'), method: 'POST' },
     { id: 'import-accounts', label: t('apiRef.importAccounts.title'), method: 'POST' },
     { id: 'delete-account', label: '/accounts/:id', method: 'DELETE' },
+    { id: 'update-account-email', label: '/accounts/:id/email', method: 'PATCH' },
     { id: 'list-accounts', label: '/accounts', method: 'GET' },
   ]
 
@@ -879,9 +880,10 @@ export default function ApiReference() {
 }'`}
         responseExamples={[
           { code: 200, body: `{
-  "message": "成功添加 1 个 AT-only 账号",
+  "message": "成功添加 1 个 AT 账号",
   "success": 1,
-  "failed": 0
+  "failed": 0,
+  "ids": [12550]
 }` },
           { code: 400, body: `{
   "error": "access_token 是必填字段"
@@ -952,6 +954,35 @@ curl --request POST \\
         responseExamples={[
           { code: 200, body: `{
   "message": "账号已删除"
+}` },
+          { code: 404, body: `{
+  "error": "账号不存在"
+}` },
+        ]}
+      />
+
+      <EndpointDoc
+        id="update-account-email"
+        method="PATCH"
+        path="/api/admin/accounts/:id/email"
+        title={t('apiRef.updateAccountEmail.title')}
+        description={t('apiRef.updateAccountEmail.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "email": "new-user@example.com"
+}`}
+        curlExample={`curl --request PATCH \\
+  --url ${baseUrl}/api/admin/accounts/12550/email \\
+  --header 'X-Admin-Key: <admin_secret>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{
+  "email": "new-user@example.com"
+}'`}
+        responseExamples={[
+          { code: 200, body: `{
+  "message": "邮箱已更新"
 }` },
           { code: 404, body: `{
   "error": "账号不存在"

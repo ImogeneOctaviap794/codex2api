@@ -281,6 +281,7 @@
     "noDataDesc": "导入 Refresh Token 后，账号会立即加入号池并显示在这里。",
     "selectTxtFile": "请选择 .txt 文件",
     "addSuccess": "账号添加成功",
+    "addATSuccessWithIds": "AT 账号添加成功，ID：{{ids}}",
     "addFailed": "添加失败：{{error}}",
     "importFailed": "导入失败",
     "importFailedWithReason": "导入失败：{{error}}",
@@ -314,6 +315,13 @@
     "cleanErrorSuccess": "错误账号已清理",
     "cleanErrorFailed": "清理错误账号失败：{{error}}",
     "healthSummary": "{{health}} · 分 {{score}} · 并发 {{concurrency}}",
+    "editEmail": "编辑邮箱",
+    "emailEditTitle": "编辑账号邮箱",
+    "emailEditDesc": "手动修改该账号在本地号池中展示和匹配使用的邮箱。",
+    "emailPlaceholder": "输入新的邮箱",
+    "emailRequired": "邮箱不能为空。",
+    "emailSaveSuccess": "邮箱已保存",
+    "emailSaveFailed": "保存邮箱失败：{{error}}",
     "editScheduler": "编辑调度",
     "schedulerEditTitle": "编辑账号调度",
     "schedulerEditDesc": "为当前账号调整调度加权分与基础并发覆盖。当前套餐：{{plan}}",
@@ -860,6 +868,10 @@
     "deleteAccount": {
       "title": "Delete Account",
       "desc": "删除指定 ID 的账号，同时从号池中移除。"
+    },
+    "updateAccountEmail": {
+      "title": "Update Account Email",
+      "desc": "修改指定账号 credentials.email，并同步更新运行时号池中的邮箱。"
     },
     "listAccounts": {
       "title": "List Accounts",

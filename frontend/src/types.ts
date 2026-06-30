@@ -149,6 +149,10 @@ export interface UpdateAccountSchedulerRequest {
   base_concurrency_override: number | null
 }
 
+export interface UpdateAccountEmailRequest {
+  email: string
+}
+
 export interface AccountModelStat {
   model: string
   requests: number
@@ -170,7 +174,10 @@ export interface MessageResponse {
 }
 
 export interface CreateAccountResponse extends MessageResponse {
-  id: number
+  id?: number
+  ids?: number[]
+  success?: number
+  failed?: number
 }
 
 export interface AdminErrorResponse {

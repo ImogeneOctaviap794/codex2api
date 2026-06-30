@@ -469,7 +469,8 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 {
   "message": "成功添加 3 个 AT 账号",
   "success": 3,
-  "failed": 0
+  "failed": 0,
+  "ids": [12550, 12551, 12552]
 }
 ```
 
@@ -483,6 +484,24 @@ curl -X POST http://localhost:8080/api/admin/accounts/at \
 ```
 
 > AT-only 账号无法自动刷新，过期后需重新添加。系统会自动解析 JWT 提取 email、plan_type 等信息。
+
+#### PATCH /api/admin/accounts/:id/email
+
+修改账号邮箱。用于手动修正 AT-only 或其他账号在本地展示、去重和 RT Manager 匹配时使用的 `credentials.email`。
+
+**请求:**
+```json
+{
+  "email": "new-user@example.com"
+}
+```
+
+**响应:**
+```json
+{
+  "message": "邮箱已更新"
+}
+```
 
 #### DELETE /api/admin/accounts/:id
 

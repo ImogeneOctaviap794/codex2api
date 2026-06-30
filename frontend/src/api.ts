@@ -20,6 +20,7 @@ import type {
   CPAExportEntry,
   SystemSettings,
   ModelPlanPolicy,
+  UpdateAccountEmailRequest,
   UpdateAccountSchedulerRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
@@ -121,6 +122,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
+  updateAccountEmail: (id: number, data: UpdateAccountEmailRequest) =>
+    request<MessageResponse>(`/accounts/${id}/email`, { method: 'PATCH', body: JSON.stringify(data) }),
   toggleAccountLock: (id: number, locked: boolean) =>
     request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
   resetAccountStatus: (id: number) =>

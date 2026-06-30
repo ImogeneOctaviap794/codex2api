@@ -281,6 +281,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/at", h.AddATAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
+	api.PATCH("/accounts/:id/email", h.UpdateAccountEmail)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
@@ -856,6 +857,54 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "账号调度配置已更新")
 }
 
+// UpdateAccountEmail 更新账号邮箱。
+func (h *Handler) UpdateAccountEmail(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Email == "" {
+		writeError(c, http.StatusBadRequest, "email 不能为空")
+		return
+	}
+	if utf8.RuneCountInString(req.Email) > 200 {
+		writeError(c, http.StatusBadRequest, "email 长度不能超过200字符")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.db.UpdateCredentials(ctx, id, map[string]interface{}{"email": req.Email}); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新邮箱失败: "+err.Error())
+		return
+	}
+
+	// 同步到内存
+	if h.store != nil {
+		if acc := h.store.FindByID(id); acc != nil {
+			acc.Email = req.Email
+		}
+	}
+
+	writeMessage(c, http.StatusOK, "邮箱已更新")
+}
+
 func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (sql.NullInt64, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return sql.NullInt64{}, nil
@@ -1190,6 +1239,8 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 	var successCount int64
 	var failCount int64
+	var idsMu sync.Mutex
+	var insertedIDs []int64
 
 	const insertConcurrency = 20
 	sem := make(chan struct{}, insertConcurrency)
@@ -1217,6 +1268,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			}
 
 			atomic.AddInt64(&successCount, 1)
+			idsMu.Lock()
+			insertedIDs = append(insertedIDs, id)
+			idsMu.Unlock()
 			h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
 			// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
@@ -1271,6 +1325,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		"message": msg,
 		"success": successTotal,
 		"failed":  failTotal,
+		"ids":     insertedIDs,
 	})
 }
 

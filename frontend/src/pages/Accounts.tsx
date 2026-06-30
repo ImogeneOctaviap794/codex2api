@@ -25,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Users } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Users, Mail } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 import DedupeModal from '../components/DedupeModal'
@@ -59,6 +59,9 @@ export default function Accounts() {
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null)
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null)
   const [editSubmitting, setEditSubmitting] = useState(false)
+  const [editingEmailAccount, setEditingEmailAccount] = useState<AccountRow | null>(null)
+  const [emailInput, setEmailInput] = useState('')
+  const [emailSubmitting, setEmailSubmitting] = useState(false)
   const [scoreMode, setScoreMode] = useState<'default' | 'custom'>('default')
   const [scoreInput, setScoreInput] = useState('')
   const [concurrencyMode, setConcurrencyMode] = useState<'default' | 'custom'>('default')
@@ -190,8 +193,12 @@ export default function Accounts() {
     if (!atForm.access_token.trim()) return
     setSubmitting(true)
     try {
-      await api.addATAccount(atForm)
-      showToast(t('accounts.addSuccess'))
+      const result = await api.addATAccount(atForm)
+      if (result.ids && result.ids.length > 0) {
+        showToast(t('accounts.addATSuccessWithIds', { ids: result.ids.join(', ') }))
+      } else {
+        showToast(t('accounts.addSuccess'))
+      }
       setShowAdd(false)
       setAtForm({ access_token: '', proxy_url: '' })
       void reload()
@@ -800,6 +807,38 @@ export default function Accounts() {
     }
   }
 
+  const openEmailEditor = (account: AccountRow) => {
+    setEditingEmailAccount(account)
+    setEmailInput(account.email || '')
+  }
+
+  const closeEmailEditor = (force = false) => {
+    if (emailSubmitting && !force) return
+    setEditingEmailAccount(null)
+    setEmailInput('')
+  }
+
+  const handleSaveEmail = async () => {
+    if (!editingEmailAccount) return
+    const email = emailInput.trim()
+    if (!email) {
+      showToast(t('accounts.emailRequired'), 'error')
+      return
+    }
+
+    setEmailSubmitting(true)
+    try {
+      await api.updateAccountEmail(editingEmailAccount.id, { email })
+      showToast(t('accounts.emailSaveSuccess'))
+      await reload()
+      closeEmailEditor(true)
+    } catch (error) {
+      showToast(t('accounts.emailSaveFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setEmailSubmitting(false)
+    }
+  }
+
   const openSchedulerEditor = (account: AccountRow) => {
     setEditingAccount(account)
     setScoreMode(account.score_bias_override === null || account.score_bias_override === undefined ? 'default' : 'custom')
@@ -1177,6 +1216,15 @@ export default function Accounts() {
                         <TableCell className="text-[14px] text-muted-foreground">{formatRelativeTime(account.updated_at)}</TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center gap-1 justify-end">
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => openEmailEditor(account)}
+                              title={t('accounts.editEmail')}
+                            >
+                              <Mail className="size-3.5" />
+                            </Button>
                             <Button
                               variant="outline"
                               size="icon"
@@ -1657,6 +1705,41 @@ export default function Accounts() {
           onDone={() => void reload()}
           showToast={showToast}
         />
+
+        <Modal
+          show={Boolean(editingEmailAccount)}
+          title={t('accounts.emailEditTitle')}
+          contentClassName="sm:max-w-[520px]"
+          onClose={closeEmailEditor}
+          footer={(
+            <>
+              <Button variant="outline" onClick={() => closeEmailEditor()} disabled={emailSubmitting}>
+                {t('common.cancel')}
+              </Button>
+              <Button onClick={() => void handleSaveEmail()} disabled={emailSubmitting || !emailInput.trim()}>
+                {emailSubmitting ? t('common.saving') : t('common.save')}
+              </Button>
+            </>
+          )}
+        >
+          {editingEmailAccount ? (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                <div className="font-semibold text-foreground">ID {editingEmailAccount.id}</div>
+                <div className="mt-1">{t('accounts.emailEditDesc')}</div>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.email')}</label>
+                <Input
+                  value={emailInput}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => setEmailInput(event.target.value)}
+                  placeholder={t('accounts.emailPlaceholder')}
+                  autoFocus
+                />
+              </div>
+            </div>
+          ) : null}
+        </Modal>
 
         <Modal
           show={Boolean(editingAccount)}
