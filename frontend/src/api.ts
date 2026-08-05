@@ -416,6 +416,52 @@ function buildOpsErrorSearchParams(params: {
   return search
 }
 
+export type UsageLogQueryParams = {
+  start: string
+  end: string
+  email?: string
+  q?: string
+  model?: string
+  endpoint?: string
+  apiKeyId?: string
+  accountId?: string
+  fast?: string
+  stream?: string
+  compact?: string
+  hasCompactionHistory?: string
+  channel?: string
+  status?: string
+  errorOnly?: string
+  errorKind?: string
+  retry?: string
+  viaWebsocket?: string
+  includeCanceled?: string
+}
+
+export function buildUsageLogSearchParams(params: UsageLogQueryParams) {
+  const search = new URLSearchParams()
+  search.set('start', params.start)
+  search.set('end', params.end)
+  if (params.email) search.set('email', params.email)
+  if (params.q) search.set('q', params.q)
+  if (params.model) search.set('model', params.model)
+  if (params.endpoint) search.set('endpoint', params.endpoint)
+  if (params.apiKeyId) search.set('api_key_id', params.apiKeyId)
+  if (params.accountId) search.set('account_id', params.accountId)
+  if (params.fast) search.set('fast', params.fast)
+  if (params.stream) search.set('stream', params.stream)
+  if (params.compact) search.set('compact', params.compact)
+  if (params.hasCompactionHistory) search.set('has_compaction_history', params.hasCompactionHistory)
+  if (params.channel) search.set('channel', params.channel)
+  if (params.status) search.set('status', params.status)
+  if (params.errorOnly) search.set('error_only', params.errorOnly)
+  if (params.errorKind) search.set('error_kind', params.errorKind)
+  if (params.retry) search.set('retry', params.retry)
+  if (params.viaWebsocket) search.set('via_websocket', params.viaWebsocket)
+  if (params.includeCanceled) search.set('include_canceled', params.includeCanceled)
+  return search
+}
+
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
   // 公开账号自助门户:生成 OpenAI 授权链接(无鉴权)。
@@ -781,23 +827,15 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string; compact?: string; hasCompactionHistory?: string; channel?: string }) => {
-    const searchParams = new URLSearchParams()
-    searchParams.set('start', params.start)
-    searchParams.set('end', params.end)
+  getUsageLogsPaged: (params: UsageLogQueryParams & { page: number; pageSize?: number }) => {
+    const searchParams = buildUsageLogSearchParams(params)
     searchParams.set('page', String(params.page))
     if (params.pageSize) searchParams.set('page_size', String(params.pageSize))
-    if (params.email) searchParams.set('email', params.email)
-    if (params.model) searchParams.set('model', params.model)
-    if (params.endpoint) searchParams.set('endpoint', params.endpoint)
-    if (params.apiKeyId) searchParams.set('api_key_id', params.apiKeyId)
-    if (params.accountId) searchParams.set('account_id', params.accountId)
-    if (params.fast) searchParams.set('fast', params.fast)
-    if (params.stream) searchParams.set('stream', params.stream)
-    if (params.compact) searchParams.set('compact', params.compact)
-    if (params.hasCompactionHistory) searchParams.set('has_compaction_history', params.hasCompactionHistory)
-    if (params.channel) searchParams.set('channel', params.channel)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
+  },
+  getUsageLogsErrorSummary: (params: UsageLogQueryParams) => {
+    const searchParams = buildUsageLogSearchParams(params)
+    return request<OpsErrorSummary>(`/usage/logs/error-summary?${searchParams.toString()}`)
   },
   getChartData: (params: {
     start: string

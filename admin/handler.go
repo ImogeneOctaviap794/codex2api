@@ -634,6 +634,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
 	api.GET("/usage/api-keys/:id/accounts", h.GetAPIKeyAccountStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
+	api.GET("/usage/logs/error-summary", h.GetUsageLogsErrorSummary)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/setup-hints", h.GetSetupHints)
@@ -6477,12 +6478,162 @@ func parseUsageLogBoolFilter(c *gin.Context, name string) (*bool, bool) {
 	}
 }
 
+func parseUsageLogStatusFilter(c *gin.Context, filter *database.UsageLogFilter) bool {
+	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	if status == "" {
+		status = strings.ToLower(strings.TrimSpace(c.Query("status_code")))
+	}
+	switch status {
+	case "", "all":
+		return true
+	case "2xx", "4xx", "5xx":
+		filter.StatusFamily = status
+		if status == "4xx" {
+			filter.IncludeCanceled = true
+		}
+		return true
+	default:
+		statusCode, err := strconv.Atoi(status)
+		if err != nil || statusCode < 100 || statusCode > 599 {
+			writeError(c, http.StatusBadRequest, "status/status_code 参数无效")
+			return false
+		}
+		filter.StatusCode = statusCode
+		if statusCode == 499 {
+			filter.IncludeCanceled = true
+		}
+		return true
+	}
+}
+
+func parseUsageLogsFilter(c *gin.Context, startTime, endTime time.Time) (database.UsageLogFilter, bool) {
+	apiKeyID, ok := parseOpsErrorPositiveInt64(c, "api_key_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	accountID, ok := parseOpsErrorPositiveInt64(c, "account_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	filter := database.UsageLogFilter{
+		Start:     startTime,
+		End:       endTime,
+		Page:      1,
+		PageSize:  20,
+		Email:     strings.TrimSpace(c.Query("email")),
+		Model:     strings.TrimSpace(c.Query("model")),
+		Endpoint:  strings.TrimSpace(c.Query("endpoint")),
+		APIKeyID:  apiKeyID,
+		AccountID: accountID,
+		ErrorKind: strings.TrimSpace(c.Query("error_kind")),
+		Query:     strings.TrimSpace(c.Query("q")),
+		Channel:   parseUsageChannel(c),
+	}
+
+	if pageStr := c.Query("page"); pageStr != "" {
+		page, err := strconv.Atoi(pageStr)
+		if err != nil || page <= 0 {
+			writeError(c, http.StatusBadRequest, "page 参数无效，需要正整数")
+			return database.UsageLogFilter{}, false
+		}
+		filter.Page = page
+	}
+	if pageSizeStr := c.Query("page_size"); pageSizeStr != "" {
+		pageSize, err := strconv.Atoi(pageSizeStr)
+		if err != nil || pageSize <= 0 || pageSize > 500 {
+			writeError(c, http.StatusBadRequest, "page_size 参数无效，需要 1 到 500 的整数")
+			return database.UsageLogFilter{}, false
+		}
+		filter.PageSize = pageSize
+	}
+
+	filter.FastOnly, ok = parseUsageLogBoolFilter(c, "fast")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.StreamOnly, ok = parseUsageLogBoolFilter(c, "stream")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	filter.CompactOnly, ok = parseUsageLogBoolFilter(c, "compact")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.CompactionHistoryOnly, ok = parseUsageLogBoolFilter(c, "has_compaction_history")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.RetryOnly, ok = parseUsageLogBoolFilter(c, "retry")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.ViaWebsocketOnly, ok = parseUsageLogBoolFilter(c, "via_websocket")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	errorOnly, ok := parseUsageLogBoolFilter(c, "error_only")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	if errorOnly != nil {
+		filter.ErrorOnly = *errorOnly
+	}
+	includeCanceled, ok := parseUsageLogBoolFilter(c, "include_canceled")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	if includeCanceled != nil {
+		filter.IncludeCanceled = *includeCanceled
+	}
+	if filter.ErrorOnly {
+		filter.IncludeCanceled = true
+	}
+	if !parseUsageLogStatusFilter(c, &filter) {
+		return database.UsageLogFilter{}, false
+	}
+
+	return filter, true
+}
+
 // GetOpsErrorSummary 获取运维错误日志概览
 func (h *Handler) GetOpsErrorSummary(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
 	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	result, err := h.db.GetUsageErrorSummary(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetUsageLogsErrorSummary 获取与请求记录筛选联动的错误摘要。
+func (h *Handler) GetUsageLogsErrorSummary(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	startStr := strings.TrimSpace(c.Query("start"))
+	endStr := strings.TrimSpace(c.Query("end"))
+	if startStr == "" || endStr == "" {
+		writeError(c, http.StatusBadRequest, "start/end 参数需要同时提供")
+		return
+	}
+	startTime, startErr := time.Parse(time.RFC3339, startStr)
+	endTime, endErr := time.Parse(time.RFC3339, endStr)
+	if startErr != nil || endErr != nil {
+		writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+		return
+	}
+
+	filter, ok := parseUsageLogsFilter(c, startTime, endTime)
 	if !ok {
 		return
 	}
@@ -6511,59 +6662,8 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 		}
 
 		// 有 page 参数 → 服务端分页（Usage 页面表格）
-		if pageStr := c.Query("page"); pageStr != "" {
-			page, _ := strconv.Atoi(pageStr)
-			pageSize := 20
-			if ps := c.Query("page_size"); ps != "" {
-				if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 500 {
-					pageSize = n
-				}
-			}
-			var apiKeyID *int64
-			if apiKeyIDStr := c.Query("api_key_id"); apiKeyIDStr != "" {
-				parsed, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
-				if err != nil || parsed <= 0 {
-					writeError(c, http.StatusBadRequest, "api_key_id 参数无效，需要正整数")
-					return
-				}
-				apiKeyID = &parsed
-			}
-			var accountID *int64
-			if accountIDStr := c.Query("account_id"); accountIDStr != "" {
-				parsed, err := strconv.ParseInt(accountIDStr, 10, 64)
-				if err != nil || parsed <= 0 {
-					writeError(c, http.StatusBadRequest, "account_id 参数无效，需要正整数")
-					return
-				}
-				accountID = &parsed
-			}
-
-			filter := database.UsageLogFilter{
-				Start:     startTime,
-				End:       endTime,
-				Page:      page,
-				PageSize:  pageSize,
-				Email:     c.Query("email"),
-				Model:     c.Query("model"),
-				Endpoint:  c.Query("endpoint"),
-				APIKeyID:  apiKeyID,
-				AccountID: accountID,
-				Channel:   parseUsageChannel(c),
-			}
-			if fastStr := c.Query("fast"); fastStr != "" {
-				v := fastStr == "true"
-				filter.FastOnly = &v
-			}
-			if streamStr := c.Query("stream"); streamStr != "" {
-				v := streamStr == "true"
-				filter.StreamOnly = &v
-			}
-			var ok bool
-			filter.CompactOnly, ok = parseUsageLogBoolFilter(c, "compact")
-			if !ok {
-				return
-			}
-			filter.CompactionHistoryOnly, ok = parseUsageLogBoolFilter(c, "has_compaction_history")
+		if c.Query("page") != "" {
+			filter, ok := parseUsageLogsFilter(c, startTime, endTime)
 			if !ok {
 				return
 			}

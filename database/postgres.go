@@ -4995,6 +4995,8 @@ type UsageLogFilter struct {
 	ErrorKind             string
 	Query                 string
 	Channel               string // 上游渠道（codex/grok），空=全部
+	RetryOnly             *bool  // nil=全部, true=仅重试请求, false=仅首次请求
+	ViaWebsocketOnly      *bool  // nil=全部, true=仅 WebSocket, false=仅 HTTP
 }
 
 func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
@@ -5017,7 +5019,15 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 	}
 	if f.Email != "" {
 		p := addArg("%" + f.Email + "%")
-		parts = append(parts, fmt.Sprintf(`(LOWER(COALESCE(a.name, '')) LIKE LOWER(%[1]s) OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s) OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s))`, p))
+		parts = append(parts, fmt.Sprintf(`(
+			LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s)
+			OR u.account_id IN (
+				SELECT search_accounts.id
+				FROM accounts search_accounts
+				WHERE LOWER(COALESCE(search_accounts.name, '')) LIKE LOWER(%[1]s)
+					OR LOWER(COALESCE(CAST(search_accounts.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
+			)
+		)`, p))
 	}
 	if f.Model != "" {
 		p := addArg(f.Model)
@@ -5055,11 +5065,21 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 		p := addArg(*f.CompactionHistoryOnly)
 		parts = append(parts, fmt.Sprintf(`COALESCE(u.has_compaction_history, false) = %s`, p))
 	}
+	if f.RetryOnly != nil {
+		p := addArg(*f.RetryOnly)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.is_retry_attempt, false) = %s`, p))
+	}
+	if f.ViaWebsocketOnly != nil {
+		p := addArg(*f.ViaWebsocketOnly)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.via_websocket, false) = %s`, p))
+	}
 	if f.StatusCode > 0 {
 		p := addArg(f.StatusCode)
 		parts = append(parts, fmt.Sprintf(`u.status_code = %s`, p))
 	}
 	switch strings.ToLower(strings.TrimSpace(f.StatusFamily)) {
+	case "2xx":
+		parts = append(parts, `u.status_code >= 200 AND u.status_code < 300`)
 	case "4xx":
 		parts = append(parts, `u.status_code >= 400 AND u.status_code < 500`)
 	case "5xx":
@@ -5085,8 +5105,12 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 				OR LOWER(COALESCE(u.api_key_name, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(u.api_key_masked, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s)
-				OR LOWER(COALESCE(a.name, '')) LIKE LOWER(%[1]s)
-				OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
+				OR u.account_id IN (
+					SELECT search_accounts.id
+					FROM accounts search_accounts
+					WHERE LOWER(COALESCE(search_accounts.name, '')) LIKE LOWER(%[1]s)
+						OR LOWER(COALESCE(CAST(search_accounts.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
+				)
 		)`, p))
 	}
 

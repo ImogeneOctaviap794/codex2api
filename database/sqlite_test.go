@@ -958,11 +958,12 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 			ErrorMessage: "client canceled",
 		},
 		{
-			AccountID:  4,
-			Endpoint:   "/v1/responses",
-			Model:      "gpt-5.4",
-			StatusCode: 200,
-			DurationMs: 90,
+			AccountID:    4,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   200,
+			DurationMs:   90,
+			ViaWebsocket: true,
 		},
 	} {
 		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
@@ -1035,6 +1036,54 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 	}
 	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 500 {
 		t.Fatalf("5xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	filter = UsageLogFilter{
+		Start:        now.Add(-1 * time.Hour),
+		End:          now.Add(1 * time.Hour),
+		Page:         1,
+		PageSize:     10,
+		StatusFamily: "2xx",
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 2xx 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 200 {
+		t.Fatalf("2xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	retryOnly := true
+	filter = UsageLogFilter{
+		Start:           now.Add(-1 * time.Hour),
+		End:             now.Add(1 * time.Hour),
+		Page:            1,
+		PageSize:        10,
+		RetryOnly:       &retryOnly,
+		IncludeCanceled: true,
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged retry 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || !page.Logs[0].IsRetryAttempt {
+		t.Fatalf("retry page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	websocketOnly := true
+	filter = UsageLogFilter{
+		Start:            now.Add(-1 * time.Hour),
+		End:              now.Add(1 * time.Hour),
+		Page:             1,
+		PageSize:         10,
+		ViaWebsocketOnly: &websocketOnly,
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged websocket 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || !page.Logs[0].ViaWebsocket {
+		t.Fatalf("websocket page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
 	}
 }
 

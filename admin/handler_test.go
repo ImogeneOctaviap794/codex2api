@@ -909,6 +909,167 @@ func TestGetUsageLogsRejectsInvalidCompactionFilters(t *testing.T) {
 	}
 }
 
+func TestGetUsageLogsRejectsInvalidDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "status",
+			query:     "status=6xx",
+			wantError: "status/status_code 参数无效",
+		},
+		{
+			name:      "retry",
+			query:     "retry=maybe",
+			wantError: "retry 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "websocket",
+			query:     "via_websocket=1",
+			wantError: "via_websocket 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "error only",
+			query:     "error_only=yes",
+			wantError: "error_only 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsAppliesDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "matching",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "server",
+			ErrorMessage:      "boom from upstream",
+			IsRetryAttempt:    true,
+			AttemptIndex:      1,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "wrong-kind",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "transport",
+			ErrorMessage:      "boom from transport",
+			IsRetryAttempt:    true,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:    accountID,
+			Endpoint:     "/v1/responses",
+			Model:        "canceled",
+			StatusCode:   499,
+			ErrorMessage: "client canceled",
+		},
+		{
+			AccountID:  accountID,
+			Endpoint:   "/v1/responses",
+			Model:      "success",
+			StatusCode: http.StatusOK,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=5xx&error_kind=server&retry=true&via_websocket=true&q=boom",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var page database.UsageLogPage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].Model != "matching" {
+		t.Fatalf("filtered page = total %d logs %+v, want matching only", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=499",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("499 status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode 499 response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 499 {
+		t.Fatalf("499 page = total %d logs %+v", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs/error-summary?start="+start+"&end="+end,
+		nil,
+	)
+	handler.GetUsageLogsErrorSummary(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var summary database.UsageErrorSummary
+	if err := json.Unmarshal(recorder.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if summary.TotalErrors != 3 || summary.Status5xx != 2 || summary.Canceled != 1 || summary.RetryAttempts != 2 {
+		t.Fatalf("summary = %+v, want total=3 5xx=2 canceled=1 retries=2", summary)
+	}
+}
+
 func TestGetUsageLogsAppliesCompactionFilters(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1060,6 +1221,44 @@ func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
 	}
 	if got := payload.Logs[0].Endpoint; got != "/v1/log-000" {
 		t.Fatalf("endpoint = %q, want /v1/log-000", got)
+	}
+}
+
+func TestGetUsageLogsRejectsInvalidQueryFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{db: newTestAdminDB(t)}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "page is not a number", query: "page=abc"},
+		{name: "page is zero", query: "page=0"},
+		{name: "page size is not a number", query: "page=1&page_size=abc"},
+		{name: "page size is zero", query: "page=1&page_size=0"},
+		{name: "page size exceeds maximum", query: "page=1&page_size=501"},
+		{name: "fast is invalid", query: "page=1&fast=maybe"},
+		{name: "stream is invalid", query: "page=1&stream=1"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start="+start+"&end="+end+"&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ginCtx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+		})
 	}
 }
 
