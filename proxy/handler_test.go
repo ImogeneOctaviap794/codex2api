@@ -1947,6 +1947,32 @@ func TestUsageLogErrorMessageExtractsStructuredError(t *testing.T) {
 	}
 }
 
+func TestUsageLogErrorMessageExtractsDetailErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "string detail",
+			body: `{"detail":"The requested model is not available for this account."}`,
+			want: "The requested model is not available for this account.",
+		},
+		{
+			name: "object detail",
+			body: `{"detail":{"code":"model_not_supported","message":"The requested model is not supported."}}`,
+			want: "model_not_supported · The requested model is not supported.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := usageLogErrorMessage(http.StatusBadRequest, []byte(tt.body)); got != tt.want {
+				t.Fatalf("usageLogErrorMessage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestUsageLogAndClientErrorsOmitUnstructuredUpstreamBodies(t *testing.T) {
 	body := []byte(`<html><body>secret request-id and internal route</body></html>`)
 	if got := usageLogErrorMessage(http.StatusBadGateway, body); got != "HTTP 502" {

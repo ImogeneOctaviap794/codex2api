@@ -547,10 +547,15 @@ func usageLogErrorMessageImpl(statusCode int, body []byte, trustedText bool) str
 		return ""
 	}
 
+	detailMessage := gjson.GetBytes(body, "detail.message").String()
+	if detail := gjson.GetBytes(body, "detail"); detail.Type == gjson.String {
+		detailMessage = detail.String()
+	}
 	candidates := []string{
 		gjson.GetBytes(body, "error.message").String(),
 		gjson.GetBytes(body, "response.error.message").String(),
 		gjson.GetBytes(body, "response.status_details.error.message").String(),
+		detailMessage,
 		gjson.GetBytes(body, "message").String(),
 	}
 	message := ""
